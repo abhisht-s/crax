@@ -192,8 +192,8 @@ def _snapshot_message(snapshot: dict) -> str:
     )
 
 
-def _print_git_snapshot_summary(snapshot: dict) -> None:
-    print("Git before snapshot:")
+def _print_git_snapshot_summary(snapshot: dict, label: str) -> None:
+    print(f"Git {label} snapshot:")
     print(f"repo_path: {snapshot['repo_path']}")
     print(f"is_git_repo: {str(snapshot['is_git_repo']).lower()}")
     print(f"branch: {snapshot['branch'] or ''}")
@@ -309,7 +309,7 @@ def main() -> None:
             _snapshot_message(git_snapshot),
             git_snapshot,
         )
-        _print_git_snapshot_summary(git_snapshot)
+        _print_git_snapshot_summary(git_snapshot, "before")
 
         ledger.add_event(
             args.run_id,
@@ -365,6 +365,16 @@ def main() -> None:
         if result["validation_error"]:
             print(f"error: {result['validation_error']}", file=sys.stderr)
         _print_codex_exec_result(result)
+
+        if not result["validation_error"]:
+            after_git_snapshot = capture_git_snapshot(repo_path_text)
+            ledger.add_event(
+                args.run_id,
+                "git_snapshot_after_codex",
+                _snapshot_message(after_git_snapshot),
+                after_git_snapshot,
+            )
+            _print_git_snapshot_summary(after_git_snapshot, "after")
 
         if result["validation_error"]:
             raise SystemExit(2)

@@ -82,3 +82,20 @@ Expected ledger event:
 ```text
 git_snapshot_before_codex
 ```
+
+## Stage 3.2 Smoke Test
+
+Capture Git before and after snapshots around Codex exec and inspect the recorded ledger events:
+
+```sh
+REPO_PATH="$(pwd)"
+RUN_ID=$(agent-loop start "Git after snapshot test")
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: GIT_AFTER_OK"
+agent-loop show "$RUN_ID"
+```
+
+Expected ledger event:
+
+```text
+git_snapshot_after_codex
+```
