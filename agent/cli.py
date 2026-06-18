@@ -13,6 +13,7 @@ from agent.codex_terminal import (
     run_codex_exec,
     run_command,
 )
+from agent.file_classifier import classify_changed_files
 from agent.git_snapshot import capture_git_snapshot
 from agent import ledger
 
@@ -182,6 +183,11 @@ def _changed_files_count(snapshot: dict) -> int:
     return len([line for line in snapshot["diff_name_only"].splitlines() if line.strip()])
 
 
+def _changed_file_paths(snapshot: dict) -> list[str]:
+    diff_name_only = snapshot.get("diff_name_only") or ""
+    return [line.strip() for line in diff_name_only.splitlines() if line.strip()]
+
+
 def _snapshot_message(snapshot: dict) -> str:
     branch = snapshot["branch"] or "None"
     head = _short_hash(snapshot["head"]) or "None"
@@ -202,6 +208,24 @@ def _print_git_snapshot_summary(snapshot: dict, label: str) -> None:
     print(f"changed_files_count: {_changed_files_count(snapshot)}")
     if snapshot["validation_error"]:
         print(f"validation_error: {snapshot['validation_error']}")
+    sys.stdout.flush()
+
+
+def _classification_message(classification: dict) -> str:
+    return (
+        f"total_files={classification['total_files']} "
+        f"category_counts={classification['counts_by_category']} "
+        f"risk_counts={classification['counts_by_risk_level']} "
+        f"high_risk_file_count={len(classification['high_risk_files'])}"
+    )
+
+
+def _print_changed_file_classification(classification: dict) -> None:
+    print("Changed-file classification:")
+    print(f"total_files: {classification['total_files']}")
+    print(f"counts_by_category: {classification['counts_by_category']}")
+    print(f"counts_by_risk_level: {classification['counts_by_risk_level']}")
+    print(f"high_risk_files: {classification['high_risk_files']}")
     sys.stdout.flush()
 
 
@@ -375,6 +399,17 @@ def main() -> None:
                 after_git_snapshot,
             )
             _print_git_snapshot_summary(after_git_snapshot, "after")
+
+            changed_file_classification = classify_changed_files(
+                _changed_file_paths(after_git_snapshot)
+            )
+            ledger.add_event(
+                args.run_id,
+                "changed_file_classification",
+                _classification_message(changed_file_classification),
+                changed_file_classification,
+            )
+            _print_changed_file_classification(changed_file_classification)
 
         if result["validation_error"]:
             raise SystemExit(2)

@@ -99,3 +99,20 @@ Expected ledger event:
 ```text
 git_snapshot_after_codex
 ```
+
+## Stage 3.3 Smoke Test
+
+Classify changed files from the Git after snapshot and inspect the recorded ledger event:
+
+```sh
+REPO_PATH="$(pwd)"
+RUN_ID=$(agent-loop start "Changed-file classifier test")
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: CLASSIFIER_OK"
+agent-loop show "$RUN_ID"
+```
+
+Expected ledger event:
+
+```text
+changed_file_classification
+```
