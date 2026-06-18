@@ -51,3 +51,13 @@ RUN_ID=$(agent-loop start "Codex check test")
 agent-loop codex-check "$RUN_ID"
 agent-loop show "$RUN_ID"
 ```
+
+## Stage 2.2 Smoke Test
+
+Run Codex in exec mode and inspect the recorded transcript events:
+
+```sh
+RUN_ID=$(agent-loop start "Codex exec test")
+agent-loop codex-run "$RUN_ID" --prompt "Say exactly: CODEX_RUN_OK"
+agent-loop show "$RUN_ID"
+```

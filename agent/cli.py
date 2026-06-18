@@ -4,12 +4,13 @@ import argparse
 import shlex
 import sys
 
-from agent.codex_terminal import check_codex_environment, run_command
+from agent.codex_terminal import check_codex_environment, run_codex_exec, run_command
 from agent import ledger
 
 
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
 DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS = 30
+DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -29,6 +30,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Check local Codex CLI availability without running prompts.",
     )
     codex_check_parser.add_argument("run_id", help="Run ID for this Codex check.")
+
+    codex_run_parser = subparsers.add_parser(
+        "codex-run",
+        help="Run Codex exec and record the transcript.",
+    )
+    codex_run_parser.add_argument("run_id", help="Run ID for this Codex exec.")
+    codex_run_parser.add_argument("--prompt", required=True, help="Prompt to pass to Codex exec.")
+    codex_run_parser.add_argument("--cwd", help="Working directory for Codex exec.")
+    codex_run_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
+        help=f"Timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+    )
 
     run_shell_parser = subparsers.add_parser(
         "run-shell",
@@ -118,6 +133,19 @@ def _print_codex_check_result(result: dict) -> None:
             print("    (none)")
 
 
+def _print_codex_exec_result(result: dict) -> None:
+    print(f"found: {result['found']}")
+    print(f"codex_path: {result['codex_path'] or ''}")
+    print(f"exit_code: {result['exit_code']}")
+    print(f"timed_out: {result['timed_out']}")
+    print("stdout:")
+    print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
+
+    if result["stderr"]:
+        print("stderr:", file=sys.stderr)
+        print(result["stderr"], end="" if result["stderr"].endswith("\n") else "\n", file=sys.stderr)
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
@@ -172,6 +200,41 @@ def main() -> None:
         )
         _print_shell_result(result)
 
+        if result["timed_out"]:
+            raise SystemExit(124)
+        raise SystemExit(result["exit_code"] or 0)
+
+    if args.command == "codex-run":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        ledger.add_event(
+            args.run_id,
+            "codex_exec_started",
+            "Running Codex exec.",
+            {
+                "prompt": args.prompt,
+                "cwd": args.cwd,
+                "timeout": args.timeout,
+            },
+        )
+
+        result = run_codex_exec(
+            args.prompt,
+            cwd=args.cwd,
+            timeout_seconds=args.timeout,
+        )
+        ledger.add_event(
+            args.run_id,
+            "codex_exec_finished",
+            f"found={result['found']} exit_code={result['exit_code']} timed_out={result['timed_out']}",
+            result,
+        )
+        _print_codex_exec_result(result)
+
+        if not result["found"]:
+            raise SystemExit(1)
         if result["timed_out"]:
             raise SystemExit(124)
         raise SystemExit(result["exit_code"] or 0)

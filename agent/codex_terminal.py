@@ -67,6 +67,41 @@ def run_command(
         }
 
 
+def run_codex_exec(
+    prompt: str,
+    cwd: str | None = None,
+    timeout_seconds: int = 300,
+) -> dict:
+    codex_path = shutil.which("codex")
+    command = ["codex", "exec", prompt]
+
+    if codex_path is None:
+        now = _utc_now()
+        return {
+            "mode": "exec",
+            "found": False,
+            "codex_path": None,
+            "prompt": prompt,
+            "cwd": cwd,
+            "command": command,
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "Codex CLI not found on PATH.\n",
+            "timed_out": False,
+            "started_at": now,
+            "finished_at": now,
+        }
+
+    result = run_command(command, cwd=cwd, timeout_seconds=timeout_seconds)
+    return {
+        "mode": "exec",
+        "found": True,
+        "codex_path": codex_path,
+        "prompt": prompt,
+        **result,
+    }
+
+
 def check_codex_environment(timeout_seconds: int = 30) -> dict:
     codex_path = shutil.which("codex")
     result = {
