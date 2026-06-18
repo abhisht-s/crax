@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import shlex
 import sys
+from pathlib import Path
 
 from agent.codex_terminal import check_codex_environment, run_codex_exec, run_command
 from agent import ledger
@@ -37,7 +38,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     codex_run_parser.add_argument("run_id", help="Run ID for this Codex exec.")
     codex_run_parser.add_argument("--prompt", required=True, help="Prompt to pass to Codex exec.")
-    codex_run_parser.add_argument("--cwd", help="Working directory for Codex exec.")
+    codex_run_parser.add_argument("--repo", help="Repository/workdir for Codex exec. Default: current directory.")
+    codex_run_parser.add_argument("--cwd", help=argparse.SUPPRESS)
     codex_run_parser.add_argument(
         "--timeout",
         type=int,
@@ -134,6 +136,7 @@ def _print_codex_check_result(result: dict) -> None:
 
 
 def _print_codex_exec_result(result: dict) -> None:
+    print(f"repo_path: {result['repo_path']}")
     print(f"found: {result['found']}")
     print(f"codex_path: {result['codex_path'] or ''}")
     print(f"exit_code: {result['exit_code']}")
@@ -209,30 +212,42 @@ def main() -> None:
         if run is None:
             parser.exit(1, f"Run not found: {args.run_id}\n")
 
+        requested_repo_path = args.repo if args.repo is not None else args.cwd
+        if requested_repo_path:
+            repo_path = Path(requested_repo_path).expanduser().resolve(strict=False)
+        else:
+            repo_path = Path.cwd().resolve()
+        repo_path_text = str(repo_path)
+
         ledger.add_event(
             args.run_id,
             "codex_exec_started",
             "Running Codex exec.",
             {
                 "prompt": args.prompt,
-                "cwd": args.cwd,
+                "repo_path": repo_path_text,
                 "timeout": args.timeout,
             },
         )
 
         result = run_codex_exec(
             args.prompt,
-            cwd=args.cwd,
+            repo_path=repo_path_text,
             timeout_seconds=args.timeout,
         )
         ledger.add_event(
             args.run_id,
             "codex_exec_finished",
-            f"found={result['found']} exit_code={result['exit_code']} timed_out={result['timed_out']}",
+            (
+                f"found={result['found']} exit_code={result['exit_code']} "
+                f"timed_out={result['timed_out']} repo_path={result['repo_path']}"
+            ),
             result,
         )
         _print_codex_exec_result(result)
 
+        if result["validation_error"]:
+            raise SystemExit(2)
         if not result["found"]:
             raise SystemExit(1)
         if result["timed_out"]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 
 def _utc_now() -> str:
@@ -69,11 +70,41 @@ def run_command(
 
 def run_codex_exec(
     prompt: str,
-    cwd: str | None = None,
+    repo_path: str | Path | None = None,
     timeout_seconds: int = 300,
+    cwd: str | Path | None = None,
 ) -> dict:
     codex_path = shutil.which("codex")
-    command = ["codex", "exec", prompt]
+    if repo_path is None:
+        repo_path = cwd if cwd is not None else Path.cwd()
+
+    resolved_repo_path = Path(repo_path).expanduser().resolve(strict=False)
+    resolved_repo_path_text = str(resolved_repo_path)
+    command = ["codex", "exec", "-C", resolved_repo_path_text, prompt]
+
+    validation_error = None
+    if not resolved_repo_path.exists():
+        validation_error = f"Repo path does not exist: {resolved_repo_path_text}"
+    elif not resolved_repo_path.is_dir():
+        validation_error = f"Repo path is not a directory: {resolved_repo_path_text}"
+
+    if validation_error is not None:
+        now = _utc_now()
+        return {
+            "mode": "exec",
+            "found": codex_path is not None,
+            "codex_path": codex_path,
+            "prompt": prompt,
+            "repo_path": resolved_repo_path_text,
+            "command": command,
+            "exit_code": 2,
+            "stdout": "",
+            "stderr": f"{validation_error}\n",
+            "timed_out": False,
+            "started_at": now,
+            "finished_at": now,
+            "validation_error": validation_error,
+        }
 
     if codex_path is None:
         now = _utc_now()
@@ -82,7 +113,7 @@ def run_codex_exec(
             "found": False,
             "codex_path": None,
             "prompt": prompt,
-            "cwd": cwd,
+            "repo_path": resolved_repo_path_text,
             "command": command,
             "exit_code": None,
             "stdout": "",
@@ -90,14 +121,17 @@ def run_codex_exec(
             "timed_out": False,
             "started_at": now,
             "finished_at": now,
+            "validation_error": None,
         }
 
-    result = run_command(command, cwd=cwd, timeout_seconds=timeout_seconds)
+    result = run_command(command, cwd=resolved_repo_path_text, timeout_seconds=timeout_seconds)
     return {
         "mode": "exec",
         "found": True,
         "codex_path": codex_path,
         "prompt": prompt,
+        "repo_path": resolved_repo_path_text,
+        "validation_error": None,
         **result,
     }
 

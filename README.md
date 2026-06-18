@@ -52,12 +52,13 @@ agent-loop codex-check "$RUN_ID"
 agent-loop show "$RUN_ID"
 ```
 
-## Stage 2.2 Smoke Test
+## Stage 2.3 Smoke Test
 
-Run Codex in exec mode and inspect the recorded transcript events:
+Run Codex in exec mode against an explicit repo path and inspect the recorded transcript events:
 
 ```sh
-RUN_ID=$(agent-loop start "Codex exec test")
-agent-loop codex-run "$RUN_ID" --prompt "Say exactly: CODEX_RUN_OK"
+REPO_PATH="$(pwd)"
+RUN_ID=$(agent-loop start "Codex repo path test")
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: CODEX_REPO_OK"
 agent-loop show "$RUN_ID"
 ```
