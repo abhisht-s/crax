@@ -29,3 +29,14 @@ Show the run using the printed run ID:
 ```sh
 agent-loop show <run_id>
 ```
+
+## Milestone 1B Smoke Test
+
+Run a supervised shell command and inspect the recorded ledger events:
+
+```sh
+agent-loop init
+RUN_ID=$(agent-loop start "Shell runner test")
+agent-loop run-shell "$RUN_ID" -- echo hello
+agent-loop show "$RUN_ID"
+```
