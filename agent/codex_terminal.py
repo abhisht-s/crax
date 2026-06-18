@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from datetime import UTC, datetime
 
@@ -64,3 +65,27 @@ def run_command(
             "started_at": started_at,
             "finished_at": _utc_now(),
         }
+
+
+def check_codex_environment(timeout_seconds: int = 30) -> dict:
+    codex_path = shutil.which("codex")
+    result = {
+        "codex_path": codex_path,
+        "found": codex_path is not None,
+        "help": None,
+        "doctor": None,
+        "timeout_seconds": timeout_seconds,
+    }
+
+    if codex_path is None:
+        return result
+
+    result["help"] = run_command(
+        [codex_path, "--help"],
+        timeout_seconds=timeout_seconds,
+    )
+    result["doctor"] = run_command(
+        [codex_path, "doctor"],
+        timeout_seconds=timeout_seconds,
+    )
+    return result

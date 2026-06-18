@@ -40,3 +40,14 @@ RUN_ID=$(agent-loop start "Shell runner test")
 agent-loop run-shell "$RUN_ID" -- echo hello
 agent-loop show "$RUN_ID"
 ```
+
+## Milestone 1C Smoke Test
+
+Check the local Codex CLI installation and inspect the recorded ledger events:
+
+```sh
+agent-loop init
+RUN_ID=$(agent-loop start "Codex check test")
+agent-loop codex-check "$RUN_ID"
+agent-loop show "$RUN_ID"
+```

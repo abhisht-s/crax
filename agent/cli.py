@@ -4,11 +4,12 @@ import argparse
 import shlex
 import sys
 
-from agent.codex_terminal import run_command
+from agent.codex_terminal import check_codex_environment, run_command
 from agent import ledger
 
 
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
+DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS = 30
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -22,6 +23,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     show_parser = subparsers.add_parser("show", help="Show a run and its events.")
     show_parser.add_argument("run_id", help="Run ID to show.")
+
+    codex_check_parser = subparsers.add_parser(
+        "codex-check",
+        help="Check local Codex CLI availability without running prompts.",
+    )
+    codex_check_parser.add_argument("run_id", help="Run ID for this Codex check.")
 
     run_shell_parser = subparsers.add_parser(
         "run-shell",
@@ -77,6 +84,38 @@ def _print_shell_result(result: dict) -> None:
     print(result["stderr"], end="" if result["stderr"].endswith("\n") else "\n", file=sys.stderr)
     print(f"exit_code: {result['exit_code']}")
     print(f"timed_out: {result['timed_out']}")
+
+
+def _first_lines(value: str, count: int = 8) -> str:
+    return "\n".join(value.splitlines()[:count])
+
+
+def _command_output(result: dict | None) -> str:
+    if result is None:
+        return ""
+    return result["stdout"] or result["stderr"]
+
+
+def _print_codex_check_result(result: dict) -> None:
+    print(f"found: {result['found']}")
+    print(f"codex_path: {result['codex_path'] or ''}")
+
+    print("help first lines:")
+    help_lines = _first_lines(_command_output(result["help"]))
+    print(help_lines if help_lines else "  (none)")
+
+    if result["doctor"] is not None:
+        doctor = result["doctor"]
+        print("doctor:")
+        print(f"  exit_code: {doctor['exit_code']}")
+        print(f"  timed_out: {doctor['timed_out']}")
+        doctor_lines = _first_lines(_command_output(doctor))
+        print("  output first lines:")
+        if doctor_lines:
+            for line in doctor_lines.splitlines():
+                print(f"    {line}")
+        else:
+            print("    (none)")
 
 
 def main() -> None:
@@ -136,6 +175,35 @@ def main() -> None:
         if result["timed_out"]:
             raise SystemExit(124)
         raise SystemExit(result["exit_code"] or 0)
+
+    if args.command == "codex-check":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        timeout_seconds = DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS
+        ledger.add_event(
+            args.run_id,
+            "codex_check_started",
+            "Checking local Codex CLI availability.",
+            {"timeout": timeout_seconds},
+        )
+
+        result = check_codex_environment(timeout_seconds=timeout_seconds)
+        if result["found"]:
+            message = f"found=True codex_path={result['codex_path']}"
+        else:
+            message = "found=False"
+
+        ledger.add_event(
+            args.run_id,
+            "codex_check_finished",
+            message,
+            result,
+        )
+        _print_codex_check_result(result)
+
+        raise SystemExit(0 if result["found"] else 1)
 
 
 if __name__ == "__main__":
