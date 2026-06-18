@@ -52,13 +52,16 @@ agent-loop codex-check "$RUN_ID"
 agent-loop show "$RUN_ID"
 ```
 
-## Stage 2.3 Smoke Test
+## Stage 2.4 Smoke Test
 
-Run Codex in exec mode against an explicit repo path and inspect the recorded transcript events:
+Run Codex in exec mode with explicit sandbox handling and inspect the recorded transcript events:
 
 ```sh
 REPO_PATH="$(pwd)"
-RUN_ID=$(agent-loop start "Codex repo path test")
-agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: CODEX_REPO_OK"
+RUN_ID=$(agent-loop start "Codex sandbox test")
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: CODEX_READ_ONLY_OK"
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --sandbox workspace-write --prompt "Say exactly: CODEX_WORKSPACE_WRITE_OK"
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --sandbox danger-full-access --prompt "Should not run"
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --sandbox danger-full-access --confirm-full-access --prompt "Say exactly: CODEX_FULL_ACCESS_OK"
 agent-loop show "$RUN_ID"
 ```

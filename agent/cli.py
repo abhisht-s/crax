@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import shlex
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
-from agent.codex_terminal import check_codex_environment, run_codex_exec, run_command
+from agent.codex_terminal import (
+    ALLOWED_CODEX_SANDBOXES,
+    check_codex_environment,
+    run_codex_exec,
+    run_command,
+)
 from agent import ledger
 
 
@@ -40,6 +47,16 @@ def _build_parser() -> argparse.ArgumentParser:
     codex_run_parser.add_argument("--prompt", required=True, help="Prompt to pass to Codex exec.")
     codex_run_parser.add_argument("--repo", help="Repository/workdir for Codex exec. Default: current directory.")
     codex_run_parser.add_argument("--cwd", help=argparse.SUPPRESS)
+    codex_run_parser.add_argument(
+        "--sandbox",
+        default="read-only",
+        help="Codex sandbox mode: read-only, workspace-write, or danger-full-access. Default: read-only.",
+    )
+    codex_run_parser.add_argument(
+        "--confirm-full-access",
+        action="store_true",
+        help="Required with --sandbox danger-full-access.",
+    )
     codex_run_parser.add_argument(
         "--timeout",
         type=int,
@@ -137,16 +154,45 @@ def _print_codex_check_result(result: dict) -> None:
 
 def _print_codex_exec_result(result: dict) -> None:
     print(f"repo_path: {result['repo_path']}")
+    print(f"sandbox: {result['sandbox']}")
     print(f"found: {result['found']}")
     print(f"codex_path: {result['codex_path'] or ''}")
     print(f"exit_code: {result['exit_code']}")
     print(f"timed_out: {result['timed_out']}")
+    if result["validation_error"]:
+        print(f"validation_error: {result['validation_error']}")
     print("stdout:")
     print(result["stdout"], end="" if result["stdout"].endswith("\n") else "\n")
 
     if result["stderr"]:
         print("stderr:", file=sys.stderr)
         print(result["stderr"], end="" if result["stderr"].endswith("\n") else "\n", file=sys.stderr)
+
+
+def _codex_exec_validation_result(
+    prompt: str,
+    repo_path: str,
+    sandbox: str,
+    validation_error: str,
+) -> dict:
+    now = datetime.now(UTC).isoformat()
+    codex_path = shutil.which("codex")
+    return {
+        "mode": "exec",
+        "found": codex_path is not None,
+        "codex_path": codex_path,
+        "prompt": prompt,
+        "repo_path": repo_path,
+        "sandbox": sandbox,
+        "command": ["codex", "exec", "-C", repo_path, "-s", sandbox, prompt],
+        "exit_code": 2,
+        "stdout": "",
+        "stderr": f"{validation_error}\n",
+        "timed_out": False,
+        "started_at": now,
+        "finished_at": now,
+        "validation_error": validation_error,
+    }
 
 
 def main() -> None:
@@ -218,6 +264,7 @@ def main() -> None:
         else:
             repo_path = Path.cwd().resolve()
         repo_path_text = str(repo_path)
+        sandbox = args.sandbox
 
         ledger.add_event(
             args.run_id,
@@ -227,23 +274,51 @@ def main() -> None:
                 "prompt": args.prompt,
                 "repo_path": repo_path_text,
                 "timeout": args.timeout,
+                "sandbox": sandbox,
             },
         )
 
-        result = run_codex_exec(
-            args.prompt,
-            repo_path=repo_path_text,
-            timeout_seconds=args.timeout,
+        validation_error = None
+        if sandbox not in ALLOWED_CODEX_SANDBOXES:
+            validation_error = (
+                "Invalid Codex sandbox. Allowed values: "
+                f"{', '.join(ALLOWED_CODEX_SANDBOXES)}."
+            )
+        elif sandbox == "danger-full-access" and not args.confirm_full_access:
+            validation_error = "Codex sandbox danger-full-access requires --confirm-full-access."
+
+        if validation_error is None:
+            result = run_codex_exec(
+                args.prompt,
+                repo_path=repo_path_text,
+                timeout_seconds=args.timeout,
+                sandbox=sandbox,
+            )
+        else:
+            result = _codex_exec_validation_result(
+                args.prompt,
+                repo_path=repo_path_text,
+                sandbox=sandbox,
+                validation_error=validation_error,
+            )
+
+        validation_message = (
+            f" validation_error={result['validation_error']}"
+            if result["validation_error"]
+            else ""
         )
         ledger.add_event(
             args.run_id,
             "codex_exec_finished",
             (
                 f"found={result['found']} exit_code={result['exit_code']} "
-                f"timed_out={result['timed_out']} repo_path={result['repo_path']}"
+                f"timed_out={result['timed_out']} repo_path={result['repo_path']} "
+                f"sandbox={result['sandbox']}{validation_message}"
             ),
             result,
         )
+        if result["validation_error"]:
+            print(f"error: {result['validation_error']}", file=sys.stderr)
         _print_codex_exec_result(result)
 
         if result["validation_error"]:

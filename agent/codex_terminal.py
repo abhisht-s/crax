@@ -5,6 +5,8 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+ALLOWED_CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
+
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -73,6 +75,7 @@ def run_codex_exec(
     repo_path: str | Path | None = None,
     timeout_seconds: int = 300,
     cwd: str | Path | None = None,
+    sandbox: str = "read-only",
 ) -> dict:
     codex_path = shutil.which("codex")
     if repo_path is None:
@@ -80,10 +83,15 @@ def run_codex_exec(
 
     resolved_repo_path = Path(repo_path).expanduser().resolve(strict=False)
     resolved_repo_path_text = str(resolved_repo_path)
-    command = ["codex", "exec", "-C", resolved_repo_path_text, prompt]
+    command = ["codex", "exec", "-C", resolved_repo_path_text, "-s", sandbox, prompt]
 
     validation_error = None
-    if not resolved_repo_path.exists():
+    if sandbox not in ALLOWED_CODEX_SANDBOXES:
+        validation_error = (
+            "Invalid Codex sandbox. Allowed values: "
+            f"{', '.join(ALLOWED_CODEX_SANDBOXES)}."
+        )
+    elif not resolved_repo_path.exists():
         validation_error = f"Repo path does not exist: {resolved_repo_path_text}"
     elif not resolved_repo_path.is_dir():
         validation_error = f"Repo path is not a directory: {resolved_repo_path_text}"
@@ -96,6 +104,7 @@ def run_codex_exec(
             "codex_path": codex_path,
             "prompt": prompt,
             "repo_path": resolved_repo_path_text,
+            "sandbox": sandbox,
             "command": command,
             "exit_code": 2,
             "stdout": "",
@@ -114,6 +123,7 @@ def run_codex_exec(
             "codex_path": None,
             "prompt": prompt,
             "repo_path": resolved_repo_path_text,
+            "sandbox": sandbox,
             "command": command,
             "exit_code": None,
             "stdout": "",
@@ -131,6 +141,7 @@ def run_codex_exec(
         "codex_path": codex_path,
         "prompt": prompt,
         "repo_path": resolved_repo_path_text,
+        "sandbox": sandbox,
         "validation_error": None,
         **result,
     }
