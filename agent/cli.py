@@ -13,6 +13,7 @@ from agent.codex_terminal import (
     run_codex_exec,
     run_command,
 )
+from agent.git_snapshot import capture_git_snapshot
 from agent import ledger
 
 
@@ -169,6 +170,41 @@ def _print_codex_exec_result(result: dict) -> None:
         print(result["stderr"], end="" if result["stderr"].endswith("\n") else "\n", file=sys.stderr)
 
 
+def _short_hash(value: str | None) -> str | None:
+    return value[:12] if value else None
+
+
+def _working_tree_dirty(snapshot: dict) -> bool:
+    return bool(snapshot["status_short"].strip())
+
+
+def _changed_files_count(snapshot: dict) -> int:
+    return len([line for line in snapshot["diff_name_only"].splitlines() if line.strip()])
+
+
+def _snapshot_message(snapshot: dict) -> str:
+    branch = snapshot["branch"] or "None"
+    head = _short_hash(snapshot["head"]) or "None"
+    dirty = str(_working_tree_dirty(snapshot)).lower()
+    return (
+        f"repo_path={snapshot['repo_path']} branch={branch} "
+        f"head={head} dirty={dirty}"
+    )
+
+
+def _print_git_snapshot_summary(snapshot: dict) -> None:
+    print("Git before snapshot:")
+    print(f"repo_path: {snapshot['repo_path']}")
+    print(f"is_git_repo: {str(snapshot['is_git_repo']).lower()}")
+    print(f"branch: {snapshot['branch'] or ''}")
+    print(f"head: {_short_hash(snapshot['head']) or ''}")
+    print(f"dirty: {str(_working_tree_dirty(snapshot)).lower()}")
+    print(f"changed_files_count: {_changed_files_count(snapshot)}")
+    if snapshot["validation_error"]:
+        print(f"validation_error: {snapshot['validation_error']}")
+    sys.stdout.flush()
+
+
 def _codex_exec_validation_result(
     prompt: str,
     repo_path: str,
@@ -265,6 +301,15 @@ def main() -> None:
             repo_path = Path.cwd().resolve()
         repo_path_text = str(repo_path)
         sandbox = args.sandbox
+
+        git_snapshot = capture_git_snapshot(repo_path_text)
+        ledger.add_event(
+            args.run_id,
+            "git_snapshot_before_codex",
+            _snapshot_message(git_snapshot),
+            git_snapshot,
+        )
+        _print_git_snapshot_summary(git_snapshot)
 
         ledger.add_event(
             args.run_id,
