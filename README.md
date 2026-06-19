@@ -248,3 +248,37 @@ correct ChatGPT chat and input box must already be focused.
 `paste-feedback` only pastes. It does not press Enter, submit the message,
 choose a chat, or navigate ChatGPT. macOS may require Accessibility permission
 for Terminal, iTerm, or the Python process before System Events can paste.
+
+## Stage 5.4 Smoke Test
+
+Paste the same GPT feedback text into the currently focused macOS app/text
+field and press Enter only after explicit confirmation:
+
+```sh
+agent-loop submit-feedback <run_id> --copy-first --confirm-submit
+```
+
+This is macOS-only. The correct ChatGPT chat and input box must already be
+focused. The command copies the generated GPT feedback message, uses
+`osascript` / System Events to send Command-V, then sends Enter.
+
+`--confirm-submit` is required, and `--copy-first` is required. Without both
+flags, no copy, paste, or Enter is sent. This is still not chat navigation,
+project selection, response capture, Codex resume, or any LLM API call.
+
+## Stage 5.5 Smoke Test
+
+Bring the ChatGPT desktop app to the front and verify it is frontmost:
+
+```sh
+agent-loop activate-chatgpt
+agent-loop activate-chatgpt --app-name ChatGPT
+```
+
+This is macOS-only. It activates the named desktop app with `osascript`, then
+checks the frontmost app with System Events.
+
+`activate-chatgpt` does not paste, press Enter, submit a message, focus the
+message input, choose a chat, or navigate projects. It assumes the ChatGPT
+desktop app is installed and the correct chat/project is already open. Browser
+support is not implemented yet.

@@ -18,7 +18,13 @@ from agent.continuation_policy import can_continue_run
 from agent.file_classifier import classify_changed_files
 from agent.gpt_feedback import build_gpt_feedback_message
 from agent.git_snapshot import capture_git_snapshot
-from agent.mac_paste import PASTE_METHOD, paste_clipboard_to_frontmost_app
+from agent.mac_app_control import activate_chatgpt
+from agent.mac_paste import (
+    ENTER_METHOD,
+    PASTE_METHOD,
+    paste_clipboard_to_frontmost_app,
+    press_enter_in_frontmost_app,
+)
 from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
 from agent.run_state import RunStatus
@@ -72,6 +78,32 @@ def _build_parser() -> argparse.ArgumentParser:
     paste_feedback_parser.add_argument(
         "--output",
         help="Optional path to write the generated feedback message.",
+    )
+
+    submit_feedback_parser = subparsers.add_parser(
+        "submit-feedback",
+        help="Paste the generated GPT feedback message and press Enter after explicit confirmation.",
+    )
+    submit_feedback_parser.add_argument("run_id", help="Run ID to generate and submit feedback for.")
+    submit_feedback_parser.add_argument(
+        "--copy-first",
+        action="store_true",
+        help="Required: copy the generated GPT feedback message before pasting it.",
+    )
+    submit_feedback_parser.add_argument(
+        "--confirm-submit",
+        action="store_true",
+        help="Required: confirm that Enter should be sent to the focused app.",
+    )
+
+    activate_chatgpt_parser = subparsers.add_parser(
+        "activate-chatgpt",
+        help="Bring the ChatGPT desktop app to the front without pasting or submitting.",
+    )
+    activate_chatgpt_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to activate. Default: ChatGPT.",
     )
 
     can_continue_parser = subparsers.add_parser(
@@ -367,6 +399,15 @@ def _print_continuation_check(run_id: str, result: dict) -> None:
     sys.stdout.flush()
 
 
+def _print_activate_chatgpt_result(result: dict) -> None:
+    print(f"app_name: {result['app_name']}")
+    print(f"activated: {str(result['activated']).lower()}")
+    print(f"frontmost_app: {result['frontmost_app'] or ''}")
+    print(f"is_frontmost: {str(result['is_frontmost']).lower()}")
+    print(f"error: {result['error'] or ''}")
+    sys.stdout.flush()
+
+
 def _print_human_decision(previous_status: str, next_status: str, note: str) -> None:
     print(f"previous_status: {previous_status}")
     print(f"next_status: {next_status}")
@@ -636,6 +677,129 @@ def main() -> None:
         if output_path is not None:
             print(f"wrote: {output_path}")
         raise SystemExit(0 if paste_result["pasted"] else 1)
+
+    if args.command == "submit-feedback":
+        missing_flags = []
+        if not args.copy_first:
+            missing_flags.append("--copy-first")
+        if not args.confirm_submit:
+            missing_flags.append("--confirm-submit")
+        if missing_flags:
+            parser.exit(
+                2,
+                "error: submit-feedback requires "
+                f"{' and '.join(missing_flags)}. No copy, paste, or Enter was sent.\n",
+            )
+
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        feedback = build_gpt_feedback_message(run, ledger.list_events(args.run_id))
+        copied_first = bool(args.copy_first)
+
+        print("The current focused text field will receive the GPT feedback and Enter will be pressed.")
+        print("warning: This sends Enter to the currently focused app.")
+
+        copy_result = copy_to_clipboard(feedback["message"])
+        copy_message = (
+            "Copied GPT feedback message to clipboard."
+            if copy_result["copied"]
+            else f"Failed to copy GPT feedback message to clipboard: {copy_result['error']}"
+        )
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_copied",
+            copy_message,
+            {
+                "run_id": feedback["run_id"],
+                "copied": copy_result["copied"],
+                "method": copy_result["method"],
+                "error": copy_result["error"],
+                "message_length": len(feedback["message"]),
+            },
+        )
+
+        if copy_result["copied"]:
+            paste_result = paste_clipboard_to_frontmost_app()
+            paste_message = (
+                "Pasted GPT feedback into frontmost app."
+                if paste_result["pasted"]
+                else "Failed to paste GPT feedback into frontmost app."
+            )
+        else:
+            paste_result = {
+                "pasted": False,
+                "method": PASTE_METHOD,
+                "error": "Skipped paste because copying GPT feedback to clipboard failed.",
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+            }
+            paste_message = "Skipped paste because copying GPT feedback to clipboard failed."
+
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_pasted",
+            paste_message,
+            {
+                "run_id": feedback["run_id"],
+                "copied_first": copied_first,
+                "paste_result": paste_result,
+                "message_length": len(feedback["message"]),
+            },
+        )
+
+        if copy_result["copied"] and paste_result["pasted"]:
+            submit_result = press_enter_in_frontmost_app()
+            submit_message = (
+                "Submitted GPT feedback by pressing Enter in frontmost app."
+                if submit_result["submitted"]
+                else "Failed to submit GPT feedback by pressing Enter in frontmost app."
+            )
+        else:
+            submit_result = {
+                "submitted": False,
+                "method": ENTER_METHOD,
+                "error": "Skipped submit because copy or paste failed.",
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+            }
+            submit_message = "Skipped submit because copy or paste failed."
+
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_submitted",
+            submit_message,
+            {
+                "run_id": feedback["run_id"],
+                "confirm_submit": bool(args.confirm_submit),
+                "submit_result": submit_result,
+                "message_length": len(feedback["message"]),
+            },
+        )
+
+        print(f"copied_first: {str(copied_first).lower()}")
+        print(f"copied: {str(copy_result['copied']).lower()}")
+        print(f"copy_method: {copy_result['method'] or ''}")
+        print(f"copy_error: {copy_result['error'] or ''}")
+        print(f"pasted: {str(paste_result['pasted']).lower()}")
+        print(f"paste_method: {paste_result['method']}")
+        print(f"paste_error: {paste_result['error'] or ''}")
+        print(f"submitted: {str(submit_result['submitted']).lower()}")
+        print(f"submit_method: {submit_result['method']}")
+        print(f"submit_error: {submit_result['error'] or ''}")
+        raise SystemExit(
+            0
+            if copy_result["copied"] and paste_result["pasted"] and submit_result["submitted"]
+            else 1
+        )
+
+    if args.command == "activate-chatgpt":
+        result = activate_chatgpt(args.app_name)
+        _print_activate_chatgpt_result(result)
+        raise SystemExit(0 if result["is_frontmost"] else 1)
 
     if args.command == "can-continue":
         run = ledger.get_run(args.run_id)
