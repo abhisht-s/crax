@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import shlex
 import sys
@@ -8,6 +9,11 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agent.chatgpt_ax_capture import (
+    DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+    DEFAULT_STABLE_SECONDS,
+    capture_response_after_feedback,
+)
 from agent.clipboard import copy_to_clipboard
 from agent.codex_terminal import (
     ALLOWED_CODEX_SANDBOXES,
@@ -128,6 +134,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "--confirm-submit",
         action="store_true",
         help="Required: confirm GPT feedback should be submitted to ChatGPT.",
+    )
+
+    capture_gpt_response_ax_parser = subparsers.add_parser(
+        "capture-gpt-response-from-chatgpt-ax",
+        help="Capture ChatGPT's visible assistant response through desktop Accessibility after explicit confirmation.",
+    )
+    capture_gpt_response_ax_parser.add_argument(
+        "run_id",
+        help="Run ID whose submitted GPT feedback should be matched before capture.",
+    )
+    capture_gpt_response_ax_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to activate. Default: ChatGPT.",
+    )
+    capture_gpt_response_ax_parser.add_argument(
+        "--confirm-capture",
+        action="store_true",
+        help="Required: confirm ChatGPT desktop AX response capture should run.",
+    )
+    capture_gpt_response_ax_parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+        help=f"Maximum seconds to wait for a stable response. Default: {DEFAULT_CAPTURE_TIMEOUT_SECONDS:g}.",
+    )
+    capture_gpt_response_ax_parser.add_argument(
+        "--stable-seconds",
+        type=float,
+        default=DEFAULT_STABLE_SECONDS,
+        help=f"Seconds the response text must remain stable. Default: {DEFAULT_STABLE_SECONDS:g}.",
     )
 
     submit_feedback_parser = subparsers.add_parser(
@@ -297,6 +334,77 @@ def _command_output(result: dict | None) -> str:
     if result is None:
         return ""
     return result["stdout"] or result["stderr"]
+
+
+def _event_metadata(event: dict) -> dict:
+    metadata_json = event.get("metadata_json")
+    if not metadata_json:
+        return {}
+    try:
+        metadata = json.loads(metadata_json)
+    except json.JSONDecodeError:
+        return {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _latest_successful_gpt_feedback_submission(events: list[dict]) -> dict | None:
+    for event in reversed(events):
+        if event.get("event_type") != "gpt_feedback_submitted":
+            continue
+        metadata = _event_metadata(event)
+        submit_result = metadata.get("submit_result")
+        if isinstance(submit_result, dict):
+            if submit_result.get("submitted") is True:
+                return event
+            continue
+        return event
+    return None
+
+
+def _latest_feedback_generation_before_submission(
+    events: list[dict],
+    submission_event: dict,
+) -> dict | None:
+    submission_event_id = submission_event.get("id")
+    for event in reversed(events):
+        if event.get("event_type") != "gpt_feedback_generated":
+            continue
+        if isinstance(submission_event_id, int) and event.get("id", 0) > submission_event_id:
+            continue
+        return event
+    return None
+
+
+def _feedback_text_from_event_metadata(
+    events: list[dict],
+    submission_event: dict,
+) -> tuple[str | None, dict | None]:
+    submission_event_id = submission_event.get("id")
+    text_keys = (
+        "submitted_feedback_text",
+        "feedback_text",
+        "feedback_message",
+        "message",
+    )
+    event_types = {
+        "gpt_feedback_generated",
+        "gpt_feedback_copied",
+        "gpt_feedback_pasted",
+        "gpt_feedback_submitted",
+    }
+
+    for event in reversed(events):
+        if event.get("event_type") not in event_types:
+            continue
+        if isinstance(submission_event_id, int) and event.get("id", 0) > submission_event_id:
+            continue
+        metadata = _event_metadata(event)
+        for key in text_keys:
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value, event
+
+    return None, None
 
 
 def _print_codex_check_result(result: dict) -> None:
@@ -607,6 +715,27 @@ def _print_chatgpt_feedback_submit_result(
         print("Feedback was submitted to ChatGPT only because --confirm-submit was provided.")
     else:
         print("Feedback was not submitted to ChatGPT.")
+    sys.stdout.flush()
+
+
+def _print_chatgpt_ax_capture_result(
+    run_id: str,
+    activation_result: dict,
+    capture_result: dict,
+    ledger_event: str | None,
+) -> None:
+    print(f"run_id: {run_id}")
+    print(f"activated: {str(activation_result['activated']).lower()}")
+    print(f"frontmost_app: {activation_result['frontmost_app'] or ''}")
+    print(f"is_frontmost: {str(activation_result['is_frontmost']).lower()}")
+    print(f"matched_feedback: {str(capture_result.get('matched_feedback', False)).lower()}")
+    print(f"candidate_count: {capture_result.get('candidate_count', 0)}")
+    print(f"response_length: {capture_result.get('response_length', 0)}")
+    print(f"response_sha256: {capture_result.get('response_sha256', '')}")
+    print(f"stable: {str(capture_result.get('stable', False)).lower()}")
+    print(f"ledger_event: {ledger_event or ''}")
+    print(f"activation_error: {activation_result['error'] or ''}")
+    print(f"error: {capture_result.get('error', '')}")
     sys.stdout.flush()
 
 
@@ -1207,6 +1336,110 @@ def main() -> None:
             )
             else 1
         )
+
+    if args.command == "capture-gpt-response-from-chatgpt-ax":
+        if not args.confirm_capture:
+            parser.exit(
+                2,
+                "error: capture-gpt-response-from-chatgpt-ax requires --confirm-capture. "
+                "No ChatGPT activation, AX inspection, ledger write, clipboard access, paste, "
+                "Enter, submit, or send action was performed.\n",
+            )
+        if args.timeout_seconds <= 0:
+            parser.exit(2, "error: --timeout-seconds must be greater than 0.\n")
+        if args.stable_seconds < 0:
+            parser.exit(2, "error: --stable-seconds must be greater than or equal to 0.\n")
+
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        events = ledger.list_events(args.run_id)
+        submitted_event = _latest_successful_gpt_feedback_submission(events)
+        if submitted_event is None:
+            parser.exit(
+                1,
+                "No successful gpt_feedback_submitted event was found for this run. "
+                "No ChatGPT AX inspection was performed.\n",
+            )
+
+        feedback_text, feedback_event = _feedback_text_from_event_metadata(events, submitted_event)
+        if feedback_text is None:
+            feedback_event = _latest_feedback_generation_before_submission(events, submitted_event)
+            feedback_text = build_gpt_feedback_message(run, events)["message"]
+
+        activation_result = activate_chatgpt(args.app_name)
+        if not activation_result["is_frontmost"]:
+            capture_result = {
+                "matched_feedback": False,
+                "candidate_count": 0,
+                "response_length": 0,
+                "response_sha256": "",
+                "stable": False,
+                "error": activation_result["error"] or "ChatGPT was not frontmost.",
+            }
+            _print_chatgpt_ax_capture_result(
+                args.run_id,
+                activation_result,
+                capture_result,
+                None,
+            )
+            raise SystemExit(1)
+
+        capture_result = capture_response_after_feedback(
+            feedback_text,
+            app_name=args.app_name,
+            timeout_seconds=args.timeout_seconds,
+            stable_seconds=args.stable_seconds,
+        )
+        if not capture_result["ok"]:
+            _print_chatgpt_ax_capture_result(
+                args.run_id,
+                activation_result,
+                capture_result,
+                None,
+            )
+            raise SystemExit(1)
+
+        event_type = "gpt_response_captured"
+        ledger.add_event(
+            args.run_id,
+            event_type,
+            "Captured GPT response from ChatGPT desktop accessibility tree.",
+            {
+                "run_id": args.run_id,
+                "source": capture_result["source"],
+                "app_name": args.app_name,
+                "response_text": capture_result["response_text"],
+                "response_length": capture_result["response_length"],
+                "response_sha256": capture_result["response_sha256"],
+                "matched_submission_event_id": submitted_event.get("id"),
+                "matched_feedback_event_id": feedback_event.get("id") if feedback_event else None,
+                "matched_candidate_index": capture_result["matched_candidate_index"],
+                "matched_candidate_path": capture_result["matched_candidate_path"],
+                "response_candidate_index": capture_result["response_candidate_index"],
+                "response_candidate_path": capture_result["response_candidate_path"],
+                "candidate_count": capture_result["candidate_count"],
+                "stability": {
+                    "stable": capture_result["stable"],
+                    "stable_seconds": capture_result["stable_seconds"],
+                    "successful_polls": capture_result["successful_polls"],
+                    "poll_interval_seconds": capture_result["poll_interval_seconds"],
+                    "timeout_seconds": capture_result["timeout_seconds"],
+                },
+                "match_score": capture_result["match_score"],
+                "capture_format": capture_result["capture_format"],
+                "format_warning": capture_result["format_warning"],
+                "ax_stats": capture_result["ax_stats"],
+            },
+        )
+        _print_chatgpt_ax_capture_result(
+            args.run_id,
+            activation_result,
+            capture_result,
+            event_type,
+        )
+        return
 
     if args.command == "paste-feedback":
         run = ledger.get_run(args.run_id)

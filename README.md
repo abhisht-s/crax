@@ -409,3 +409,40 @@ Manual validation:
 ChatGPT content, use browser automation, or use any LLM/API automation. It still
 depends on the correct ChatGPT chat and input already being open and active
 before the command runs.
+
+## Stage 5.9B Smoke Test
+
+Capture ChatGPT's visible assistant response from the desktop app through
+macOS Accessibility after feedback was submitted:
+
+```sh
+agent-loop capture-gpt-response-from-chatgpt-ax <run_id> --confirm-capture
+agent-loop capture-gpt-response-from-chatgpt-ax <run_id> --app-name ChatGPT --confirm-capture
+```
+
+`--confirm-capture` is required. Without it, no ChatGPT activation, AX
+inspection, ledger write, clipboard access, paste, Enter, submit, or send action
+is performed.
+
+This command activates the ChatGPT desktop app, verifies it is frontmost, reads
+the focused window's Accessibility tree, matches the previously submitted GPT
+feedback from the ledger, waits for the following assistant response text to be
+stable, and records `gpt_response_captured`.
+
+It does not click, paste, submit, press Enter, scroll, navigate projects/chats,
+inspect browser ChatGPT, or use any LLM/API automation. The correct ChatGPT
+project/chat must still be open manually, and the submitted feedback plus the
+assistant response must be visible in the current window. This is v0.1 behavior:
+it aborts instead of guessing if it cannot match the submitted feedback or
+identify the following assistant response.
+
+The captured text is rendered macOS Accessibility text. Markdown and code block
+formatting may be lossy compared with the original ChatGPT message.
+
+Manual validation:
+
+1. Submit feedback using `agent-loop submit-feedback-to-chatgpt <run_id> --confirm-submit`.
+2. Wait for ChatGPT's response to finish.
+3. Run `agent-loop capture-gpt-response-from-chatgpt-ax <run_id> --confirm-capture`.
+4. Confirm output says `matched_feedback: true`, `stable: true`, and `ledger_event: gpt_response_captured`.
+5. Run `agent-loop show <run_id>` and confirm `gpt_response_captured` exists.
