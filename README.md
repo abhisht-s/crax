@@ -150,3 +150,22 @@ Expected ledger event:
 ```text
 supervision_decision
 ```
+
+## Stage 4.2 Smoke Test
+
+Update run status from the supervision decision and inspect the recorded transition event:
+
+```sh
+REPO_PATH="$(pwd)"
+RUN_ID=$(agent-loop start "Run status transition test")
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: RUN_STATUS_TRANSITION_OK"
+agent-loop show "$RUN_ID"
+```
+
+Expected:
+
+```text
+run_status_transition
+```
+
+Run status should be `completed` if no meaningful anomalies are detected, or `completed` with a `record_only` decision if only `repo_dirty_before_codex` exists.

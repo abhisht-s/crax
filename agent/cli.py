@@ -17,6 +17,8 @@ from agent.file_classifier import classify_changed_files
 from agent.git_snapshot import capture_git_snapshot
 from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
+from agent.run_state import RunStatus
+from agent.run_status_policy import status_from_supervision_decision
 from agent import ledger
 
 
@@ -275,6 +277,23 @@ def _print_supervision_decision(decision: dict) -> None:
     sys.stdout.flush()
 
 
+def _run_status_transition_message(transition: dict) -> str:
+    return (
+        f"previous_status={transition['previous_status']} "
+        f"next_status={transition['next_status']} "
+        f"reason={transition['reason']}"
+    )
+
+
+def _print_run_status_transition(transition: dict) -> None:
+    print("Run status transition:")
+    print(f"previous_status: {transition['previous_status']}")
+    print(f"next_status: {transition['next_status']}")
+    print(f"reason: {transition['reason']}")
+    print(f"should_auto_complete: {transition['should_auto_complete']}")
+    sys.stdout.flush()
+
+
 def _codex_exec_validation_result(
     prompt: str,
     repo_path: str,
@@ -486,6 +505,21 @@ def main() -> None:
             supervision_decision,
         )
         _print_supervision_decision(supervision_decision)
+
+        transition = status_from_supervision_decision(supervision_decision, result)
+        transition = {
+            **transition,
+            "previous_status": run["status"],
+            "next_status": transition["next_status"],
+        }
+        ledger.update_run_status(args.run_id, RunStatus(transition["next_status"]))
+        ledger.add_event(
+            args.run_id,
+            "run_status_transition",
+            _run_status_transition_message(transition),
+            transition,
+        )
+        _print_run_status_transition(transition)
 
         if result["validation_error"]:
             raise SystemExit(2)
