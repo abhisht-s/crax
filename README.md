@@ -187,3 +187,21 @@ human_approval
 human_rejection
 human_review_completed
 ```
+
+## Stage 4.4 Smoke Test
+
+Check whether a run can continue to a future automated step:
+
+```sh
+agent-loop can-continue <run_id>
+```
+
+`completed` and `approved` runs allow continuation. `needs_review`,
+`waiting_for_approval`, `rejected`, and `failed` runs block continuation until
+the required human or manual action is handled.
+
+Expected ledger event:
+
+```text
+continuation_check
+```

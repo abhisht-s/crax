@@ -13,6 +13,7 @@ from agent.codex_terminal import (
     run_codex_exec,
     run_command,
 )
+from agent.continuation_policy import can_continue_run
 from agent.file_classifier import classify_changed_files
 from agent.git_snapshot import capture_git_snapshot
 from agent.risk_policy import evaluate_supervision_decision
@@ -38,6 +39,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     show_parser = subparsers.add_parser("show", help="Show a run and its events.")
     show_parser.add_argument("run_id", help="Run ID to show.")
+
+    can_continue_parser = subparsers.add_parser(
+        "can-continue",
+        help="Check whether a run may continue to the next automated step.",
+    )
+    can_continue_parser.add_argument("run_id", help="Run ID to check.")
 
     approve_parser = subparsers.add_parser("approve", help="Approve a flagged run.")
     approve_parser.add_argument("run_id", help="Run ID to approve.")
@@ -309,6 +316,23 @@ def _print_run_status_transition(transition: dict) -> None:
     sys.stdout.flush()
 
 
+def _continuation_check_message(result: dict) -> str:
+    return (
+        f"can_continue={result['can_continue']} "
+        f"status={result['status']} "
+        f"reason={result['reason']}"
+    )
+
+
+def _print_continuation_check(run_id: str, result: dict) -> None:
+    print(f"run_id: {run_id}")
+    print(f"status: {result['status']}")
+    print(f"can_continue: {result['can_continue']}")
+    print(f"reason: {result['reason']}")
+    print(f"required_action: {result['required_action'] or ''}")
+    sys.stdout.flush()
+
+
 def _print_human_decision(previous_status: str, next_status: str, note: str) -> None:
     print(f"previous_status: {previous_status}")
     print(f"next_status: {next_status}")
@@ -414,6 +438,21 @@ def main() -> None:
 
         _print_run(run, ledger.list_events(args.run_id))
         return
+
+    if args.command == "can-continue":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        result = can_continue_run(run["status"])
+        ledger.add_event(
+            args.run_id,
+            "continuation_check",
+            _continuation_check_message(result),
+            result,
+        )
+        _print_continuation_check(args.run_id, result)
+        raise SystemExit(0 if result["can_continue"] else 2)
 
     if args.command == "approve":
         run = ledger.get_run(args.run_id)
