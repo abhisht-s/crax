@@ -39,6 +39,21 @@ def _build_parser() -> argparse.ArgumentParser:
     show_parser = subparsers.add_parser("show", help="Show a run and its events.")
     show_parser.add_argument("run_id", help="Run ID to show.")
 
+    approve_parser = subparsers.add_parser("approve", help="Approve a flagged run.")
+    approve_parser.add_argument("run_id", help="Run ID to approve.")
+    approve_parser.add_argument("--note", default="", help="Optional human approval note.")
+
+    reject_parser = subparsers.add_parser("reject", help="Reject a flagged run.")
+    reject_parser.add_argument("run_id", help="Run ID to reject.")
+    reject_parser.add_argument("--note", default="", help="Optional human rejection note.")
+
+    complete_review_parser = subparsers.add_parser(
+        "complete-review",
+        help="Mark a needs_review run as reviewed and completed.",
+    )
+    complete_review_parser.add_argument("run_id", help="Run ID to complete review for.")
+    complete_review_parser.add_argument("--note", default="", help="Optional human review note.")
+
     codex_check_parser = subparsers.add_parser(
         "codex-check",
         help="Check local Codex CLI availability without running prompts.",
@@ -294,6 +309,63 @@ def _print_run_status_transition(transition: dict) -> None:
     sys.stdout.flush()
 
 
+def _print_human_decision(previous_status: str, next_status: str, note: str) -> None:
+    print(f"previous_status: {previous_status}")
+    print(f"next_status: {next_status}")
+    print(f"note: {note}")
+    sys.stdout.flush()
+
+
+def _resolve_flagged_run(
+    run_id: str,
+    run: dict,
+    note: str,
+    allowed_statuses: set[str],
+    next_status: RunStatus,
+    allowed_event_type: str,
+    allowed_message: str,
+    rejected_event_type: str,
+    action_label: str,
+) -> None:
+    current_status = run["status"]
+    if current_status not in allowed_statuses:
+        allowed_statuses_text = ", ".join(sorted(allowed_statuses))
+        message = (
+            f"Cannot {action_label} run from current status "
+            f"{current_status!r}. Allowed statuses: {allowed_statuses_text}."
+        )
+        ledger.add_event(
+            run_id,
+            rejected_event_type,
+            message,
+            {
+                "current_status": current_status,
+                "note": note,
+            },
+        )
+        print(f"error: {message}", file=sys.stderr)
+        raise SystemExit(1)
+
+    previous_status = current_status
+    ledger.update_run_status(
+        run_id,
+        next_status,
+        final_summary=run["final_summary"],
+        error=run["error"],
+    )
+    ledger.add_event(
+        run_id,
+        allowed_event_type,
+        allowed_message,
+        {
+            "previous_status": previous_status,
+            "next_status": next_status.value,
+            "note": note,
+        },
+    )
+    _print_human_decision(previous_status, next_status.value, note)
+
+
 def _codex_exec_validation_result(
     prompt: str,
     repo_path: str,
@@ -341,6 +413,60 @@ def main() -> None:
             parser.exit(1, f"Run not found: {args.run_id}\n")
 
         _print_run(run, ledger.list_events(args.run_id))
+        return
+
+    if args.command == "approve":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        _resolve_flagged_run(
+            args.run_id,
+            run,
+            args.note,
+            {RunStatus.WAITING_FOR_APPROVAL.value, RunStatus.NEEDS_REVIEW.value},
+            RunStatus.APPROVED,
+            "human_approval",
+            "Run approved by user.",
+            "human_approval_rejected_by_state",
+            "approve",
+        )
+        return
+
+    if args.command == "reject":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        _resolve_flagged_run(
+            args.run_id,
+            run,
+            args.note,
+            {RunStatus.WAITING_FOR_APPROVAL.value, RunStatus.NEEDS_REVIEW.value},
+            RunStatus.REJECTED,
+            "human_rejection",
+            "Run rejected by user.",
+            "human_rejection_rejected_by_state",
+            "reject",
+        )
+        return
+
+    if args.command == "complete-review":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        _resolve_flagged_run(
+            args.run_id,
+            run,
+            args.note,
+            {RunStatus.NEEDS_REVIEW.value},
+            RunStatus.COMPLETED,
+            "human_review_completed",
+            "Run review completed by user.",
+            "human_review_completion_rejected_by_state",
+            "complete review for",
+        )
         return
 
     if args.command == "run-shell":

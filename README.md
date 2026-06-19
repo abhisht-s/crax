@@ -169,3 +169,21 @@ run_status_transition
 ```
 
 Run status should be `completed` if no meaningful anomalies are detected, or `completed` with a `record_only` decision if only `repo_dirty_before_codex` exists.
+
+## Stage 4.3 Smoke Test
+
+Resolve flagged runs after human review:
+
+```sh
+agent-loop approve <run_id> --note "Reviewed scope issue, acceptable."
+agent-loop reject <run_id> --note "Audit-only prompt modified files."
+agent-loop complete-review <run_id> --note "Migration change reviewed."
+```
+
+Expected ledger events:
+
+```text
+human_approval
+human_rejection
+human_review_completed
+```
