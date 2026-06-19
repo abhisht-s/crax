@@ -33,6 +33,10 @@ from agent.mac_paste import (
     press_enter_in_frontmost_app,
 )
 from agent.mac_ui_inspect import inspect_chatgpt_ui
+from agent.prompt_extraction import (
+    find_latest_valid_captured_response,
+    extract_next_codex_prompt_from_text,
+)
 from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
 from agent.run_state import RunStatus
@@ -165,6 +169,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_STABLE_SECONDS,
         help=f"Seconds the response text must remain stable. Default: {DEFAULT_STABLE_SECONDS:g}.",
+    )
+
+    extract_next_codex_prompt_parser = subparsers.add_parser(
+        "extract-next-codex-prompt",
+        help="Extract and preview a next Codex prompt from the latest captured GPT response without running Codex.",
+    )
+    extract_next_codex_prompt_parser.add_argument(
+        "run_id",
+        help="Run ID whose captured GPT response should be inspected.",
+    )
+    extract_next_codex_prompt_parser.add_argument(
+        "--confirm-extract",
+        action="store_true",
+        help="Required to write the extracted prompt artifact and ledger event.",
+    )
+    extract_next_codex_prompt_parser.add_argument(
+        "--output",
+        help="Optional path to write the extracted prompt when --confirm-extract is present.",
     )
 
     submit_feedback_parser = subparsers.add_parser(
@@ -739,6 +761,56 @@ def _print_chatgpt_ax_capture_result(
     sys.stdout.flush()
 
 
+def _prompt_preview(prompt_text: str, limit: int = 500) -> str:
+    if len(prompt_text) <= limit:
+        return prompt_text
+    return f"{prompt_text[:limit]}\n... (truncated)"
+
+
+def _print_next_codex_prompt_extraction_result(
+    run_id: str,
+    selection: object,
+    extraction: object | None,
+    output_path: Path | None = None,
+    ledger_event: str | None = None,
+) -> None:
+    source_event = getattr(selection, "source_event", None)
+    submitted_event = getattr(selection, "submitted_event", None)
+    source_event_id = source_event.get("id") if isinstance(source_event, dict) else None
+    submitted_event_id = submitted_event.get("id") if isinstance(submitted_event, dict) else None
+    selection_warnings = list(getattr(selection, "warnings", ()))
+    extraction_warnings = list(getattr(extraction, "warnings", ())) if extraction is not None else []
+    error = getattr(extraction, "error", None) if extraction is not None else getattr(selection, "error", None)
+    prompt_text = getattr(extraction, "prompt_text", "") if extraction is not None else ""
+    selected_prompt_index = (
+        getattr(extraction, "selected_prompt_index", None) if extraction is not None else None
+    )
+
+    print(f"run_id: {run_id}")
+    print(f"source_event_id: {source_event_id or ''}")
+    print(f"matched_submission_event_id: {submitted_event_id or ''}")
+    print(f"extraction_method: {getattr(extraction, 'extraction_method', None) or ''}")
+    print(f"prompt_found: {str(bool(getattr(extraction, 'ok', False))).lower()}")
+    print(f"prompt_length: {getattr(extraction, 'prompt_length', 0) if extraction is not None else 0}")
+    print(f"prompt_sha256: {getattr(extraction, 'prompt_sha256', '') if extraction is not None else ''}")
+    print(
+        "safety_status: "
+        f"{getattr(extraction, 'safety_status', 'requires_human_review') if extraction is not None else 'requires_human_review'}"
+    )
+    print(f"prompt_count_detected: {getattr(extraction, 'prompt_count_detected', 0) if extraction is not None else 0}")
+    print(f"selected_prompt_index: {selected_prompt_index if selected_prompt_index is not None else ''}")
+    print(f"output_path: {str(output_path) if output_path is not None else ''}")
+    print(f"ledger_event: {ledger_event or ''}")
+    for warning in selection_warnings + extraction_warnings:
+        print(f"warning: {warning}")
+    print(f"error: {error or ''}")
+    if prompt_text:
+        print("prompt_preview:")
+        print(_prompt_preview(prompt_text))
+    print("No Codex execution was performed.")
+    sys.stdout.flush()
+
+
 def _print_human_decision(previous_status: str, next_status: str, note: str) -> None:
     print(f"previous_status: {previous_status}")
     print(f"next_status: {next_status}")
@@ -750,6 +822,12 @@ def _write_feedback_output(output_path_text: str, message: str) -> Path:
     output_path = Path(output_path_text).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(message, encoding="utf-8")
+    return output_path
+
+
+def _write_text_output(output_path: Path, text: str) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(text, encoding="utf-8")
     return output_path
 
 
@@ -1438,6 +1516,69 @@ def main() -> None:
             activation_result,
             capture_result,
             event_type,
+        )
+        return
+
+    if args.command == "extract-next-codex-prompt":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        events = ledger.list_events(args.run_id)
+        selection = find_latest_valid_captured_response(events)
+        if not selection.ok:
+            _print_next_codex_prompt_extraction_result(args.run_id, selection, None)
+            raise SystemExit(1)
+
+        extraction = extract_next_codex_prompt_from_text(selection.response_text)
+        if not extraction.ok:
+            _print_next_codex_prompt_extraction_result(args.run_id, selection, extraction)
+            raise SystemExit(1)
+
+        output_path = None
+        ledger_event = None
+        if args.confirm_extract:
+            output_path = (
+                Path(args.output).expanduser()
+                if args.output
+                else Path("data") / "runs" / args.run_id / "next_codex_prompt.md"
+            )
+            try:
+                output_path = _write_text_output(output_path, extraction.prompt_text)
+            except OSError as exc:
+                parser.exit(1, f"Failed to write extracted Codex prompt output: {exc}\n")
+
+            ledger_event = "next_codex_prompt_extracted"
+            warnings = [*selection.warnings, *extraction.warnings]
+            ledger.add_event(
+                args.run_id,
+                ledger_event,
+                "Extracted next Codex prompt from captured GPT response.",
+                {
+                    "source_event_id": selection.source_event["id"] if selection.source_event else None,
+                    "source_event_type": "gpt_response_captured",
+                    "source_response_sha256": selection.response_sha256,
+                    "matched_submission_event_id": (
+                        selection.submitted_event["id"] if selection.submitted_event else None
+                    ),
+                    "extraction_method": extraction.extraction_method,
+                    "prompt_text": extraction.prompt_text,
+                    "prompt_path": str(output_path),
+                    "prompt_length": extraction.prompt_length,
+                    "prompt_sha256": extraction.prompt_sha256,
+                    "prompt_count_detected": extraction.prompt_count_detected,
+                    "selected_prompt_index": extraction.selected_prompt_index,
+                    "safety_status": extraction.safety_status,
+                    "warnings": warnings,
+                },
+            )
+
+        _print_next_codex_prompt_extraction_result(
+            args.run_id,
+            selection,
+            extraction,
+            output_path=output_path,
+            ledger_event=ledger_event,
         )
         return
 

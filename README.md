@@ -446,3 +446,61 @@ Manual validation:
 3. Run `agent-loop capture-gpt-response-from-chatgpt-ax <run_id> --confirm-capture`.
 4. Confirm output says `matched_feedback: true`, `stable: true`, and `ledger_event: gpt_response_captured`.
 5. Run `agent-loop show <run_id>` and confirm `gpt_response_captured` exists.
+
+## Stage 5.10B Smoke Test
+
+Extract and preview a candidate next Codex prompt from the latest valid
+captured GPT response without running Codex:
+
+```sh
+agent-loop extract-next-codex-prompt <run_id>
+agent-loop extract-next-codex-prompt <run_id> --confirm-extract
+agent-loop extract-next-codex-prompt <run_id> --confirm-extract --output data/runs/<run_id>/next_codex_prompt.md
+```
+
+Without `--confirm-extract`, this command is read-only. It reads the ledger,
+selects a valid captured GPT response, extracts a candidate prompt if the
+response uses strict prompt markers, prints a bounded preview, and does not
+write a ledger event or output file.
+
+With `--confirm-extract`, it writes the extracted prompt to
+`data/runs/<run_id>/next_codex_prompt.md` by default, or to `--output` when
+provided, and records `next_codex_prompt_extracted`.
+
+This command never runs Codex, pastes, submits, presses Enter, clicks, scrolls,
+interacts with ChatGPT, performs ChatGPT AX capture, or uses an LLM/API. Every
+extracted prompt is recorded as `requires_human_review` and is preview-only
+until a later explicit human-confirmed execution step.
+
+Prompt extraction prefers this sentinel contract:
+
+```text
+BEGIN_NEXT_CODEX_PROMPT
+...
+END_NEXT_CODEX_PROMPT
+```
+
+If GPT wants a next Codex step, it should include exactly one sentinel block. If
+no Codex step should run, it should omit the markers.
+
+If no sentinel block exists, the extractor accepts exactly one triple-backtick
+fenced code block only when it is introduced by one of these labels:
+
+```text
+Codex prompt:
+Next Codex prompt:
+Prompt for Codex:
+Use this Codex prompt:
+```
+
+The command rejects prose-only responses, unlabeled code blocks, empty prompt
+blocks, malformed sentinel markers, multiple sentinel blocks, multiple labeled
+fenced prompt blocks, SHA mismatches, and stale captures.
+
+Stale-capture protection:
+
+1. The latest successful `gpt_feedback_submitted` event is selected.
+2. Only `gpt_response_captured` events whose `matched_submission_event_id`
+   matches that latest submission are eligible.
+3. The captured response must contain non-empty `response_text`, contain
+   `response_sha256`, and match the SHA-256 of the response text.
