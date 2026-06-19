@@ -7,6 +7,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+from agent.clipboard import copy_to_clipboard
 from agent.codex_terminal import (
     ALLOWED_CODEX_SANDBOXES,
     check_codex_environment,
@@ -15,7 +16,9 @@ from agent.codex_terminal import (
 )
 from agent.continuation_policy import can_continue_run
 from agent.file_classifier import classify_changed_files
+from agent.gpt_feedback import build_gpt_feedback_message
 from agent.git_snapshot import capture_git_snapshot
+from agent.mac_paste import PASTE_METHOD, paste_clipboard_to_frontmost_app
 from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
 from agent.run_state import RunStatus
@@ -39,6 +42,37 @@ def _build_parser() -> argparse.ArgumentParser:
 
     show_parser = subparsers.add_parser("show", help="Show a run and its events.")
     show_parser.add_argument("run_id", help="Run ID to show.")
+
+    gpt_feedback_parser = subparsers.add_parser(
+        "gpt-feedback",
+        help="Generate a GPT feedback message from the latest Codex run output.",
+    )
+    gpt_feedback_parser.add_argument("run_id", help="Run ID to generate feedback for.")
+    gpt_feedback_parser.add_argument(
+        "--output",
+        help="Optional path to write the generated feedback message.",
+    )
+    gpt_feedback_parser.add_argument(
+        "--copy",
+        action="store_true",
+        help="Copy the generated GPT feedback message to the macOS clipboard.",
+    )
+
+    paste_feedback_parser = subparsers.add_parser(
+        "paste-feedback",
+        help="Paste the generated GPT feedback message into the frontmost focused app.",
+    )
+    paste_feedback_parser.add_argument("run_id", help="Run ID to generate and paste feedback for.")
+    paste_feedback_parser.add_argument(
+        "--copy-first",
+        action="store_true",
+        required=True,
+        help="Required: copy the generated GPT feedback message before pasting it.",
+    )
+    paste_feedback_parser.add_argument(
+        "--output",
+        help="Optional path to write the generated feedback message.",
+    )
 
     can_continue_parser = subparsers.add_parser(
         "can-continue",
@@ -340,6 +374,13 @@ def _print_human_decision(previous_status: str, next_status: str, note: str) -> 
     sys.stdout.flush()
 
 
+def _write_feedback_output(output_path_text: str, message: str) -> Path:
+    output_path = Path(output_path_text).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(message, encoding="utf-8")
+    return output_path
+
+
 def _resolve_flagged_run(
     run_id: str,
     run: dict,
@@ -438,6 +479,163 @@ def main() -> None:
 
         _print_run(run, ledger.list_events(args.run_id))
         return
+
+    if args.command == "gpt-feedback":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        feedback = build_gpt_feedback_message(run, ledger.list_events(args.run_id))
+
+        if args.output:
+            try:
+                output_path = _write_feedback_output(args.output, feedback["message"])
+            except OSError as exc:
+                parser.exit(1, f"Failed to write GPT feedback output: {exc}\n")
+
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_generated",
+            "Generated GPT feedback message.",
+            {
+                "run_id": feedback["run_id"],
+                "status": feedback["status"],
+                "codex_exit_code": feedback["codex_exit_code"],
+                "codex_timed_out": feedback["codex_timed_out"],
+                "changed_files": feedback["changed_files"],
+                "message_length": len(feedback["message"]),
+            },
+        )
+
+        copy_result = None
+        if args.copy:
+            copy_result = copy_to_clipboard(feedback["message"])
+            copy_message = (
+                "Copied GPT feedback message to clipboard."
+                if copy_result["copied"]
+                else f"Failed to copy GPT feedback message to clipboard: {copy_result['error']}"
+            )
+            ledger.add_event(
+                args.run_id,
+                "gpt_feedback_copied",
+                copy_message,
+                {
+                    "copied": copy_result["copied"],
+                    "method": copy_result["method"],
+                    "error": copy_result["error"],
+                    "message_length": len(feedback["message"]),
+                },
+            )
+
+        print(feedback["message"])
+        if args.output:
+            print(f"wrote: {output_path}")
+        if copy_result is not None:
+            if copy_result["copied"]:
+                print(f"copied: true (method: {copy_result['method']})")
+            else:
+                print(f"copied: false ({copy_result['error']})")
+                sys.exit(1)
+        return
+
+    if args.command == "paste-feedback":
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        feedback = build_gpt_feedback_message(run, ledger.list_events(args.run_id))
+        output_path = None
+
+        if args.output:
+            try:
+                output_path = _write_feedback_output(args.output, feedback["message"])
+            except OSError as exc:
+                parser.exit(1, f"Failed to write GPT feedback output: {exc}\n")
+
+        copied_first = bool(args.copy_first)
+        copy_result = copy_to_clipboard(feedback["message"])
+        copy_message = (
+            "Copied GPT feedback message to clipboard."
+            if copy_result["copied"]
+            else f"Failed to copy GPT feedback message to clipboard: {copy_result['error']}"
+        )
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_copied",
+            copy_message,
+            {
+                "run_id": feedback["run_id"],
+                "copied": copy_result["copied"],
+                "method": copy_result["method"],
+                "error": copy_result["error"],
+                "message_length": len(feedback["message"]),
+            },
+        )
+
+        if not copy_result["copied"]:
+            paste_result = {
+                "pasted": False,
+                "method": PASTE_METHOD,
+                "error": "Skipped paste because copying GPT feedback to clipboard failed.",
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+            }
+            paste_metadata = {
+                "run_id": feedback["run_id"],
+                "copied_first": copied_first,
+                "paste_result": paste_result,
+                "message_length": len(feedback["message"]),
+            }
+            if output_path is not None:
+                paste_metadata["output_path"] = str(output_path)
+            ledger.add_event(
+                args.run_id,
+                "gpt_feedback_pasted",
+                "Failed to paste GPT feedback into frontmost app.",
+                paste_metadata,
+            )
+            print(f"copied_first: {str(copied_first).lower()}")
+            print("pasted: false")
+            print(f"method: {paste_result['method']}")
+            print(f"error: {copy_result['error']}")
+            print("note: No submit/Enter was sent.")
+            if output_path is not None:
+                print(f"wrote: {output_path}")
+            raise SystemExit(1)
+
+        print(
+            "Paste target must already be focused. This command will paste into "
+            "the current focused text field and will not press Enter."
+        )
+        paste_result = paste_clipboard_to_frontmost_app()
+        paste_metadata = {
+            "run_id": feedback["run_id"],
+            "copied_first": copied_first,
+            "paste_result": paste_result,
+            "message_length": len(feedback["message"]),
+        }
+        if output_path is not None:
+            paste_metadata["output_path"] = str(output_path)
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_pasted",
+            (
+                "Pasted GPT feedback into frontmost app."
+                if paste_result["pasted"]
+                else "Failed to paste GPT feedback into frontmost app."
+            ),
+            paste_metadata,
+        )
+
+        print(f"copied_first: {str(copied_first).lower()}")
+        print(f"pasted: {str(paste_result['pasted']).lower()}")
+        print(f"method: {paste_result['method']}")
+        print(f"error: {paste_result['error'] or ''}")
+        print("note: No submit/Enter was sent.")
+        if output_path is not None:
+            print(f"wrote: {output_path}")
+        raise SystemExit(0 if paste_result["pasted"] else 1)
 
     if args.command == "can-continue":
         run = ledger.get_run(args.run_id)

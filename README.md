@@ -205,3 +205,46 @@ Expected ledger event:
 ```text
 continuation_check
 ```
+
+## Stage 5.1 Smoke Test
+
+Generate the GPT feedback text for a completed Codex run:
+
+```sh
+agent-loop gpt-feedback <run_id>
+agent-loop gpt-feedback <run_id> --output data/runs/<run_id>/gpt_feedback.md
+```
+
+This prepares the text that will later be pasted back into ChatGPT after Codex
+finishes. It includes Codex's final captured output plus concise run metadata;
+it does not include full changed code files or full diffs.
+
+## Stage 5.2 Smoke Test
+
+Copy the same GPT feedback text to the macOS clipboard:
+
+```sh
+agent-loop gpt-feedback <run_id> --copy
+agent-loop gpt-feedback <run_id> --output data/runs/<run_id>/gpt_feedback.md --copy
+```
+
+`--copy` uses macOS `pbcopy`. It copies the generated GPT feedback message,
+not source files or diffs.
+
+## Stage 5.3 Smoke Test
+
+Paste the same GPT feedback text into the currently focused macOS app/text
+field:
+
+```sh
+agent-loop paste-feedback <run_id> --copy-first
+agent-loop paste-feedback <run_id> --copy-first --output data/runs/<run_id>/gpt_feedback.md
+```
+
+This is macOS-only. It copies the generated GPT feedback message first, then
+uses `osascript` / System Events to send Command-V to the frontmost app. The
+correct ChatGPT chat and input box must already be focused.
+
+`paste-feedback` only pastes. It does not press Enter, submit the message,
+choose a chat, or navigate ChatGPT. macOS may require Accessibility permission
+for Terminal, iTerm, or the Python process before System Events can paste.
