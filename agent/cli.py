@@ -15,6 +15,7 @@ from agent.codex_terminal import (
 )
 from agent.file_classifier import classify_changed_files
 from agent.git_snapshot import capture_git_snapshot
+from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
 from agent import ledger
 
@@ -230,7 +231,9 @@ def _print_changed_file_classification(classification: dict) -> None:
     sys.stdout.flush()
 
 
-def _diagnostics_message(diagnostics: dict) -> str:
+def _diagnostics_message(diagnostics: dict | None) -> str:
+    if diagnostics is None:
+        return "diagnostics_unavailable"
     return (
         f"outcome={diagnostics['outcome']} "
         f"attention_level={diagnostics['attention_level']} "
@@ -238,13 +241,37 @@ def _diagnostics_message(diagnostics: dict) -> str:
     )
 
 
-def _print_prompt_repo_impact_diagnostics(diagnostics: dict) -> None:
+def _print_prompt_repo_impact_diagnostics(diagnostics: dict | None) -> None:
     print("Prompt/repo impact diagnostics:")
+    if diagnostics is None:
+        print("unavailable")
+        sys.stdout.flush()
+        return
     print(f"outcome: {diagnostics['outcome']}")
     print(f"attention_level: {diagnostics['attention_level']}")
     print(f"prompt_intents: {diagnostics['prompt_intents']}")
     print(f"flags: {diagnostics['flags']}")
     print(f"messages: {diagnostics['messages']}")
+    sys.stdout.flush()
+
+
+def _supervision_decision_message(decision: dict) -> str:
+    return (
+        f"decision={decision['decision']} "
+        f"attention_level={decision['attention_level']} "
+        f"approval_required={decision['approval_required']} "
+        f"reasons={decision['reasons']}"
+    )
+
+
+def _print_supervision_decision(decision: dict) -> None:
+    print("Supervision decision:")
+    print(f"decision: {decision['decision']}")
+    print(f"attention_level: {decision['attention_level']}")
+    print(f"approval_required: {decision['approval_required']}")
+    print(f"needs_review: {decision['needs_review']}")
+    print(f"reasons: {decision['reasons']}")
+    print(f"messages: {decision['messages']}")
     sys.stdout.flush()
 
 
@@ -432,13 +459,17 @@ def main() -> None:
             )
             _print_changed_file_classification(changed_file_classification)
 
-        prompt_repo_impact_diagnostics = analyze_prompt_repo_impact(
-            args.prompt,
-            result,
-            git_snapshot,
-            after_git_snapshot,
-            changed_file_classification,
-        )
+        try:
+            prompt_repo_impact_diagnostics = analyze_prompt_repo_impact(
+                args.prompt,
+                result,
+                git_snapshot,
+                after_git_snapshot,
+                changed_file_classification,
+            )
+        except Exception as exc:
+            prompt_repo_impact_diagnostics = None
+            print(f"warning: prompt/repo impact diagnostics unavailable: {exc}", file=sys.stderr)
         ledger.add_event(
             args.run_id,
             "prompt_repo_impact_diagnostics",
@@ -446,6 +477,15 @@ def main() -> None:
             prompt_repo_impact_diagnostics,
         )
         _print_prompt_repo_impact_diagnostics(prompt_repo_impact_diagnostics)
+
+        supervision_decision = evaluate_supervision_decision(prompt_repo_impact_diagnostics)
+        ledger.add_event(
+            args.run_id,
+            "supervision_decision",
+            _supervision_decision_message(supervision_decision),
+            supervision_decision,
+        )
+        _print_supervision_decision(supervision_decision)
 
         if result["validation_error"]:
             raise SystemExit(2)

@@ -133,3 +133,20 @@ Expected ledger event:
 ```text
 prompt_repo_impact_diagnostics
 ```
+
+## Stage 4.1 Smoke Test
+
+Record a supervision decision after prompt/repo impact diagnostics:
+
+```sh
+REPO_PATH="$(pwd)"
+RUN_ID=$(agent-loop start "Supervision decision test")
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: SUPERVISION_DECISION_OK"
+agent-loop show "$RUN_ID"
+```
+
+Expected ledger event:
+
+```text
+supervision_decision
+```
