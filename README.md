@@ -374,3 +374,38 @@ Manual validation:
 projects/chats, inspect or scrape ChatGPT content, or use any LLM/API/browser
 automation. It still depends on the correct ChatGPT chat and input already being
 open and active before the command runs.
+
+## Stage 5.8 Smoke Test
+
+Generate the real GPT feedback text for a run, copy it, activate the ChatGPT
+desktop app, verify ChatGPT is frontmost, paste into the active ChatGPT input,
+and submit by pressing Enter only after explicit confirmation:
+
+```sh
+agent-loop submit-feedback-to-chatgpt <run_id> --confirm-submit
+agent-loop submit-feedback-to-chatgpt <run_id> --app-name ChatGPT --confirm-submit
+agent-loop submit-feedback-to-chatgpt <run_id> --output data/runs/<run_id>/gpt_feedback.md --confirm-submit
+```
+
+`--confirm-submit` is required. Without it, no feedback is generated, copied,
+pasted, submitted, or sent.
+
+`paste-feedback-to-chatgpt` activates ChatGPT and pastes the feedback, but does
+not submit or press Enter. `submit-feedback-to-chatgpt` activates ChatGPT,
+pastes the feedback, and presses Enter only when `--confirm-submit` is present.
+
+Manual validation:
+
+1. Create or reuse a safe run with GPT feedback available.
+2. Open ChatGPT desktop app.
+3. Open the intended project/chat manually.
+4. Click the message input manually.
+5. Put Terminal/VS Code frontmost.
+6. Run `agent-loop submit-feedback-to-chatgpt <run_id> --confirm-submit`.
+7. Confirm feedback appears and is submitted.
+8. Confirm the ledger shows `gpt_feedback_submitted`.
+
+`submit-feedback-to-chatgpt` does not navigate projects/chats, inspect or scrape
+ChatGPT content, use browser automation, or use any LLM/API automation. It still
+depends on the correct ChatGPT chat and input already being open and active
+before the command runs.
