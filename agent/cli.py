@@ -15,6 +15,7 @@ from agent.codex_terminal import (
 )
 from agent.file_classifier import classify_changed_files
 from agent.git_snapshot import capture_git_snapshot
+from agent.run_diagnostics import analyze_prompt_repo_impact
 from agent import ledger
 
 
@@ -229,6 +230,24 @@ def _print_changed_file_classification(classification: dict) -> None:
     sys.stdout.flush()
 
 
+def _diagnostics_message(diagnostics: dict) -> str:
+    return (
+        f"outcome={diagnostics['outcome']} "
+        f"attention_level={diagnostics['attention_level']} "
+        f"flags={diagnostics['flags']}"
+    )
+
+
+def _print_prompt_repo_impact_diagnostics(diagnostics: dict) -> None:
+    print("Prompt/repo impact diagnostics:")
+    print(f"outcome: {diagnostics['outcome']}")
+    print(f"attention_level: {diagnostics['attention_level']}")
+    print(f"prompt_intents: {diagnostics['prompt_intents']}")
+    print(f"flags: {diagnostics['flags']}")
+    print(f"messages: {diagnostics['messages']}")
+    sys.stdout.flush()
+
+
 def _codex_exec_validation_result(
     prompt: str,
     repo_path: str,
@@ -327,6 +346,8 @@ def main() -> None:
         sandbox = args.sandbox
 
         git_snapshot = capture_git_snapshot(repo_path_text)
+        after_git_snapshot = None
+        changed_file_classification = None
         ledger.add_event(
             args.run_id,
             "git_snapshot_before_codex",
@@ -410,6 +431,21 @@ def main() -> None:
                 changed_file_classification,
             )
             _print_changed_file_classification(changed_file_classification)
+
+        prompt_repo_impact_diagnostics = analyze_prompt_repo_impact(
+            args.prompt,
+            result,
+            git_snapshot,
+            after_git_snapshot,
+            changed_file_classification,
+        )
+        ledger.add_event(
+            args.run_id,
+            "prompt_repo_impact_diagnostics",
+            _diagnostics_message(prompt_repo_impact_diagnostics),
+            prompt_repo_impact_diagnostics,
+        )
+        _print_prompt_repo_impact_diagnostics(prompt_repo_impact_diagnostics)
 
         if result["validation_error"]:
             raise SystemExit(2)

@@ -116,3 +116,20 @@ Expected ledger event:
 ```text
 changed_file_classification
 ```
+
+## Stage 3.4 Smoke Test
+
+Record prompt-intent versus repo-impact diagnostics after changed-file classification:
+
+```sh
+REPO_PATH="$(pwd)"
+RUN_ID=$(agent-loop start "Prompt repo diagnostics test")
+agent-loop codex-run "$RUN_ID" --repo "$REPO_PATH" --prompt "Say exactly: PROMPT_REPO_DIAGNOSTICS_OK"
+agent-loop show "$RUN_ID"
+```
+
+Expected ledger event:
+
+```text
+prompt_repo_impact_diagnostics
+```
