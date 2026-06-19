@@ -282,3 +282,23 @@ checks the frontmost app with System Events.
 message input, choose a chat, or navigate projects. It assumes the ChatGPT
 desktop app is installed and the correct chat/project is already open. Browser
 support is not implemented yet.
+
+## Stage 5.6A Smoke Test
+
+Activate the ChatGPT desktop app and run a minimal read-only UI diagnostic:
+
+```sh
+agent-loop inspect-chatgpt-ui
+agent-loop inspect-chatgpt-ui --app-name ChatGPT
+```
+
+This is a read-only macOS diagnostic. It activates ChatGPT, verifies it is
+frontmost, then uses `osascript` / System Events to attempt safe shallow window
+inspection. It exits successfully if activation and frontmost verification
+succeed, even when deeper accessibility details are unavailable.
+
+`inspect-chatgpt-ui` does not paste, press Enter, submit a message, click,
+focus the message input, choose a chat, or navigate projects. It reports
+warnings when focused-element or text-input candidate inspection is unavailable.
+macOS may require Accessibility permission for Terminal, iTerm, VS Code, or the
+Python process before System Events can inspect ChatGPT.

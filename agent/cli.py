@@ -25,6 +25,7 @@ from agent.mac_paste import (
     paste_clipboard_to_frontmost_app,
     press_enter_in_frontmost_app,
 )
+from agent.mac_ui_inspect import inspect_chatgpt_ui
 from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
 from agent.run_state import RunStatus
@@ -104,6 +105,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--app-name",
         default="ChatGPT",
         help="macOS application name to activate. Default: ChatGPT.",
+    )
+
+    inspect_chatgpt_ui_parser = subparsers.add_parser(
+        "inspect-chatgpt-ui",
+        help="Read-only diagnostic for ChatGPT accessibility UI elements.",
+    )
+    inspect_chatgpt_ui_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
     )
 
     can_continue_parser = subparsers.add_parser(
@@ -405,6 +416,55 @@ def _print_activate_chatgpt_result(result: dict) -> None:
     print(f"frontmost_app: {result['frontmost_app'] or ''}")
     print(f"is_frontmost: {str(result['is_frontmost']).lower()}")
     print(f"error: {result['error'] or ''}")
+    sys.stdout.flush()
+
+
+def _ui_element_label(element: dict) -> str:
+    labels = []
+    for key in ("role", "subrole", "name", "title", "description", "help", "value"):
+        value = element.get(key)
+        if value:
+            labels.append(f"{key}={value!r}")
+    if element.get("enabled") is not None:
+        labels.append(f"enabled={str(element['enabled']).lower()}")
+    if element.get("focused") is not None:
+        labels.append(f"focused={str(element['focused']).lower()}")
+    if element.get("x") is not None and element.get("y") is not None:
+        labels.append(f"pos=({element['x']},{element['y']})")
+    if element.get("width") is not None and element.get("height") is not None:
+        labels.append(f"size=({element['width']}x{element['height']})")
+    return ", ".join(labels) if labels else "(no accessible details)"
+
+
+def _print_ui_element_list(title: str, elements: list[dict], limit: int = 12) -> None:
+    print(f"{title}: {len(elements)}")
+    for index, element in enumerate(elements[:limit], start=1):
+        window_index = element.get("window_index")
+        depth = element.get("depth")
+        prefix = f"  {index}."
+        if window_index is not None:
+            prefix += f" window={window_index}"
+        if depth is not None:
+            prefix += f" depth={depth}"
+        print(f"{prefix} {_ui_element_label(element)}")
+    if len(elements) > limit:
+        print(f"  ... {len(elements) - limit} more omitted")
+
+
+def _print_inspect_chatgpt_ui_result(result: dict) -> None:
+    print(f"activated: {str(result['activated']).lower()}")
+    print(f"frontmost_app: {result['frontmost_app'] or ''}")
+    _print_ui_element_list("windows", result["windows"])
+    print("focused_element:")
+    if result["focused_element"] is None:
+        print("  (none)")
+    else:
+        print(f"  {_ui_element_label(result['focused_element'])}")
+    _print_ui_element_list("text_input_candidates", result["text_input_candidates"])
+    _print_ui_element_list("button_candidates", result.get("button_candidates", []), limit=16)
+    print(f"errors: {len(result['errors'])}")
+    for error in result["errors"]:
+        print(f"  {error}")
     sys.stdout.flush()
 
 
@@ -800,6 +860,12 @@ def main() -> None:
         result = activate_chatgpt(args.app_name)
         _print_activate_chatgpt_result(result)
         raise SystemExit(0 if result["is_frontmost"] else 1)
+
+    if args.command == "inspect-chatgpt-ui":
+        result = inspect_chatgpt_ui(args.app_name)
+        _print_inspect_chatgpt_ui_result(result)
+        is_frontmost = bool(result["activation_result"]["is_frontmost"])
+        raise SystemExit(0 if result["activated"] and is_frontmost else 1)
 
     if args.command == "can-continue":
         run = ledger.get_run(args.run_id)
