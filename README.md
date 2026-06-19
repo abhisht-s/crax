@@ -302,3 +302,38 @@ focus the message input, choose a chat, or navigate projects. It reports
 warnings when focused-element or text-input candidate inspection is unavailable.
 macOS may require Accessibility permission for Terminal, iTerm, VS Code, or the
 Python process before System Events can inspect ChatGPT.
+
+## Stage 5.6B Smoke Test
+
+Activate the ChatGPT desktop app, verify it is frontmost, copy a fixed harmless
+marker, and paste it into the active ChatGPT input:
+
+```sh
+agent-loop test-chatgpt-target-paste --confirm-paste
+agent-loop test-chatgpt-target-paste --app-name ChatGPT --confirm-paste
+```
+
+The pasted marker is:
+
+```text
+WATCH_TO_CODEX_STAGE_5_6B_TARGET_PASTE_TEST_DO_NOT_SUBMIT
+```
+
+`--confirm-paste` is required. Without it, no app activation, copy, paste, or
+Enter is sent.
+
+Manual validation:
+
+1. Open ChatGPT desktop app.
+2. Open the intended project/chat manually.
+3. Click the message input manually.
+4. Put Terminal/VS Code frontmost.
+5. Run `agent-loop test-chatgpt-target-paste --confirm-paste`.
+6. Confirm marker appears in input.
+7. Confirm it was not submitted.
+8. Delete marker manually.
+
+`test-chatgpt-target-paste` does not press Enter, submit the message, navigate
+projects/chats, inspect ChatGPT content, or use any LLM/API/browser automation.
+It still depends on the correct ChatGPT chat and input being active before the
+command runs.

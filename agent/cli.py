@@ -4,6 +4,7 @@ import argparse
 import shutil
 import shlex
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -36,6 +37,8 @@ from agent import ledger
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
 DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS = 30
 DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300
+CHATGPT_TARGET_PASTE_MARKER = "WATCH_TO_CODEX_STAGE_5_6B_TARGET_PASTE_TEST_DO_NOT_SUBMIT"
+CHATGPT_TARGET_PASTE_DELAY_SECONDS = 0.3
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -115,6 +118,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--app-name",
         default="ChatGPT",
         help="macOS application name to inspect. Default: ChatGPT.",
+    )
+
+    test_chatgpt_target_paste_parser = subparsers.add_parser(
+        "test-chatgpt-target-paste",
+        help="Copy and paste a fixed marker into the active ChatGPT input without submitting.",
+    )
+    test_chatgpt_target_paste_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to activate. Default: ChatGPT.",
+    )
+    test_chatgpt_target_paste_parser.add_argument(
+        "--confirm-paste",
+        action="store_true",
+        help="Required: confirm the fixed marker should be pasted into ChatGPT.",
     )
 
     can_continue_parser = subparsers.add_parser(
@@ -465,6 +483,27 @@ def _print_inspect_chatgpt_ui_result(result: dict) -> None:
     print(f"errors: {len(result['errors'])}")
     for error in result["errors"]:
         print(f"  {error}")
+    sys.stdout.flush()
+
+
+def _print_chatgpt_target_paste_result(
+    activation_result: dict,
+    copy_result: dict,
+    paste_result: dict,
+    marker: str,
+) -> None:
+    print(f"activated: {str(activation_result['activated']).lower()}")
+    print(f"frontmost_app: {activation_result['frontmost_app'] or ''}")
+    print(f"is_frontmost: {str(activation_result['is_frontmost']).lower()}")
+    print(f"copied: {str(copy_result['copied']).lower()}")
+    print(f"copy_method: {copy_result['method'] or ''}")
+    print(f"pasted: {str(paste_result['pasted']).lower()}")
+    print(f"paste_method: {paste_result['method'] or ''}")
+    print(f"marker: {marker}")
+    print(f"activation_error: {activation_result['error'] or ''}")
+    print(f"copy_error: {copy_result['error'] or ''}")
+    print(f"paste_error: {paste_result['error'] or ''}")
+    print("No submit/Enter was sent.")
     sys.stdout.flush()
 
 
@@ -866,6 +905,74 @@ def main() -> None:
         _print_inspect_chatgpt_ui_result(result)
         is_frontmost = bool(result["activation_result"]["is_frontmost"])
         raise SystemExit(0 if result["activated"] and is_frontmost else 1)
+
+    if args.command == "test-chatgpt-target-paste":
+        if not args.confirm_paste:
+            parser.exit(
+                2,
+                "error: test-chatgpt-target-paste requires --confirm-paste. "
+                "No copy, paste, or Enter was sent.\n",
+            )
+
+        marker = CHATGPT_TARGET_PASTE_MARKER
+        activation_result = activate_chatgpt(args.app_name)
+        if not activation_result["is_frontmost"]:
+            copy_result = {
+                "copied": False,
+                "method": None,
+                "error": "Skipped copy because ChatGPT was not frontmost.",
+            }
+            paste_result = {
+                "pasted": False,
+                "method": PASTE_METHOD,
+                "error": "Skipped paste because ChatGPT was not frontmost.",
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+            }
+            _print_chatgpt_target_paste_result(
+                activation_result,
+                copy_result,
+                paste_result,
+                marker,
+            )
+            raise SystemExit(1)
+
+        time.sleep(CHATGPT_TARGET_PASTE_DELAY_SECONDS)
+        copy_result = copy_to_clipboard(marker)
+        if not copy_result["copied"]:
+            paste_result = {
+                "pasted": False,
+                "method": PASTE_METHOD,
+                "error": "Skipped paste because copying marker to clipboard failed.",
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+            }
+            _print_chatgpt_target_paste_result(
+                activation_result,
+                copy_result,
+                paste_result,
+                marker,
+            )
+            raise SystemExit(1)
+
+        time.sleep(CHATGPT_TARGET_PASTE_DELAY_SECONDS)
+        paste_result = paste_clipboard_to_frontmost_app()
+        _print_chatgpt_target_paste_result(
+            activation_result,
+            copy_result,
+            paste_result,
+            marker,
+        )
+        raise SystemExit(
+            0
+            if activation_result["activated"]
+            and activation_result["is_frontmost"]
+            and copy_result["copied"]
+            and paste_result["pasted"]
+            else 1
+        )
 
     if args.command == "can-continue":
         run = ledger.get_run(args.run_id)
