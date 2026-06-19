@@ -337,3 +337,40 @@ Manual validation:
 projects/chats, inspect ChatGPT content, or use any LLM/API/browser automation.
 It still depends on the correct ChatGPT chat and input being active before the
 command runs.
+
+## Stage 5.7 Smoke Test
+
+Generate the real GPT feedback text for a run, copy it, activate the ChatGPT
+desktop app, verify ChatGPT is frontmost, and paste into the active ChatGPT
+input:
+
+```sh
+agent-loop paste-feedback-to-chatgpt <run_id> --confirm-paste
+agent-loop paste-feedback-to-chatgpt <run_id> --app-name ChatGPT --confirm-paste
+agent-loop paste-feedback-to-chatgpt <run_id> --output data/runs/<run_id>/gpt_feedback.md --confirm-paste
+```
+
+`--confirm-paste` is required. Without it, no feedback is generated, copied,
+pasted, submitted, or sent.
+
+`paste-feedback` pastes to the current frontmost focused app/text field.
+`paste-feedback-to-chatgpt` activates ChatGPT first, verifies ChatGPT is
+frontmost, then pastes. Both commands only paste; they do not press Enter or
+submit the message.
+
+Manual validation:
+
+1. Create or reuse a run with GPT feedback available.
+2. Open ChatGPT desktop app.
+3. Open the intended project/chat manually.
+4. Click the message input manually.
+5. Put Terminal/VS Code frontmost.
+6. Run `agent-loop paste-feedback-to-chatgpt <run_id> --confirm-paste`.
+7. Confirm feedback appears in ChatGPT input.
+8. Confirm it was not submitted.
+9. Delete it manually or submit manually if appropriate.
+
+`paste-feedback-to-chatgpt` does not press Enter, submit the message, navigate
+projects/chats, inspect or scrape ChatGPT content, or use any LLM/API/browser
+automation. It still depends on the correct ChatGPT chat and input already being
+open and active before the command runs.

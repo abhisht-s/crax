@@ -84,6 +84,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional path to write the generated feedback message.",
     )
 
+    paste_feedback_to_chatgpt_parser = subparsers.add_parser(
+        "paste-feedback-to-chatgpt",
+        help="Generate, copy, activate ChatGPT, verify frontmost, and paste feedback without submitting.",
+    )
+    paste_feedback_to_chatgpt_parser.add_argument(
+        "run_id",
+        help="Run ID to generate and paste feedback for.",
+    )
+    paste_feedback_to_chatgpt_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to activate. Default: ChatGPT.",
+    )
+    paste_feedback_to_chatgpt_parser.add_argument(
+        "--output",
+        help="Optional path to write the generated feedback message.",
+    )
+    paste_feedback_to_chatgpt_parser.add_argument(
+        "--confirm-paste",
+        action="store_true",
+        help="Required: confirm GPT feedback should be pasted into ChatGPT.",
+    )
+
     submit_feedback_parser = subparsers.add_parser(
         "submit-feedback",
         help="Paste the generated GPT feedback message and press Enter after explicit confirmation.",
@@ -507,6 +530,31 @@ def _print_chatgpt_target_paste_result(
     sys.stdout.flush()
 
 
+def _print_chatgpt_feedback_paste_result(
+    run_id: str,
+    copy_result: dict,
+    activation_result: dict,
+    paste_result: dict,
+    output_path: Path | None,
+    error: str | None = None,
+) -> None:
+    print(f"run_id: {run_id}")
+    print(f"copied: {str(copy_result['copied']).lower()}")
+    print(f"copy_method: {copy_result['method'] or ''}")
+    print(f"activated: {str(activation_result['activated']).lower()}")
+    print(f"frontmost_app: {activation_result['frontmost_app'] or ''}")
+    print(f"is_frontmost: {str(activation_result['is_frontmost']).lower()}")
+    print(f"pasted: {str(paste_result['pasted']).lower()}")
+    print(f"paste_method: {paste_result['method'] or ''}")
+    print(f"output_path: {str(output_path) if output_path is not None else ''}")
+    print(f"copy_error: {copy_result['error'] or ''}")
+    print(f"activation_error: {activation_result['error'] or ''}")
+    print(f"paste_error: {paste_result['error'] or ''}")
+    print(f"error: {error or ''}")
+    print("No submit/Enter was sent.")
+    sys.stdout.flush()
+
+
 def _print_human_decision(previous_status: str, next_status: str, note: str) -> None:
     print(f"previous_status: {previous_status}")
     print(f"next_status: {next_status}")
@@ -677,6 +725,178 @@ def main() -> None:
                 print(f"copied: false ({copy_result['error']})")
                 sys.exit(1)
         return
+
+    if args.command == "paste-feedback-to-chatgpt":
+        if not args.confirm_paste:
+            parser.exit(
+                2,
+                "error: paste-feedback-to-chatgpt requires --confirm-paste. "
+                "No feedback was generated, copied, pasted, submitted, or sent.\n",
+            )
+
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        events = ledger.list_events(args.run_id)
+        feedback = build_gpt_feedback_message(run, events)
+        output_path = None
+
+        if args.output:
+            try:
+                output_path = _write_feedback_output(args.output, feedback["message"])
+            except OSError as exc:
+                parser.exit(1, f"Failed to write GPT feedback output: {exc}\n")
+
+        generation_metadata = {
+            "run_id": feedback["run_id"],
+            "status": feedback["status"],
+            "codex_exit_code": feedback["codex_exit_code"],
+            "codex_timed_out": feedback["codex_timed_out"],
+            "changed_files": feedback["changed_files"],
+            "message_length": len(feedback["message"]),
+            "target": "ChatGPT",
+            "app_name": args.app_name,
+            "targeted_chatgpt": True,
+        }
+        if output_path is not None:
+            generation_metadata["output_path"] = str(output_path)
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_generated",
+            "Generated GPT feedback message for ChatGPT-targeted paste.",
+            generation_metadata,
+        )
+
+        copy_result = copy_to_clipboard(feedback["message"])
+        copy_message = (
+            "Copied GPT feedback message to clipboard for ChatGPT-targeted paste."
+            if copy_result["copied"]
+            else f"Failed to copy GPT feedback message to clipboard: {copy_result['error']}"
+        )
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_copied",
+            copy_message,
+            {
+                "run_id": feedback["run_id"],
+                "copied": copy_result["copied"],
+                "method": copy_result["method"],
+                "error": copy_result["error"],
+                "message_length": len(feedback["message"]),
+                "target": "ChatGPT",
+                "app_name": args.app_name,
+                "targeted_chatgpt": True,
+            },
+        )
+
+        if not copy_result["copied"]:
+            activation_result = {
+                "activated": False,
+                "app_name": args.app_name,
+                "frontmost_app": None,
+                "is_frontmost": False,
+                "activation_result": None,
+                "frontmost_result": None,
+                "error": "Skipped activation because copying GPT feedback to clipboard failed.",
+            }
+            paste_result = {
+                "pasted": False,
+                "method": PASTE_METHOD,
+                "error": "Skipped paste because copying GPT feedback to clipboard failed.",
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+            }
+            ledger.add_event(
+                args.run_id,
+                "gpt_feedback_pasted",
+                "Skipped ChatGPT-targeted paste because copying GPT feedback failed.",
+                {
+                    "run_id": feedback["run_id"],
+                    "paste_result": paste_result,
+                    "activation_result": activation_result,
+                    "message_length": len(feedback["message"]),
+                    "target": "ChatGPT",
+                    "app_name": args.app_name,
+                    "targeted_chatgpt": True,
+                    "output_path": str(output_path) if output_path is not None else None,
+                },
+            )
+            _print_chatgpt_feedback_paste_result(
+                args.run_id,
+                copy_result,
+                activation_result,
+                paste_result,
+                output_path,
+                copy_result["error"],
+            )
+            raise SystemExit(1)
+
+        activation_result = activate_chatgpt(args.app_name)
+        if not activation_result["is_frontmost"]:
+            paste_result = {
+                "pasted": False,
+                "method": PASTE_METHOD,
+                "error": "Skipped paste because ChatGPT was not frontmost.",
+                "stdout": "",
+                "stderr": "",
+                "exit_code": None,
+            }
+            ledger.add_event(
+                args.run_id,
+                "gpt_feedback_pasted",
+                "Skipped ChatGPT-targeted paste because ChatGPT was not frontmost.",
+                {
+                    "run_id": feedback["run_id"],
+                    "paste_result": paste_result,
+                    "activation_result": activation_result,
+                    "message_length": len(feedback["message"]),
+                    "target": "ChatGPT",
+                    "app_name": args.app_name,
+                    "targeted_chatgpt": True,
+                    "output_path": str(output_path) if output_path is not None else None,
+                },
+            )
+            _print_chatgpt_feedback_paste_result(
+                args.run_id,
+                copy_result,
+                activation_result,
+                paste_result,
+                output_path,
+                activation_result["error"],
+            )
+            raise SystemExit(1)
+
+        paste_result = paste_clipboard_to_frontmost_app()
+        ledger.add_event(
+            args.run_id,
+            "gpt_feedback_pasted",
+            (
+                "Pasted GPT feedback into ChatGPT."
+                if paste_result["pasted"]
+                else "Failed to paste GPT feedback into ChatGPT."
+            ),
+            {
+                "run_id": feedback["run_id"],
+                "paste_result": paste_result,
+                "activation_result": activation_result,
+                "message_length": len(feedback["message"]),
+                "target": "ChatGPT",
+                "app_name": args.app_name,
+                "targeted_chatgpt": True,
+                "output_path": str(output_path) if output_path is not None else None,
+            },
+        )
+        _print_chatgpt_feedback_paste_result(
+            args.run_id,
+            copy_result,
+            activation_result,
+            paste_result,
+            output_path,
+            paste_result["error"],
+        )
+        raise SystemExit(0 if paste_result["pasted"] else 1)
 
     if args.command == "paste-feedback":
         run = ledger.get_run(args.run_id)
