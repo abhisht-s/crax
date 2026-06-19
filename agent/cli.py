@@ -36,6 +36,7 @@ from agent.mac_ui_inspect import inspect_chatgpt_ui
 from agent.prompt_extraction import (
     find_latest_valid_captured_response,
     extract_next_codex_prompt_from_text,
+    select_latest_valid_extracted_codex_prompt,
 )
 from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
@@ -286,6 +287,45 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Required with --sandbox danger-full-access.",
     )
     codex_run_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
+        help=f"Timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+    )
+
+    run_extracted_codex_prompt_parser = subparsers.add_parser(
+        "run-extracted-codex-prompt",
+        help="Run the latest extracted Codex prompt after explicit human confirmation.",
+    )
+    run_extracted_codex_prompt_parser.add_argument(
+        "run_id",
+        help="Run ID containing next_codex_prompt_extracted.",
+    )
+    run_extracted_codex_prompt_parser.add_argument(
+        "--repo",
+        required=True,
+        help="Explicit repository/workdir for Codex exec.",
+    )
+    run_extracted_codex_prompt_parser.add_argument(
+        "--sandbox",
+        default="read-only",
+        help="Codex sandbox mode: read-only, workspace-write, or danger-full-access. Default: read-only.",
+    )
+    run_extracted_codex_prompt_parser.add_argument(
+        "--confirm-run",
+        action="store_true",
+        help="Required: confirm the extracted prompt should be run through Codex.",
+    )
+    run_extracted_codex_prompt_parser.add_argument(
+        "--confirm-full-access",
+        action="store_true",
+        help="Required with --sandbox danger-full-access.",
+    )
+    run_extracted_codex_prompt_parser.add_argument(
+        "--expect-prompt-sha256",
+        help="Optional expected SHA-256 for the selected extracted prompt.",
+    )
+    run_extracted_codex_prompt_parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
@@ -905,6 +945,204 @@ def _codex_exec_validation_result(
         "finished_at": now,
         "validation_error": validation_error,
     }
+
+
+def _run_codex_exec_flow(
+    run_id: str,
+    run: dict,
+    prompt: str,
+    repo_path_text: str,
+    sandbox: str,
+    timeout: int,
+    confirm_full_access: bool,
+) -> dict:
+    git_snapshot = capture_git_snapshot(repo_path_text)
+    after_git_snapshot = None
+    changed_file_classification = None
+    ledger.add_event(
+        run_id,
+        "git_snapshot_before_codex",
+        _snapshot_message(git_snapshot),
+        git_snapshot,
+    )
+    _print_git_snapshot_summary(git_snapshot, "before")
+
+    ledger.add_event(
+        run_id,
+        "codex_exec_started",
+        "Running Codex exec.",
+        {
+            "prompt": prompt,
+            "repo_path": repo_path_text,
+            "timeout": timeout,
+            "sandbox": sandbox,
+        },
+    )
+
+    validation_error = None
+    if sandbox not in ALLOWED_CODEX_SANDBOXES:
+        validation_error = (
+            "Invalid Codex sandbox. Allowed values: "
+            f"{', '.join(ALLOWED_CODEX_SANDBOXES)}."
+        )
+    elif sandbox == "danger-full-access" and not confirm_full_access:
+        validation_error = "Codex sandbox danger-full-access requires --confirm-full-access."
+
+    if validation_error is None:
+        result = run_codex_exec(
+            prompt,
+            repo_path=repo_path_text,
+            timeout_seconds=timeout,
+            sandbox=sandbox,
+        )
+    else:
+        result = _codex_exec_validation_result(
+            prompt,
+            repo_path=repo_path_text,
+            sandbox=sandbox,
+            validation_error=validation_error,
+        )
+
+    validation_message = (
+        f" validation_error={result['validation_error']}"
+        if result["validation_error"]
+        else ""
+    )
+    ledger.add_event(
+        run_id,
+        "codex_exec_finished",
+        (
+            f"found={result['found']} exit_code={result['exit_code']} "
+            f"timed_out={result['timed_out']} repo_path={result['repo_path']} "
+            f"sandbox={result['sandbox']}{validation_message}"
+        ),
+        result,
+    )
+    if result["validation_error"]:
+        print(f"error: {result['validation_error']}", file=sys.stderr)
+    _print_codex_exec_result(result)
+
+    if not result["validation_error"]:
+        after_git_snapshot = capture_git_snapshot(repo_path_text)
+        ledger.add_event(
+            run_id,
+            "git_snapshot_after_codex",
+            _snapshot_message(after_git_snapshot),
+            after_git_snapshot,
+        )
+        _print_git_snapshot_summary(after_git_snapshot, "after")
+
+        changed_file_classification = classify_changed_files(
+            _changed_file_paths(after_git_snapshot)
+        )
+        ledger.add_event(
+            run_id,
+            "changed_file_classification",
+            _classification_message(changed_file_classification),
+            changed_file_classification,
+        )
+        _print_changed_file_classification(changed_file_classification)
+
+    try:
+        prompt_repo_impact_diagnostics = analyze_prompt_repo_impact(
+            prompt,
+            result,
+            git_snapshot,
+            after_git_snapshot,
+            changed_file_classification,
+        )
+    except Exception as exc:
+        prompt_repo_impact_diagnostics = None
+        print(f"warning: prompt/repo impact diagnostics unavailable: {exc}", file=sys.stderr)
+    ledger.add_event(
+        run_id,
+        "prompt_repo_impact_diagnostics",
+        _diagnostics_message(prompt_repo_impact_diagnostics),
+        prompt_repo_impact_diagnostics,
+    )
+    _print_prompt_repo_impact_diagnostics(prompt_repo_impact_diagnostics)
+
+    supervision_decision = evaluate_supervision_decision(prompt_repo_impact_diagnostics)
+    ledger.add_event(
+        run_id,
+        "supervision_decision",
+        _supervision_decision_message(supervision_decision),
+        supervision_decision,
+    )
+    _print_supervision_decision(supervision_decision)
+
+    transition = status_from_supervision_decision(supervision_decision, result)
+    transition = {
+        **transition,
+        "previous_status": run["status"],
+        "next_status": transition["next_status"],
+    }
+    ledger.update_run_status(run_id, RunStatus(transition["next_status"]))
+    ledger.add_event(
+        run_id,
+        "run_status_transition",
+        _run_status_transition_message(transition),
+        transition,
+    )
+    _print_run_status_transition(transition)
+
+    return {
+        "result": result,
+        "git_snapshot": git_snapshot,
+        "after_git_snapshot": after_git_snapshot,
+        "changed_file_classification": changed_file_classification,
+        "prompt_repo_impact_diagnostics": prompt_repo_impact_diagnostics,
+        "supervision_decision": supervision_decision,
+        "transition": transition,
+    }
+
+
+def _print_extracted_codex_prompt_preview(
+    run_id: str,
+    selection: object,
+    repo_path: str,
+    sandbox: str,
+) -> None:
+    event = getattr(selection, "event", None)
+    extraction_event_id = event.get("id") if isinstance(event, dict) else None
+    print(f"run_id: {run_id}")
+    print(f"extraction_event_id: {extraction_event_id or ''}")
+    print(f"prompt_sha256: {getattr(selection, 'prompt_sha256', '')}")
+    print(f"prompt_length: {getattr(selection, 'prompt_length', 0)}")
+    print(f"repo_path: {repo_path}")
+    print(f"sandbox: {sandbox}")
+    for warning in getattr(selection, "warnings", ()):
+        print(f"warning: {warning}")
+    print("prompt_preview:")
+    print(_prompt_preview(getattr(selection, "prompt_text", "")))
+    sys.stdout.flush()
+
+
+def _print_extracted_codex_prompt_run_result(
+    run_id: str,
+    selection: object,
+    repo_path: str,
+    sandbox: str,
+    flow: dict,
+) -> None:
+    event = getattr(selection, "event", None)
+    extraction_event_id = event.get("id") if isinstance(event, dict) else None
+    result = flow["result"]
+    supervision_decision = flow["supervision_decision"] or {}
+    transition = flow["transition"] or {}
+    print("Extracted Codex prompt run:")
+    print(f"run_id: {run_id}")
+    print(f"extraction_event_id: {extraction_event_id or ''}")
+    print(f"prompt_sha256: {getattr(selection, 'prompt_sha256', '')}")
+    print(f"prompt_length: {getattr(selection, 'prompt_length', 0)}")
+    print(f"repo_path: {repo_path}")
+    print(f"sandbox: {sandbox}")
+    print(f"codex_exit_code: {result['exit_code']}")
+    print(f"codex_timed_out: {result['timed_out']}")
+    print(f"supervision_decision: {supervision_decision.get('decision', '')}")
+    print(f"status: {transition.get('next_status', '')}")
+    print("Extracted prompt was run only because --confirm-run was provided.")
+    sys.stdout.flush()
 
 
 def main() -> None:
@@ -1982,6 +2220,138 @@ def main() -> None:
             raise SystemExit(124)
         raise SystemExit(result["exit_code"] or 0)
 
+    if args.command == "run-extracted-codex-prompt":
+        if not args.confirm_run:
+            parser.exit(
+                2,
+                "error: --confirm-run is required. No ledger write, git snapshot, "
+                "prompt artifact read, or Codex execution was performed.\n",
+            )
+
+        run = ledger.get_run(args.run_id)
+        if run is None:
+            parser.exit(1, f"Run not found: {args.run_id}\n")
+
+        continuation = can_continue_run(run["status"])
+        if not continuation["can_continue"]:
+            parser.exit(
+                2,
+                (
+                    "Run cannot continue: "
+                    f"status={continuation['status']} "
+                    f"reason={continuation['reason']} "
+                    f"required_action={continuation['required_action'] or ''}\n"
+                ),
+            )
+
+        repo_path = Path(args.repo).expanduser().resolve(strict=False)
+        repo_path_text = str(repo_path)
+        if not repo_path.exists():
+            parser.exit(2, f"Repo path does not exist: {repo_path_text}\n")
+        if not repo_path.is_dir():
+            parser.exit(2, f"Repo path is not a directory: {repo_path_text}\n")
+
+        sandbox = args.sandbox
+        if sandbox not in ALLOWED_CODEX_SANDBOXES:
+            parser.exit(
+                2,
+                "Invalid Codex sandbox. Allowed values: "
+                f"{', '.join(ALLOWED_CODEX_SANDBOXES)}.\n",
+            )
+        if sandbox == "danger-full-access" and not args.confirm_full_access:
+            parser.exit(
+                2,
+                "Codex sandbox danger-full-access requires --confirm-full-access.\n",
+            )
+
+        events = ledger.list_events(args.run_id)
+        selection = select_latest_valid_extracted_codex_prompt(
+            events,
+            expect_prompt_sha256=args.expect_prompt_sha256,
+        )
+        if not selection.ok:
+            event_id = selection.event.get("id") if selection.event else ""
+            print(f"extraction_event_id: {event_id}", file=sys.stderr)
+            for warning in selection.warnings:
+                print(f"warning: {warning}", file=sys.stderr)
+            parser.exit(1, f"Invalid extracted Codex prompt: {selection.error}\n")
+
+        _print_extracted_codex_prompt_preview(
+            args.run_id,
+            selection,
+            repo_path_text,
+            sandbox,
+        )
+
+        extraction_event_id = selection.event.get("id") if selection.event else None
+        selection_metadata = {
+            "extraction_event_id": extraction_event_id,
+            "prompt_sha256": selection.prompt_sha256,
+            "prompt_length": selection.prompt_length,
+            "repo_path": repo_path_text,
+            "sandbox": sandbox,
+            "source_event_id": selection.source_event_id,
+            "matched_submission_event_id": selection.matched_submission_event_id,
+        }
+        ledger.add_event(
+            args.run_id,
+            "extracted_codex_prompt_selected",
+            "Selected extracted Codex prompt for human-confirmed execution.",
+            selection_metadata,
+        )
+        ledger.add_event(
+            args.run_id,
+            "extracted_codex_prompt_run_started",
+            "Running extracted Codex prompt after explicit human confirmation.",
+            {
+                **selection_metadata,
+                "timeout": args.timeout,
+            },
+        )
+
+        flow = _run_codex_exec_flow(
+            args.run_id,
+            run,
+            selection.prompt_text,
+            repo_path_text,
+            sandbox,
+            args.timeout,
+            args.confirm_full_access,
+        )
+
+        result = flow["result"]
+        supervision_decision = flow["supervision_decision"] or {}
+        transition = flow["transition"] or {}
+        ledger.add_event(
+            args.run_id,
+            "extracted_codex_prompt_run_finished",
+            "Finished extracted Codex prompt execution.",
+            {
+                **selection_metadata,
+                "exit_code": result["exit_code"],
+                "timed_out": result["timed_out"],
+                "status": transition.get("next_status"),
+                "supervision_decision": supervision_decision.get("decision"),
+                "validation_error": result["validation_error"],
+            },
+        )
+
+        _print_extracted_codex_prompt_run_result(
+            args.run_id,
+            selection,
+            repo_path_text,
+            sandbox,
+            flow,
+        )
+
+        if result["validation_error"]:
+            raise SystemExit(2)
+        if not result["found"]:
+            raise SystemExit(1)
+        if result["timed_out"]:
+            raise SystemExit(124)
+        raise SystemExit(result["exit_code"] or 0)
+
     if args.command == "codex-run":
         run = ledger.get_run(args.run_id)
         if run is None:
@@ -1995,135 +2365,16 @@ def main() -> None:
         repo_path_text = str(repo_path)
         sandbox = args.sandbox
 
-        git_snapshot = capture_git_snapshot(repo_path_text)
-        after_git_snapshot = None
-        changed_file_classification = None
-        ledger.add_event(
+        flow = _run_codex_exec_flow(
             args.run_id,
-            "git_snapshot_before_codex",
-            _snapshot_message(git_snapshot),
-            git_snapshot,
+            run,
+            args.prompt,
+            repo_path_text,
+            sandbox,
+            args.timeout,
+            args.confirm_full_access,
         )
-        _print_git_snapshot_summary(git_snapshot, "before")
-
-        ledger.add_event(
-            args.run_id,
-            "codex_exec_started",
-            "Running Codex exec.",
-            {
-                "prompt": args.prompt,
-                "repo_path": repo_path_text,
-                "timeout": args.timeout,
-                "sandbox": sandbox,
-            },
-        )
-
-        validation_error = None
-        if sandbox not in ALLOWED_CODEX_SANDBOXES:
-            validation_error = (
-                "Invalid Codex sandbox. Allowed values: "
-                f"{', '.join(ALLOWED_CODEX_SANDBOXES)}."
-            )
-        elif sandbox == "danger-full-access" and not args.confirm_full_access:
-            validation_error = "Codex sandbox danger-full-access requires --confirm-full-access."
-
-        if validation_error is None:
-            result = run_codex_exec(
-                args.prompt,
-                repo_path=repo_path_text,
-                timeout_seconds=args.timeout,
-                sandbox=sandbox,
-            )
-        else:
-            result = _codex_exec_validation_result(
-                args.prompt,
-                repo_path=repo_path_text,
-                sandbox=sandbox,
-                validation_error=validation_error,
-            )
-
-        validation_message = (
-            f" validation_error={result['validation_error']}"
-            if result["validation_error"]
-            else ""
-        )
-        ledger.add_event(
-            args.run_id,
-            "codex_exec_finished",
-            (
-                f"found={result['found']} exit_code={result['exit_code']} "
-                f"timed_out={result['timed_out']} repo_path={result['repo_path']} "
-                f"sandbox={result['sandbox']}{validation_message}"
-            ),
-            result,
-        )
-        if result["validation_error"]:
-            print(f"error: {result['validation_error']}", file=sys.stderr)
-        _print_codex_exec_result(result)
-
-        if not result["validation_error"]:
-            after_git_snapshot = capture_git_snapshot(repo_path_text)
-            ledger.add_event(
-                args.run_id,
-                "git_snapshot_after_codex",
-                _snapshot_message(after_git_snapshot),
-                after_git_snapshot,
-            )
-            _print_git_snapshot_summary(after_git_snapshot, "after")
-
-            changed_file_classification = classify_changed_files(
-                _changed_file_paths(after_git_snapshot)
-            )
-            ledger.add_event(
-                args.run_id,
-                "changed_file_classification",
-                _classification_message(changed_file_classification),
-                changed_file_classification,
-            )
-            _print_changed_file_classification(changed_file_classification)
-
-        try:
-            prompt_repo_impact_diagnostics = analyze_prompt_repo_impact(
-                args.prompt,
-                result,
-                git_snapshot,
-                after_git_snapshot,
-                changed_file_classification,
-            )
-        except Exception as exc:
-            prompt_repo_impact_diagnostics = None
-            print(f"warning: prompt/repo impact diagnostics unavailable: {exc}", file=sys.stderr)
-        ledger.add_event(
-            args.run_id,
-            "prompt_repo_impact_diagnostics",
-            _diagnostics_message(prompt_repo_impact_diagnostics),
-            prompt_repo_impact_diagnostics,
-        )
-        _print_prompt_repo_impact_diagnostics(prompt_repo_impact_diagnostics)
-
-        supervision_decision = evaluate_supervision_decision(prompt_repo_impact_diagnostics)
-        ledger.add_event(
-            args.run_id,
-            "supervision_decision",
-            _supervision_decision_message(supervision_decision),
-            supervision_decision,
-        )
-        _print_supervision_decision(supervision_decision)
-
-        transition = status_from_supervision_decision(supervision_decision, result)
-        transition = {
-            **transition,
-            "previous_status": run["status"],
-            "next_status": transition["next_status"],
-        }
-        ledger.update_run_status(args.run_id, RunStatus(transition["next_status"]))
-        ledger.add_event(
-            args.run_id,
-            "run_status_transition",
-            _run_status_transition_message(transition),
-            transition,
-        )
-        _print_run_status_transition(transition)
+        result = flow["result"]
 
         if result["validation_error"]:
             raise SystemExit(2)

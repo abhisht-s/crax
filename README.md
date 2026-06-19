@@ -504,3 +504,40 @@ Stale-capture protection:
    matches that latest submission are eligible.
 3. The captured response must contain non-empty `response_text`, contain
    `response_sha256`, and match the SHA-256 of the response text.
+
+## Stage 5.11B Smoke Test
+
+Run the latest validated extracted Codex prompt only after explicit human
+confirmation:
+
+```sh
+agent-loop run-extracted-codex-prompt <run_id> --repo "$(pwd)"
+agent-loop run-extracted-codex-prompt <run_id> --repo "$(pwd)" --confirm-run
+agent-loop run-extracted-codex-prompt <run_id> --repo "$(pwd)" --sandbox read-only --expect-prompt-sha256 <sha256> --confirm-run
+```
+
+Without `--confirm-run`, this command performs no ledger write, no git
+snapshot, no prompt artifact read, and no Codex execution.
+
+With `--confirm-run`, the command continues the same run in v0.1; it does not
+create a child run. It selects the latest `next_codex_prompt_extracted` event,
+verifies the prompt text, SHA-256, prompt length, human-review safety status,
+source capture, matched submission, and prompt artifact if present, then runs
+Codex through the same supervised execution path as `codex-run`.
+
+`--repo` is required and must be explicit. The default sandbox is `read-only`.
+`danger-full-access` requires both `--sandbox danger-full-access` and
+`--confirm-full-access`.
+
+Expected wrapper ledger events:
+
+```text
+extracted_codex_prompt_selected
+extracted_codex_prompt_run_started
+extracted_codex_prompt_run_finished
+```
+
+The usual Codex execution, git snapshot, classification, diagnostics,
+supervision, and status-transition events are recorded between the started and
+finished wrapper events. This is still human-supervised execution, not
+autonomous looping.
