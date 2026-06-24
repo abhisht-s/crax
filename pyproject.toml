@@ -11,9 +11,13 @@ requires-python = ">=3.11"
 
 [project.scripts]
 agent-loop = "agent.cli:main"
+agent-loop-local = "agent.local_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "."}
+
+[tool.setuptools.package-data]
+agent = ["web_static/*"]
 
 [tool.setuptools.packages.find]
 where = ["."]

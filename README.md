@@ -392,7 +392,8 @@ pasted, submitted, or sent.
 
 `paste-feedback-to-chatgpt` activates ChatGPT and pastes the feedback, but does
 not submit or press Enter. `submit-feedback-to-chatgpt` activates ChatGPT,
-pastes the feedback, and presses Enter only when `--confirm-submit` is present.
+pastes the feedback, sends submit input only when `--confirm-submit` is present,
+and records success only after Accessibility verifies the submission marker.
 
 Manual validation:
 
@@ -403,7 +404,7 @@ Manual validation:
 5. Put Terminal/VS Code frontmost.
 6. Run `agent-loop submit-feedback-to-chatgpt <run_id> --confirm-submit`.
 7. Confirm feedback appears and is submitted.
-8. Confirm the ledger shows `gpt_feedback_submitted`.
+8. Confirm the ledger shows `gpt_feedback_submission_verified`.
 
 `submit-feedback-to-chatgpt` does not navigate projects/chats, inspect or scrape
 ChatGPT content, use browser automation, or use any LLM/API automation. It still
@@ -413,7 +414,7 @@ before the command runs.
 ## Stage 5.9B Smoke Test
 
 Capture ChatGPT's visible assistant response from the desktop app through
-macOS Accessibility after feedback was submitted:
+macOS Accessibility after feedback submission was verified:
 
 ```sh
 agent-loop capture-gpt-response-from-chatgpt-ax <run_id> --confirm-capture
@@ -425,8 +426,8 @@ inspection, ledger write, clipboard access, paste, Enter, submit, or send action
 is performed.
 
 This command activates the ChatGPT desktop app, verifies it is frontmost, reads
-the focused window's Accessibility tree, matches the previously submitted GPT
-feedback from the ledger, waits for the following assistant response text to be
+the focused window's Accessibility tree, anchors on the verified submission
+marker from the ledger, waits for the following assistant response text to be
 stable, and records `gpt_response_captured`.
 
 It does not click, paste, submit, press Enter, scroll, navigate projects/chats,
@@ -499,7 +500,7 @@ fenced prompt blocks, SHA mismatches, and stale captures.
 
 Stale-capture protection:
 
-1. The latest successful `gpt_feedback_submitted` event is selected.
+1. The latest successful `gpt_feedback_submission_verified` event is selected.
 2. Only `gpt_response_captured` events whose `matched_submission_event_id`
    matches that latest submission are eligible.
 3. The captured response must contain non-empty `response_text`, contain
@@ -541,3 +542,66 @@ The usual Codex execution, git snapshot, classification, diagnostics,
 supervision, and status-transition events are recorded between the started and
 finished wrapper events. This is still human-supervised execution, not
 autonomous looping.
+
+## Stage 5.12 Smoke Test
+
+Continue a completed Codex run through the primary supervised loop UX:
+
+```sh
+agent-loop supervise <run_id> --repo "$(pwd)"
+agent-loop supervise <run_id> --repo "$(pwd)" --sandbox read-only
+agent-loop supervise <run_id> --repo "$(pwd)" --sandbox workspace-write
+```
+
+`supervise` inspects the ledger and chooses one next safe action. It does not
+start the initial Codex task; create the run and perform the first `codex-run`
+separately for now.
+
+The normal loop has two manual gates:
+
+```text
+Send Codex result to ChatGPT? [y/N]
+Run this prompt in Codex? [y/N]
+```
+
+After the Send gate is approved, `supervise` submits the recorded Codex result
+to the already-open ChatGPT desktop chat, waits for the visible reply to become
+stable through macOS Accessibility capture, and extracts the next prompt. The
+correct ChatGPT chat must already be open and visible.
+
+For this primary UX, the next prompt must use exactly one sentinel block:
+
+```text
+BEGIN_NEXT_CODEX_PROMPT
+...
+END_NEXT_CODEX_PROMPT
+```
+
+If ChatGPT gives prose, malformed markers, multiple prompt blocks, or a
+non-sentinel prompt format, `supervise` stops and does not run Codex. The
+lower-level `extract-next-codex-prompt` command remains available for
+diagnostics and recovery.
+
+For extracted prompt execution, `read-only` is the default sandbox.
+`workspace-write` is allowed only when explicitly passed and is shown at the Run
+gate. `danger-full-access` is blocked by `supervise` in v0.1; use the
+low-level command only after deliberate manual review if full access is needed.
+
+`supervise` stops after Codex finishes. Run it again to continue the next
+Codex -> ChatGPT -> Codex cycle. The low-level commands remain supported:
+
+```text
+codex-run
+submit-feedback-to-chatgpt
+capture-gpt-response-from-chatgpt-ax
+extract-next-codex-prompt
+run-extracted-codex-prompt
+```
+
+## Autonomous Workspace-Write Test
+
+This is a temporary local test of scoped autonomous edits.
+
+## Autonomous Delta Attribution Test
+
+This verifies that the loop attributes only the changes made by this Codex invocation.

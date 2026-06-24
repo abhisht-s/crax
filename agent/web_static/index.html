@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Loop Local Controller</title>
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>Agent Loop Local Controller</h1>
+        <p class="subtitle">Local run dashboard</p>
+      </div>
+      <section class="connection-panel" aria-labelledby="connection-heading">
+        <h2 id="connection-heading">Connection</h2>
+        <p id="connection-status" class="status-badge status-muted" aria-live="polite">Connecting</p>
+      </section>
+    </header>
+
+    <main class="layout">
+      <section id="startup-panel" class="panel" aria-labelledby="startup-heading">
+        <h2 id="startup-heading">Start Run</h2>
+        <div class="form-grid">
+          <label for="repository-path">Repository path</label>
+          <input id="repository-path" name="repository_path" type="text" autocomplete="off">
+
+          <label for="initial-task">Initial task</label>
+          <textarea id="initial-task" name="initial_instruction" rows="6"></textarea>
+
+          <label for="sandbox-select">Sandbox</label>
+          <select id="sandbox-select" name="sandbox">
+            <option value="read-only">read-only</option>
+            <option value="workspace-write">workspace-write</option>
+          </select>
+        </div>
+        <div class="action-row">
+          <button id="start-button" type="button">Start run</button>
+          <span id="startup-status" class="inline-status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section id="active-run-panel" class="panel" aria-labelledby="active-run-heading">
+        <h2 id="active-run-heading">Current Run</h2>
+        <dl class="summary-grid">
+          <div><dt>Run ID</dt><dd id="run-id">None</dd></div>
+          <div><dt>Repository</dt><dd id="run-repository">None</dd></div>
+          <div><dt>Sandbox</dt><dd id="run-sandbox">None</dd></div>
+          <div><dt>Run status</dt><dd id="run-status">None</dd></div>
+          <div><dt>Controller</dt><dd id="controller-state">idle</dd></div>
+          <div><dt>Action</dt><dd id="action-running">Not running</dd></div>
+          <div><dt>Stage</dt><dd id="current-stage">Idle</dd></div>
+          <div><dt>Planner action</dt><dd id="planner-action">None</dd></div>
+          <div><dt>Planner reason</dt><dd id="planner-reason">None</dd></div>
+          <div><dt>Actionable error</dt><dd id="actionable-error">None</dd></div>
+        </dl>
+      </section>
+
+      <section id="latest-summaries-panel" class="panel" aria-labelledby="summaries-heading">
+        <h2 id="summaries-heading">Latest Summaries</h2>
+        <div class="summary-list">
+          <section>
+            <h3>Codex</h3>
+            <pre id="latest-codex-summary"></pre>
+          </section>
+          <section>
+            <h3>ChatGPT submission</h3>
+            <pre id="latest-chatgpt-submission-summary"></pre>
+          </section>
+          <section>
+            <h3>ChatGPT capture</h3>
+            <pre id="latest-chatgpt-capture-summary"></pre>
+          </section>
+          <section>
+            <h3>Prompt extraction</h3>
+            <pre id="latest-prompt-extraction-summary"></pre>
+          </section>
+          <section>
+            <h3>Governance</h3>
+            <pre id="latest-governance-summary"></pre>
+          </section>
+        </div>
+      </section>
+
+      <section id="approval-panel" class="panel hidden" aria-labelledby="approval-heading">
+        <h2 id="approval-heading">Approval Required</h2>
+        <p id="approval-kind">No approval is pending.</p>
+        <div class="action-row">
+          <button id="approve-button" type="button">Approve</button>
+          <button id="reject-button" type="button" class="secondary">Reject</button>
+          <span id="approval-status" class="inline-status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section id="progress-panel" class="panel hidden" aria-labelledby="progress-heading">
+        <h2 id="progress-heading">Progress</h2>
+        <p id="progress-description">Routine work is available.</p>
+        <div class="action-row">
+          <button id="tick-button" type="button">Continue routine work</button>
+          <span id="tick-status" class="inline-status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section id="terminal-panel" class="panel" aria-labelledby="terminal-heading">
+        <h2 id="terminal-heading">Run State</h2>
+        <p id="terminal-status" class="status-badge status-muted">Idle</p>
+      </section>
+
+      <section id="event-timeline-panel" class="panel wide" aria-labelledby="timeline-heading">
+        <h2 id="timeline-heading">Event Timeline</h2>
+        <ol id="event-timeline" class="timeline"></ol>
+      </section>
+    </main>
+  </body>
+</html>
