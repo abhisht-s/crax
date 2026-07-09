@@ -8,7 +8,7 @@ ONE LINER: Crax is takes prompts from ChatGPT Desktop app --> Gives them to Code
 
 It is basically an orchestrator that allows your chatgpt desktop app give instructions to codex working in your local codebase and see codex output and keep the loop going. You can have it runnning overnight for doing any kind of work you want. It can control your macos while youre away and interact with the ChatGPT desktop app.
 
-The V0.1 is the first version, it's raw and brittle, but really facinating. We've have it perform 25 consecutive loops without us touching the desktop at once. 
+The V0.1 is the first version, it's raw and brittle, but really facinating. We've seen it perform 25 consecutive loops without us touching the desktop at once and perfectly and safely implementing a decided feature
 
 # Setup from GitHub
 
