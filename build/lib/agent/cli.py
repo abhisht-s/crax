@@ -15,22 +15,44 @@ from agent.chatgpt_ax_capture import (
     DEFAULT_STABLE_SECONDS,
     capture_response_after_feedback,
 )
+from agent.chatgpt_navigation_diagnostic import (
+    DEFAULT_MAX_DEPTH as DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+    DEFAULT_MAX_NODES as DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+    DEEP_INSPECTOR_OUTPUT_CHAR_GUARD,
+    calibrate_chatgpt_sidebar_coordinate_mapping,
+    diagnose_chatgpt_project_chat_rows,
+    inspect_chatgpt_navigation_ui,
+    inspect_chatgpt_project_chat_row_ax,
+    inspect_chatgpt_project_visible_chats,
+    inspect_chatgpt_sidebar_destination,
+    open_chatgpt_project_chat,
+    open_chatgpt_sidebar_destination,
+    verify_chatgpt_sidebar_destination,
+    verify_chatgpt_sidebar_frame_click,
+    verify_current_cursor_click,
+    verify_synthetic_click_delivery,
+)
 from agent.clipboard import copy_to_clipboard
 from agent.codex_terminal import (
-    ALLOWED_CODEX_SANDBOXES,
     check_codex_environment,
-    run_codex_exec,
     run_command,
 )
+from agent.codex_services import execute_codex_direct_service
 from agent.continuation_policy import can_continue_run
 from agent.file_classifier import classify_changed_files
 from agent.gpt_feedback import build_gpt_feedback_message
 from agent.git_snapshot import (
-    attributable_paths,
     capture_git_snapshot,
     capture_invocation_git_state,
     compute_invocation_delta,
 )
+from agent.governance_services import (
+    PostCodexGovernanceCallbacks,
+    _build_governance_observation,
+    _governance_transition_if_blocking,
+    apply_post_codex_governance_service,
+)
+from agent.extracted_prompt_services import execute_extracted_codex_prompt_service
 from agent.mac_app_control import activate_chatgpt
 from agent.mac_paste import (
     ENTER_METHOD,
@@ -43,37 +65,39 @@ from agent.mac_ui_inspect import (
     inspect_chatgpt_ui,
     press_chatgpt_send_button,
 )
-from agent.prompt_extraction import (
-    find_latest_valid_captured_response,
-    extract_next_codex_prompt_from_text,
-    select_latest_valid_extracted_codex_prompt,
-    select_valid_extracted_codex_prompt_event,
-    sha256_text,
+from agent.chatgpt_services import (
+    capture_chatgpt_response_service,
+    extract_next_codex_prompt_service,
+    submit_feedback_to_chatgpt_service,
 )
+from agent.prompt_extraction import sha256_text
 from agent.prompt_contract import parse_prompt_contract
 from agent.risk_policy import evaluate_supervision_decision
 from agent.run_diagnostics import analyze_prompt_repo_impact
 from agent.run_state import RunStatus
+from agent.run_services import (
+    HumanDecision,
+    HumanDecisionResult,
+    create_run_service,
+    resolve_human_decision,
+)
 from agent.run_status_policy import status_from_supervision_decision
 from agent.supervise import SuperviseAction, detect_next_supervise_action
-from agent.workspace_write_policy import (
-    POLICY_VERSION as WORKSPACE_WRITE_POLICY_VERSION,
-    diff_content_flags,
-    verify_workspace_write_post_run,
-)
+from agent.supervision_services import run_supervision_step
 from agent import ledger
 
 
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
-DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS = 30
-DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300
+DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS: int | None = None
+DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS: int | None = None
 CHATGPT_TARGET_PASTE_MARKER = "WATCH_TO_CODEX_STAGE_5_6B_TARGET_PASTE_TEST_DO_NOT_SUBMIT"
 CHATGPT_TARGET_PASTE_DELAY_SECONDS = 0.3
-CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS = 5.0
+CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS: float | None = None
 CHATGPT_PASTE_VERIFY_POLL_SECONDS = 0.15
 CHATGPT_POST_PASTE_SETTLE_SECONDS = 0.5
-CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS = 15.0
+CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS: float | None = None
 CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS = 0.35
+CHATGPT_NAVIGATION_COMPACT_OUTPUT_CHAR_GUARD = 25_000
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -186,8 +210,8 @@ def _build_parser() -> argparse.ArgumentParser:
     capture_gpt_response_ax_parser.add_argument(
         "--timeout-seconds",
         type=float,
-        default=DEFAULT_CAPTURE_TIMEOUT_SECONDS,
-        help=f"Maximum seconds to wait for a stable response. Default: {DEFAULT_CAPTURE_TIMEOUT_SECONDS:g}.",
+        default=None,
+        help="Deprecated; ignored. ChatGPT response capture has no elapsed-time deadline.",
     )
     capture_gpt_response_ax_parser.add_argument(
         "--stable-seconds",
@@ -248,6 +272,423 @@ def _build_parser() -> argparse.ArgumentParser:
         "--app-name",
         default="ChatGPT",
         help="macOS application name to inspect. Default: ChatGPT.",
+    )
+
+    inspect_chatgpt_navigation_ui_parser = subparsers.add_parser(
+        "inspect-chatgpt-navigation-ui",
+        help="Read-only structural diagnostic for ChatGPT navigation accessibility UI.",
+        description="Read-only structural diagnostic for ChatGPT navigation accessibility UI.",
+    )
+    inspect_chatgpt_navigation_ui_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    inspect_chatgpt_navigation_ui_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    inspect_chatgpt_navigation_ui_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+    inspect_chatgpt_navigation_ui_parser.add_argument(
+        "--include-visible-navigation-titles",
+        action="store_true",
+        help="Explicit opt-in: disclose exact visible chat/project titles only from validated navigation list structures.",
+    )
+    inspect_chatgpt_navigation_ui_parser.add_argument(
+        "--include-json-details",
+        action="store_true",
+        help="Include bounded structured JSON details. Default output is compact human-readable text only.",
+    )
+
+    verify_chatgpt_sidebar_destination_parser = subparsers.add_parser(
+        "verify-chatgpt-sidebar-destination",
+        help="Explicitly press one visible ChatGPT sidebar destination and verify the result.",
+        description=(
+            "Explicit one-destination UI action and verification for a currently visible ChatGPT "
+            "Projects or Recents entry. This is separate from the read-only inventory command."
+        ),
+    )
+    verify_chatgpt_sidebar_destination_parser.add_argument(
+        "--kind",
+        choices=("project", "chat"),
+        required=True,
+        help="Destination kind. Must be exactly project or chat.",
+    )
+    verify_chatgpt_sidebar_destination_parser.add_argument(
+        "--title",
+        required=True,
+        help="Exact non-empty visible sidebar title to verify.",
+    )
+    verify_chatgpt_sidebar_destination_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    verify_chatgpt_sidebar_destination_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    verify_chatgpt_sidebar_destination_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    open_chatgpt_sidebar_destination_parser = subparsers.add_parser(
+        "open-chatgpt-sidebar-destination",
+        help="Open one exact currently visible ChatGPT sidebar project or chat destination.",
+        description=(
+            "Production ChatGPT sidebar destination opener. Dry-run by default; requires "
+            "--confirm-open-destination before any ChatGPT activation, AXPress, or native click is performed."
+        ),
+    )
+    open_chatgpt_sidebar_destination_parser.add_argument(
+        "--kind",
+        choices=("project", "chat"),
+        required=True,
+        help="Destination kind. Must be exactly project or chat.",
+    )
+    open_chatgpt_sidebar_destination_parser.add_argument(
+        "--title",
+        required=True,
+        help="Exact non-empty visible sidebar title to open.",
+    )
+    open_chatgpt_sidebar_destination_parser.add_argument(
+        "--confirm-open-destination",
+        action="store_true",
+        help="Required to activate ChatGPT and open the destination.",
+    )
+    open_chatgpt_sidebar_destination_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to activate. Default: ChatGPT.",
+    )
+    open_chatgpt_sidebar_destination_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    open_chatgpt_sidebar_destination_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    inspect_chatgpt_sidebar_destination_parser = subparsers.add_parser(
+        "inspect-chatgpt-sidebar-destination",
+        help="Read-only deep AX inspection for one visible ChatGPT sidebar destination.",
+        description=(
+            "Read-only deep Accessibility inspection for exactly one currently visible ChatGPT "
+            "Projects or Recents destination. No UI action is performed."
+        ),
+    )
+    inspect_chatgpt_sidebar_destination_parser.add_argument(
+        "--kind",
+        choices=("project", "chat"),
+        required=True,
+        help="Destination kind. Must be exactly project or chat.",
+    )
+    inspect_chatgpt_sidebar_destination_parser.add_argument(
+        "--title",
+        required=True,
+        help="Exact non-empty visible sidebar title to inspect.",
+    )
+    inspect_chatgpt_sidebar_destination_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    inspect_chatgpt_sidebar_destination_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    inspect_chatgpt_sidebar_destination_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+    inspect_chatgpt_sidebar_destination_parser.add_argument(
+        "--include-json-details",
+        action="store_true",
+        help="Include capped structured JSON details for the retained local AX evidence.",
+    )
+
+    inspect_chatgpt_project_visible_chats_parser = subparsers.add_parser(
+        "inspect-chatgpt-project-visible-chats",
+        help="Read-only inspector for currently visible chat rows in an already-open ChatGPT project.",
+        description=(
+            "Read-only AX inspection for visible chat rows in the currently open ChatGPT project. "
+            "This command does not activate ChatGPT, click, scroll, press keys, paste, or open chats."
+        ),
+    )
+    inspect_chatgpt_project_visible_chats_parser.add_argument(
+        "--project-title",
+        required=True,
+        help="Exact title of the already-open ChatGPT project.",
+    )
+    inspect_chatgpt_project_visible_chats_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    inspect_chatgpt_project_visible_chats_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    inspect_chatgpt_project_visible_chats_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    inspect_chatgpt_project_chat_row_ax_parser = subparsers.add_parser(
+        "inspect-chatgpt-project-chat-row-ax",
+        help="Read-only bounded AX subtree audit for exact visible ChatGPT project chat rows.",
+        description=(
+            "Read-only AX structure audit for accepted visible project chat rows. "
+            "No app activation, click, scroll, keypress, paste, cursor read, or workflow action is performed."
+        ),
+    )
+    inspect_chatgpt_project_chat_row_ax_parser.add_argument(
+        "--project-title",
+        required=True,
+        help="Exact title of the already-open ChatGPT project.",
+    )
+    inspect_chatgpt_project_chat_row_ax_parser.add_argument(
+        "--chat-title",
+        action="append",
+        required=True,
+        help="Requested visible chat title to audit. May be supplied more than once.",
+    )
+    inspect_chatgpt_project_chat_row_ax_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    inspect_chatgpt_project_chat_row_ax_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    inspect_chatgpt_project_chat_row_ax_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    diagnose_chatgpt_project_chat_rows_parser = subparsers.add_parser(
+        "diagnose-chatgpt-project-chat-rows",
+        help="Read-only visual-row diagnostic for an already-open ChatGPT project Chats list.",
+        description=(
+            "Read-only AX diagnostic for every visible visual row band in the confirmed project Chats list. "
+            "No app activation, click, scroll, AXPress, keyboard, paste, cursor, screenshot, OCR, browser, or workflow action is performed."
+        ),
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--project-title",
+        required=True,
+        help="Exact title of the already-open ChatGPT project.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--contains-title",
+        default="",
+        help="Optional diagnostic output filter. Collection and matching remain unchanged.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    open_chatgpt_project_chat_parser = subparsers.add_parser(
+        "open-chatgpt-project-chat",
+        help="Open one exact currently visible chat inside an exact ChatGPT project.",
+        description=(
+            "Autonomous ChatGPT project chat opener. It opens/confirms the exact project, resolves "
+            "currently visible project chat rows, and opens one exact visible chat only when "
+            "--confirm-open-chat is supplied."
+        ),
+    )
+    open_chatgpt_project_chat_parser.add_argument(
+        "--project-title",
+        required=True,
+        help="Exact ChatGPT project title to open first.",
+    )
+    open_chatgpt_project_chat_parser.add_argument(
+        "--chat-title",
+        required=True,
+        help="Exact currently visible project chat title to open.",
+    )
+    open_chatgpt_project_chat_parser.add_argument(
+        "--confirm-open-chat",
+        action="store_true",
+        help="Required to open the project and then perform one exact chat opening action.",
+    )
+    open_chatgpt_project_chat_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to activate. Default: ChatGPT.",
+    )
+    open_chatgpt_project_chat_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    open_chatgpt_project_chat_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    calibrate_chatgpt_sidebar_coordinate_mapping_parser = subparsers.add_parser(
+        "calibrate-chatgpt-sidebar-coordinate-mapping",
+        help="Read-only calibration inspector for ChatGPT sidebar coordinate mapping.",
+        description=(
+            "Read-only manual coordinate calibration. Place the physical cursor over the exact visible "
+            "ChatGPT sidebar title before running. The command captures AX hit-test and frame evidence "
+            "without clicking, moving the cursor, focusing, scrolling, typing, or changing UI state."
+        ),
+    )
+    calibrate_chatgpt_sidebar_coordinate_mapping_parser.add_argument(
+        "--kind",
+        choices=("project", "chat"),
+        required=True,
+        help="Destination kind. Must be exactly project or chat.",
+    )
+    calibrate_chatgpt_sidebar_coordinate_mapping_parser.add_argument(
+        "--title",
+        required=True,
+        help="Exact non-empty visible sidebar title to calibrate.",
+    )
+    calibrate_chatgpt_sidebar_coordinate_mapping_parser.add_argument(
+        "--confirm-calibration-click",
+        action="store_true",
+        help="Required to emit two calculated native clicks and confirm mapping from post-click UI state.",
+    )
+    calibrate_chatgpt_sidebar_coordinate_mapping_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    calibrate_chatgpt_sidebar_coordinate_mapping_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    calibrate_chatgpt_sidebar_coordinate_mapping_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    verify_chatgpt_sidebar_frame_click_parser = subparsers.add_parser(
+        "verify-chatgpt-sidebar-frame-click",
+        help="Dry-run or explicitly perform one frame-derived primary sidebar row click.",
+        description=(
+            "Frame-resolved ChatGPT sidebar destination verification. Dry-run by default; "
+            "requires --confirm-frame-click before any native mouse event is posted."
+        ),
+    )
+    verify_chatgpt_sidebar_frame_click_parser.add_argument(
+        "--kind",
+        choices=("project", "chat"),
+        required=True,
+        help="Destination kind. Must be exactly project or chat.",
+    )
+    verify_chatgpt_sidebar_frame_click_parser.add_argument(
+        "--title",
+        required=True,
+        help="Exact non-empty visible sidebar title to resolve immediately before clicking.",
+    )
+    verify_chatgpt_sidebar_frame_click_parser.add_argument(
+        "--confirm-frame-click",
+        action="store_true",
+        help="Required to post one native CoreGraphics left mouse down/up at the resolved safe point.",
+    )
+    verify_chatgpt_sidebar_frame_click_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    verify_chatgpt_sidebar_frame_click_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    verify_chatgpt_sidebar_frame_click_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
+    verify_synthetic_click_delivery_parser = subparsers.add_parser(
+        "verify-synthetic-click-delivery",
+        help="Manual diagnostic: determine whether a single synthetic click is actually delivered.",
+        description=(
+            "Use macOS Calculator as the controlled click-delivery target and determine whether one "
+            "synthetic CoreGraphics click on the visible digit 7 button changes Calculator's display. "
+            "Dry-run by default; requires --confirm-synthetic-click-probe to emit exactly one click "
+            "through the same unchanged click service used by verify-chatgpt-sidebar-frame-click. "
+            "This is a manual diagnostic command only."
+        ),
+    )
+    verify_synthetic_click_delivery_parser.add_argument(
+        "--confirm-synthetic-click-probe",
+        action="store_true",
+        help="Required to post exactly one native CoreGraphics left mouse down/up onto Calculator digit 7.",
+    )
+
+    verify_current_cursor_click_parser = subparsers.add_parser(
+        "verify-current-cursor-click",
+        help="Manual diagnostic: post one synthetic click at the current physical cursor location.",
+        description=(
+            "Blind manual CoreGraphics click diagnostic. Dry-run reads only the current cursor location. "
+            "Confirmed mode posts exactly one left mouse down/up at the current physical cursor location "
+            "through the same unchanged click service used by verify-chatgpt-sidebar-frame-click."
+        ),
+    )
+    verify_current_cursor_click_parser.add_argument(
+        "--confirm-current-cursor-click",
+        action="store_true",
+        help="Required to post exactly one native CoreGraphics left mouse down/up at the current cursor location.",
     )
 
     test_chatgpt_target_paste_parser = subparsers.add_parser(
@@ -313,8 +754,8 @@ def _build_parser() -> argparse.ArgumentParser:
     codex_run_parser.add_argument(
         "--timeout",
         type=int,
-        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
-        help=f"Timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+        default=None,
+        help="Deprecated; ignored. Codex execution has no elapsed-time deadline.",
     )
     codex_run_parser.add_argument(
         "--no-supervise",
@@ -362,8 +803,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_extracted_codex_prompt_parser.add_argument(
         "--timeout",
         type=int,
-        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
-        help=f"Timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+        default=None,
+        help="Deprecated; ignored. Codex execution has no elapsed-time deadline.",
     )
 
     supervise_parser = subparsers.add_parser(
@@ -389,14 +830,14 @@ def _build_parser() -> argparse.ArgumentParser:
     supervise_parser.add_argument(
         "--timeout",
         type=int,
-        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
-        help=f"Codex timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+        default=None,
+        help="Deprecated; ignored. Codex execution has no elapsed-time deadline.",
     )
     supervise_parser.add_argument(
         "--capture-timeout-seconds",
         type=float,
-        default=DEFAULT_CAPTURE_TIMEOUT_SECONDS,
-        help=f"Maximum seconds to wait for a stable ChatGPT response. Default: {DEFAULT_CAPTURE_TIMEOUT_SECONDS:g}.",
+        default=None,
+        help="Deprecated; ignored. ChatGPT response capture has no elapsed-time deadline.",
     )
     supervise_parser.add_argument(
         "--stable-seconds",
@@ -637,10 +1078,9 @@ def _focused_composer_from_observation(observation: dict) -> dict | None:
 
 
 def _wait_for_pasted_marker(app_name: str, marker_text: str) -> dict:
-    deadline = time.monotonic() + CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS
     polls = 0
     last_observation: dict = {}
-    while time.monotonic() <= deadline:
+    while True:
         polls += 1
         observation = inspect_chatgpt_submission_ui(app_name, marker_text=marker_text)
         last_observation = observation
@@ -650,23 +1090,12 @@ def _wait_for_pasted_marker(app_name: str, marker_text: str) -> dict:
                 "ok": True,
                 "reason_code": "chatgpt_draft_pasted",
                 "poll_count": polls,
-                "timeout_seconds": CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS,
+                "timeout_seconds": None,
                 "poll_interval_seconds": CHATGPT_PASTE_VERIFY_POLL_SECONDS,
                 "observation": _submission_ui_observation_summary(observation, marker_text),
             }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(CHATGPT_PASTE_VERIFY_POLL_SECONDS, remaining))
-
-    return {
-        "ok": False,
-        "reason_code": "chatgpt_paste_not_visible",
-        "poll_count": polls,
-        "timeout_seconds": CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS,
-        "poll_interval_seconds": CHATGPT_PASTE_VERIFY_POLL_SECONDS,
-        "observation": _submission_ui_observation_summary(last_observation, marker_text),
-    }
+        if CHATGPT_PASTE_VERIFY_POLL_SECONDS > 0:
+            time.sleep(CHATGPT_PASTE_VERIFY_POLL_SECONDS)
 
 
 def _submission_verification_status(observation: dict, marker_text: str) -> dict:
@@ -710,11 +1139,10 @@ def _submission_verification_status(observation: dict, marker_text: str) -> dict
 
 
 def _verify_submission_marker(app_name: str, marker_text: str) -> dict:
-    deadline = time.monotonic() + CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS
     polls = 0
     last_observation: dict = {}
     last_status: dict = {}
-    while time.monotonic() <= deadline:
+    while True:
         polls += 1
         observation = inspect_chatgpt_submission_ui(app_name, marker_text=marker_text)
         last_observation = observation
@@ -725,25 +1153,13 @@ def _verify_submission_marker(app_name: str, marker_text: str) -> dict:
                 "ok": bool(status["verified"]),
                 "reason_code": status["reason_code"],
                 "poll_count": polls,
-                "timeout_seconds": CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
+                "timeout_seconds": None,
                 "poll_interval_seconds": CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
                 "status": status,
                 "observation": _submission_ui_observation_summary(observation, marker_text),
             }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS, remaining))
-
-    return {
-        "ok": False,
-        "reason_code": last_status.get("reason_code") or "chatgpt_submission_not_verified",
-        "poll_count": polls,
-        "timeout_seconds": CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
-        "poll_interval_seconds": CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
-        "status": last_status,
-        "observation": _submission_ui_observation_summary(last_observation, marker_text),
-    }
+        if CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS > 0:
+            time.sleep(CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS)
 
 
 def _select_send_input_method(app_name: str, marker_text: str) -> tuple[dict, dict]:
@@ -846,15 +1262,6 @@ def _print_git_snapshot_summary(snapshot: dict, label: str) -> None:
     sys.stdout.flush()
 
 
-def _classification_message(classification: dict) -> str:
-    return (
-        f"total_files={classification['total_files']} "
-        f"category_counts={classification['counts_by_category']} "
-        f"risk_counts={classification['counts_by_risk_level']} "
-        f"high_risk_file_count={len(classification['high_risk_files'])}"
-    )
-
-
 def _print_changed_file_classification(classification: dict) -> None:
     print("Changed-file classification:")
     print(f"total_files: {classification['total_files']}")
@@ -876,14 +1283,11 @@ def _print_governance_observation(observation: dict) -> None:
     sys.stdout.flush()
 
 
-def _diagnostics_message(diagnostics: dict | None) -> str:
-    if diagnostics is None:
-        return "diagnostics_unavailable"
-    return (
-        f"outcome={diagnostics['outcome']} "
-        f"attention_level={diagnostics['attention_level']} "
-        f"flags={diagnostics['flags']}"
-    )
+def _print_workspace_write_human_required(post_run_policy: dict) -> None:
+    print("Stopped: Codex completed, but an objective workspace-write post-run failure was detected.")
+    print(f"Reason: {post_run_policy.get('reason_code')}")
+    print("No ChatGPT submission or further Codex execution was performed.")
+    sys.stdout.flush()
 
 
 def _print_prompt_repo_impact_diagnostics(diagnostics: dict | None) -> None:
@@ -900,15 +1304,6 @@ def _print_prompt_repo_impact_diagnostics(diagnostics: dict | None) -> None:
     sys.stdout.flush()
 
 
-def _supervision_decision_message(decision: dict) -> str:
-    return (
-        f"decision={decision['decision']} "
-        f"attention_level={decision['attention_level']} "
-        f"approval_required={decision['approval_required']} "
-        f"reasons={decision['reasons']}"
-    )
-
-
 def _print_supervision_decision(decision: dict) -> None:
     print("Supervision decision:")
     print(f"decision: {decision['decision']}")
@@ -918,14 +1313,6 @@ def _print_supervision_decision(decision: dict) -> None:
     print(f"reasons: {decision['reasons']}")
     print(f"messages: {decision['messages']}")
     sys.stdout.flush()
-
-
-def _run_status_transition_message(transition: dict) -> str:
-    return (
-        f"previous_status={transition['previous_status']} "
-        f"next_status={transition['next_status']} "
-        f"reason={transition['reason']}"
-    )
 
 
 def _print_run_status_transition(transition: dict) -> None:
@@ -1010,6 +1397,1186 @@ def _print_inspect_chatgpt_ui_result(result: dict) -> None:
     for error in result["errors"]:
         print(f"  {error}")
     sys.stdout.flush()
+
+
+def _print_inspect_chatgpt_navigation_ui_result(result: dict, include_json_details: bool = False) -> None:
+    lines = _inspect_chatgpt_navigation_ui_result_lines(result)
+    if include_json_details:
+        lines.append("json_details:")
+        lines.append(json.dumps(result, indent=2, sort_keys=True))
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_verify_chatgpt_sidebar_destination_result(result: dict) -> None:
+    target = result.get("target") or {}
+    pre = result.get("pre_action_snapshot") or {}
+    post = result.get("post_action_snapshot") or {}
+    lines = [
+        "ChatGPT sidebar destination verification",
+        f"status: {result.get('status') or ''}",
+        f"ok: {str(bool(result.get('ok'))).lower()}",
+        f"app_name: {result.get('app_name') or ''}",
+        f"kind: {result.get('kind') or ''}",
+        f"title: {result.get('title') or ''}",
+        f"pid_present: {str(bool(result.get('pid_present'))).lower()}",
+        f"process_resolution_method: {result.get('process_resolution_method') or ''}",
+        f"target_title_path: {target.get('title_ax_path') or ''}",
+        f"target_action_path: {target.get('resolved_target_ax_path') or ''}",
+        f"target_resolution_method: {target.get('resolution_method') or ''}",
+        f"target_enabled: {target.get('enabled_state')}",
+        f"target_actions: {target.get('available_action_names') or []}",
+        f"pre_requested_visible: {str(bool(pre.get('requested_title_visible'))).lower()}",
+        f"pre_requested_selected: {str(bool(pre.get('requested_title_selected'))).lower()}",
+        f"post_requested_visible: {str(bool(post.get('requested_title_visible'))).lower()}",
+        f"post_requested_selected: {str(bool(post.get('requested_title_selected'))).lower()}",
+        f"actions_performed: {result.get('actions_performed') or []}",
+        f"error: {result.get('error') or ''}",
+    ]
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_open_chatgpt_sidebar_destination_result(result: dict) -> None:
+    target = result.get("target") or {}
+    activation = result.get("activation_result") or {}
+    stability = result.get("activation_stability") or {}
+    point = result.get("calculated_global_point") or {}
+    post = result.get("post_action_evidence") or {}
+    signals = post.get("signals") or []
+    visible_chats = result.get("visible_chats") or []
+    lines = [
+        "ChatGPT sidebar destination open",
+        f"requested_kind: {result.get('kind') or ''}",
+        f"requested_title: {result.get('title') or ''}",
+        (
+            "activation_result: "
+            f"activated={activation.get('activated')} "
+            f"is_frontmost={activation.get('is_frontmost')} "
+            f"frontmost_app={activation.get('frontmost_app') or ''} "
+            f"error={activation.get('error') or ''}"
+        ),
+        (
+            "stability: "
+            f"status={stability.get('status') or ''} "
+            f"samples={stability.get('samples', 0)} "
+            f"error={stability.get('error') or ''}"
+        ),
+        f"chosen_method: {result.get('chosen_method') or ''}",
+        f"target_title_path: {target.get('title_ax_path') or ''}",
+        f"target_row_path: {target.get('row_ax_path') or ''}",
+        f"title_role: {target.get('title_role') or ''}",
+        f"row_role: {target.get('row_role') or ''}",
+        f"title_actions: {target.get('title_actions') or []}",
+        f"row_actions: {target.get('row_actions') or []}",
+        f"title_frame: {_compact_plain_frame(result.get('title_frame') or {})}",
+        f"row_frame: {_compact_plain_frame(result.get('row_frame') or {})}",
+        f"chatgpt_ax_window_frame: {_compact_plain_frame(result.get('chatgpt_ax_window_frame') or {})}",
+        f"chatgpt_windowserver_bounds: {_compact_plain_frame(result.get('chatgpt_windowserver_bounds') or {})}",
+        f"calculated_global_point: x={point.get('x')} y={point.get('y')}",
+        f"calculated_point_hit_test_relationship: {result.get('calculated_point_hit_test_relationship') or ''}",
+        f"post_action_confirmed: {post.get('confirmed')}",
+        f"post_action_evidence: {signals}",
+        f"visible_chat_count: {result.get('visible_chat_count', 0)}",
+        f"visible_chat_titles: {[chat.get('title') or '' for chat in visible_chats]}",
+        f"final_outcome: {result.get('outcome') or ''}",
+        f"actions_performed: {result.get('actions_performed') or []}",
+        f"error: {result.get('error') or ''}",
+    ]
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _compact_plain_frame(frame: dict) -> str:
+    return (
+        f"x={frame.get('x')} y={frame.get('y')} "
+        f"width={frame.get('width')} height={frame.get('height')}"
+    )
+
+
+def _print_inspect_chatgpt_sidebar_destination_result(result: dict, include_json_details: bool = False) -> None:
+    lines = _inspect_chatgpt_sidebar_destination_result_lines(result)
+    if include_json_details:
+        json_text = json.dumps(result, indent=2, sort_keys=True)
+        remaining = max(0, DEEP_INSPECTOR_OUTPUT_CHAR_GUARD - _line_char_count(lines) - len("json_details:\n"))
+        lines.append("json_details:")
+        if len(json_text) <= remaining:
+            lines.append(json_text)
+        else:
+            lines.append(json_text[:remaining])
+            lines.append("(json details truncated by output guard)")
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_verify_chatgpt_sidebar_frame_click_result(result: dict) -> None:
+    target = result.get("target") or {}
+    frame_safety = result.get("frame_safety") or {}
+    source_frame = frame_safety.get("source_frame") or {}
+    sidebar_frame = frame_safety.get("chosen_sidebar_frame_geometry") or {}
+    window_frame = frame_safety.get("focused_window_frame_geometry") or {}
+    click_point = result.get("click_point") or {}
+    post = result.get("post_click_evidence") or {}
+    coords = result.get("coordinate_diagnostics") or {}
+    lines = [
+        "ChatGPT sidebar frame-click verification",
+        f"status: {result.get('status') or ''}",
+        f"ok: {str(bool(result.get('ok'))).lower()}",
+        f"dry_run: {str(not bool(result.get('confirm_frame_click'))).lower()}",
+        f"app_name: {result.get('app_name') or ''}",
+        f"kind: {result.get('kind') or ''}",
+        f"title: {result.get('title') or ''}",
+        f"pid_present: {str(bool(result.get('pid_present'))).lower()}",
+        f"process_resolution_method: {result.get('process_resolution_method') or ''}",
+        f"target_title_path: {target.get('title_ax_path') or ''}",
+        f"target_row_path: {target.get('computed_row_ax_path') or ''}",
+        f"chosen_source_frame_path: {target.get('source_frame_path') or ''}",
+        f"chosen_source_frame_relation: {target.get('source_frame_relation') or ''}",
+        f"chosen_sidebar_frame_path: {frame_safety.get('chosen_sidebar_frame_path') or ''}",
+        f"chosen_sidebar_frame_role: {frame_safety.get('chosen_sidebar_frame_role') or ''}",
+        (
+            "chosen_sidebar_frame_geometry: "
+            f"x={sidebar_frame.get('x')} y={sidebar_frame.get('y')} "
+            f"width={sidebar_frame.get('width')} height={sidebar_frame.get('height')}"
+        ),
+        f"sidebar_containment_method: {frame_safety.get('sidebar_containment_method') or ''}",
+        f"row_inside_chosen_sidebar_frame: {frame_safety.get('row_inside_chosen_sidebar_frame')}",
+        (
+            "focused_window_frame_geometry: "
+            f"x={window_frame.get('x')} y={window_frame.get('y')} "
+            f"width={window_frame.get('width')} height={window_frame.get('height')}"
+        ),
+        (
+            "frame_geometry: "
+            f"x={source_frame.get('x')} y={source_frame.get('y')} "
+            f"width={source_frame.get('width')} height={source_frame.get('height')}"
+        ),
+        (
+            "frame_checks: "
+            f"valid={source_frame.get('valid')} "
+            f"inside_window={source_frame.get('fully_inside_window')} "
+            f"inside_sidebar={source_frame.get('inside_sidebar_or_list')} "
+            f"large_enough={source_frame.get('large_enough_for_safe_interior_click')}"
+        ),
+        f"safe_click_point: x={click_point.get('x')} y={click_point.get('y')} ok={click_point.get('ok')}",
+        f"safe_click_policy: {click_point.get('policy') or ''}",
+        f"overflow_exclusion_zone: {click_point.get('overflow_exclusion_zone') or {}}",
+        f"why_click_point_avoids_overflow_region: {frame_safety.get('why_click_point_avoids_overflow_region') or ''}",
+        f"safety_checks_passed: {str(bool(frame_safety.get('safety_checks_passed'))).lower()}",
+        *_coordinate_diagnostics_lines(coords),
+        f"post_click_status: {post.get('status') or ''}",
+        f"post_selection_or_focus_changed: {post.get('selection_or_focus_changed')}",
+        f"post_observable_state_changed: {post.get('observable_state_changed')}",
+        f"actions_performed: {result.get('actions_performed') or []}",
+        f"error: {result.get('error') or ''}",
+    ]
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_calibrate_chatgpt_sidebar_coordinate_mapping_result(result: dict) -> None:
+    target = result.get("target") or {}
+    cursor = result.get("current_global_physical_cursor_location") or {}
+    hit = result.get("hit_test") or {}
+    windowserver = result.get("windowserver_evidence") or {}
+    chosen_ws = (windowserver.get("chosen_window") or {}).get("bounds") or {}
+    frames = result.get("frame_evidence") or []
+    title_frame = _first_frame_evidence(frames, "target_title_frame")
+    row_frame = _first_frame_evidence(frames, "computed_row_frame")
+    ax_window = _first_frame_evidence(frames, "chatgpt_ax_window_frame")
+    calculated = result.get("calculated_global_click_point") or {}
+    selected = result.get("selected_source_mapping_candidate") or {}
+    selected_point = selected.get("candidate_point") or {}
+    post = result.get("post_click_requested_destination_evidence") or {}
+    lines = [
+        "ChatGPT sidebar coordinate-mapping calibration",
+        f"status: {result.get('status') or ''}",
+        f"ok: {str(bool(result.get('ok'))).lower()}",
+        f"read_only: {str(bool(result.get('read_only'))).lower()}",
+        f"app_name: {result.get('app_name') or ''}",
+        f"kind: {result.get('kind') or ''}",
+        f"title: {result.get('title') or ''}",
+        f"pid_present: {str(bool(result.get('pid_present'))).lower()}",
+        f"process_resolution_method: {result.get('process_resolution_method') or ''}",
+        f"current_global_physical_cursor_location: x={cursor.get('x')} y={cursor.get('y')}",
+        f"hit_test_path: {hit.get('path') or ''}",
+        f"hit_test_role: {hit.get('role') or ''}",
+        f"hit_test_subrole: {hit.get('subrole') or ''}",
+        f"hit_test_relationship_to_requested_target: {result.get('hit_test_relationship_to_requested_target') or ''}",
+        f"target_title_path: {target.get('title_ax_path') or ''}",
+        f"target_row_path: {target.get('computed_row_ax_path') or ''}",
+        f"target_title_frame: {_compact_calibration_frame(title_frame)}",
+        f"row_frame: {_compact_calibration_frame(row_frame)}",
+        (
+            "chosen_chatgpt_windowserver_bounds: "
+            f"x={chosen_ws.get('x')} y={chosen_ws.get('y')} "
+            f"width={chosen_ws.get('width')} height={chosen_ws.get('height')}"
+        ),
+        f"chosen_chatgpt_ax_window_frame: {_compact_calibration_frame(ax_window)}",
+        "mapping_candidates:",
+    ]
+    for candidate in result.get("mapping_candidates") or []:
+        point = candidate.get("candidate_point") or {}
+        lines.append(
+            "  "
+            f"{candidate.get('mapping_name') or ''}: "
+            f"x={point.get('x')} y={point.get('y')} "
+            f"distance_from_cursor_px={candidate.get('distance_from_cursor_px')} "
+            f"inside_window={candidate.get('inside_actual_visible_chatgpt_window_bounds')} "
+            f"inside_hit_relationship={candidate.get('inside_target_hit_test_relationship')} "
+            f"inside_title={candidate.get('inside_target_title_frame_under_interpretation')} "
+            f"inside_row={candidate.get('inside_target_row_frame_under_interpretation')}"
+        )
+    if result.get("confirm_calibration_click"):
+        lines.extend(
+            [
+                (
+                    "chosen_mapping_candidate: "
+                    f"name={selected.get('mapping_name') or ''} "
+                    f"classification={selected.get('classification_if_unique') or ''} "
+                    f"x={selected_point.get('x')} y={selected_point.get('y')}"
+                ),
+                f"calculated_global_click_point: x={calculated.get('x')} y={calculated.get('y')}",
+                f"click_count: {result.get('click_count')}",
+                f"inter_click_delay_ms: {result.get('inter_click_delay_ms')}",
+                (
+                    "post_click_requested_destination_evidence: "
+                    f"confirmed={post.get('active_destination_confirmed')} "
+                    f"visible={post.get('requested_title_visible')} "
+                    f"match_count={post.get('requested_title_match_count')} "
+                    f"evidence={post.get('evidence') or []}"
+                ),
+                f"final_click_classification: {result.get('final_click_classification') or ''}",
+            ]
+        )
+    lines.extend(
+        [
+            f"final_mapping_classification: {result.get('final_mapping_classification') or ''}",
+            f"recommended_future_click_transform: {result.get('recommended_future_click_transform') or 'unresolved'}",
+            f"actions_performed: {result.get('actions_performed') or []}",
+            f"error: {result.get('error') or ''}",
+            _calibration_non_action_line(bool(result.get("confirm_calibration_click"))),
+            f"recommended_runtime_click_transform: {result.get('recommended_runtime_click_transform') or 'unresolved'}",
+        ]
+    )
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_inspect_chatgpt_project_visible_chats_result(result: dict) -> None:
+    content = result.get("main_project_content") or result.get("project_content_container") or {}
+    content_frame = content.get("frame") or {}
+    chat_list = result.get("chat_list_container") or {}
+    chat_list_frame = chat_list.get("frame") or {}
+    lines = [
+        "ChatGPT project visible chats",
+        f"status: {result.get('status') or ''}",
+        f"ok: {str(bool(result.get('ok'))).lower()}",
+        f"project_title: {result.get('project_title') or ''}",
+        f"visible_chat_count: {result.get('visible_chat_count', 0)}",
+        (
+            "main_project_content_path: "
+            f"{content.get('path') or ''}"
+        ),
+        (
+            "main_project_content_frame: "
+            f"{_compact_plain_frame(content_frame)}"
+        ),
+        (
+            "project_content_container: "
+            f"path={content.get('path') or ''} "
+            f"frame={_compact_plain_frame(content_frame)}"
+        ),
+        (
+            "chat_list_container_path: "
+            f"{chat_list.get('path') or ''}"
+        ),
+        (
+            "chat_list_container_frame: "
+            f"{_compact_plain_frame(chat_list_frame)}"
+        ),
+        f"more_rows_may_exist_below: {result.get('more_rows_may_exist_below')}",
+        f"project_chat_list_identity: {result.get('project_chat_list_identity') or 'not_confirmed'}",
+        (
+            "project_chat_list_container: "
+            f"path={result.get('project_chat_list_container_path') or ''} "
+            f"role={result.get('project_chat_list_container_role') or ''} "
+            f"frame={_compact_plain_frame(result.get('project_chat_list_container_frame') or {})}"
+        ),
+        f"project_chat_row_shape_status: {result.get('project_chat_row_shape_status') or ''}",
+        f"valid_project_chat_row_count: {result.get('valid_project_chat_row_count', 0)}",
+        f"invalid_candidate_count: {result.get('invalid_candidate_count', 0)}",
+        f"row_height_median: {result.get('row_height_median', 0.0)}",
+        f"vertical_peer_list_confirmed: {str(bool(result.get('vertical_peer_list_confirmed'))).lower()}",
+        f"chats_tab_active_evidence: {result.get('chats_tab_active_evidence') or ''}",
+        f"identity_stability_samples: {result.get('identity_stability_samples', 1)}",
+        f"identity_failure_reasons: {result.get('identity_failure_reasons') or []}",
+        f"excluded_candidate_count: {sum((result.get('excluded_candidate_counts') or {}).values())}",
+        f"excluded_candidate_reasons: {result.get('excluded_candidate_counts') or {}}",
+        f"actions_performed: {result.get('actions_performed') or []}",
+    ]
+    for chat in result.get("visible_chats") or []:
+        row_frame = chat.get("row_frame") or {}
+        lines.append(f"{chat.get('ordinal')}. {chat.get('title') or ''}")
+        if chat.get("preview"):
+            lines.append(f"   preview: {chat.get('preview')}")
+        lines.append(f"   row_frame: {_compact_plain_frame(row_frame)}")
+        lines.append(f"   visibility: {chat.get('visibility') or ''}")
+        lines.append(f"   path: {chat.get('path') or ''}")
+        lines.append(f"   role: {chat.get('role') or ''} subrole: {chat.get('subrole') or ''}")
+        lines.append(f"   display_title_source: {chat.get('display_title_source') or ''}")
+        lines.append(f"   title_representation: {chat.get('title_representation') or ''}")
+        lines.append(f"   preview_representation: {chat.get('preview_representation') or ''}")
+        lines.append(f"   ax_press_available: {chat.get('ax_press_available')}")
+    lines.append(f"error: {result.get('error') or ''}")
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_inspect_chatgpt_project_chat_row_ax_result(result: dict) -> None:
+    lines = [
+        "ChatGPT project chat row AX audit",
+        f"status: {result.get('status') or ''}",
+        f"ok: {str(bool(result.get('ok'))).lower()}",
+        f"project_title: {result.get('project_title') or ''}",
+        f"chat_titles: {result.get('chat_titles') or []}",
+        f"project_resolution_status: {result.get('project_resolution_status') or ''}",
+        f"visible_chat_count: {result.get('visible_chat_count', 0)}",
+        f"actions_performed: {result.get('actions_performed') or []}",
+    ]
+    for audit_index, audit in enumerate(result.get("row_audits") or [], start=1):
+        row = audit.get("accepted_row") or {}
+        summary = audit.get("summary") or {}
+        lines.extend(
+            [
+                f"audit_{audit_index}_requested_chat_title: {audit.get('requested_chat_title') or ''}",
+                f"audit_{audit_index}_status: {audit.get('status') or ''}",
+                f"audit_{audit_index}_row_path: {row.get('row_path') or ''}",
+                f"audit_{audit_index}_row_role: {row.get('row_role') or ''} subrole: {row.get('row_subrole') or ''}",
+                f"audit_{audit_index}_row_frame: {_compact_plain_frame(row.get('row_frame') or {})}",
+                f"audit_{audit_index}_resolver_title: {row.get('resolver_title') or ''}",
+                f"audit_{audit_index}_raw_flattened_row_text: {audit.get('raw_flattened_row_text') or ''}",
+                f"audit_{audit_index}_row_exposes_merged_text: {summary.get('row_exposes_merged_text')}",
+                f"audit_{audit_index}_exact_title_node_paths: {summary.get('exact_title_node_paths') or []}",
+                f"audit_{audit_index}_preview_like_node_paths: {summary.get('preview_like_node_paths') or []}",
+                f"audit_{audit_index}_punctuation_only_node_paths: {summary.get('punctuation_only_node_paths') or []}",
+            ]
+        )
+        for node in audit.get("nodes") or []:
+            frame = node.get("frame") or {}
+            lines.extend(
+                [
+                    (
+                        f"  node path={node.get('path') or ''} "
+                        f"depth={node.get('relative_depth')} child_index={node.get('child_index')} "
+                        f"role={node.get('role') or ''} subrole={node.get('subrole') or ''}"
+                    ),
+                    f"    frame: {_compact_plain_frame(frame)} actions={node.get('actions') or []}",
+                    f"    AXTitle: {node.get('AXTitle') or ''}",
+                    f"    AXValue: {node.get('AXValue') or ''}",
+                    f"    AXDescription: {node.get('AXDescription') or ''}",
+                    f"    text_classification: {node.get('text_classification') or ''}",
+                ]
+            )
+    lines.append(f"error: {result.get('error') or ''}")
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_diagnose_chatgpt_project_chat_rows_result(result: dict) -> None:
+    summary = result.get("summary") or {}
+    lines = [
+        "ChatGPT Project Chat Row Diagnostic",
+        "Project/list identity",
+        f"requested_project_title: {result.get('requested_project_title') or ''}",
+        f"project_identity_confirmed: {str(bool(result.get('project_identity_confirmed'))).lower()}",
+        f"project_chat_list_identity: {result.get('project_chat_list_identity') or 'not_confirmed'}",
+        f"project_chat_list_container_path: {result.get('project_chat_list_container_path') or ''}",
+        f"project_chat_list_container_role: {result.get('project_chat_list_container_role') or ''}",
+        f"project_chat_list_container_frame: {_compact_plain_frame(result.get('project_chat_list_container_frame') or {})}",
+        f"identity_failure_reasons: {result.get('identity_failure_reasons') or []}",
+        "Confirmed list viewport",
+        f"frame: {_compact_plain_frame(result.get('project_chat_list_container_frame') or {})}",
+        f"ax_nodes_inspected: {summary.get('ax_nodes_inspected', 0)}",
+        f"contains_title_filter: {result.get('contains_title') or ''}",
+        f"hidden_unrelated_band_count: {result.get('hidden_unrelated_band_count', 0)}",
+        "Current resolver accepted rows",
+    ]
+    for row in result.get("current_resolver_accepted_rows") or []:
+        lines.extend(
+            [
+                f"- ordinal={row.get('ordinal')} title={row.get('title') or ''}",
+                f"  row_path: {row.get('row_path') or ''}",
+                f"  row_frame: {_compact_plain_frame(row.get('row_frame') or {})}",
+                f"  title_representation: {row.get('title_representation') or ''}",
+            ]
+        )
+    if not result.get("current_resolver_accepted_rows"):
+        lines.append("- none")
+
+    lines.append("Visual row bands")
+    for band in result.get("visual_row_bands") or []:
+        lines.extend(
+            [
+                f"band_index: {band.get('band_index')}",
+                f"band_frame: {_compact_plain_frame(band.get('band_frame') or {})}",
+                f"band_height: {band.get('band_height')}",
+                f"node_count: {band.get('node_count')}",
+                f"outermost_candidate_path: {band.get('outermost_candidate_path') or ''}",
+                f"outermost_candidate_role: {band.get('outermost_candidate_role') or ''}",
+            ]
+        )
+
+    lines.append("Band candidate evidence")
+    for band in result.get("visual_row_bands") or []:
+        lines.append(f"band_index: {band.get('band_index')}")
+        for node in band.get("nodes") or []:
+            lines.extend(
+                [
+                    f"  node_index: {node.get('node_index')}",
+                    f"    role: {node.get('role') or ''}",
+                    f"    subrole: {node.get('subrole') or ''}",
+                    f"    path: {node.get('path') or ''}",
+                    f"    parent_path: {node.get('parent_path') or ''}",
+                    f"    parent_role: {node.get('parent_role') or ''}",
+                    f"    frame: {_compact_plain_frame(node.get('frame') or {})}",
+                    f"    frame_height: {node.get('frame_height')}",
+                    f"    actions: {node.get('actions') or []}",
+                    f"    AXTitle: {node.get('AXTitle') or ''}",
+                    f"    AXDescription: {node.get('AXDescription') or ''}",
+                    f"    AXValue: {node.get('AXValue') or ''}",
+                ]
+            )
+        for candidate in band.get("title_candidates") or []:
+            lines.extend(
+                [
+                    "  title_candidate:",
+                    f"    source_path: {candidate.get('source_path') or ''}",
+                    f"    source_role: {candidate.get('source_role') or ''}",
+                    f"    source_attribute: {candidate.get('source_attribute') or ''}",
+                    f"    raw_text: {candidate.get('raw_text') or ''}",
+                    f"    candidate_kind: {candidate.get('candidate_kind') or ''}",
+                ]
+            )
+
+    lines.append("Current resolver comparison")
+    for band in result.get("visual_row_bands") or []:
+        comparison = band.get("current_resolver_comparison") or {}
+        lines.extend(
+            [
+                f"band_index: {band.get('band_index')}",
+                f"current_resolver_status: {comparison.get('current_resolver_status') or ''}",
+                f"current_resolver_title: {comparison.get('current_resolver_title') or ''}",
+                f"current_resolver_row_path: {comparison.get('current_resolver_row_path') or ''}",
+                f"current_resolver_row_frame: {_compact_plain_frame(comparison.get('current_resolver_row_frame') or {})}",
+                f"current_resolver_rejection_reasons: {comparison.get('current_resolver_rejection_reasons') or []}",
+            ]
+        )
+
+    lines.append("Experimental canonical titles")
+    for band in result.get("visual_row_bands") or []:
+        canonical = band.get("experimental_canonical") or {}
+        lines.extend(
+            [
+                f"band_index: {band.get('band_index')}",
+                f"experimental_canonical_title: {canonical.get('experimental_canonical_title') or ''}",
+                f"experimental_preview: {canonical.get('experimental_preview') or ''}",
+                f"experimental_title_confidence: {canonical.get('experimental_title_confidence') or 'none'}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "Summary",
+            f"ax_nodes_inspected: {summary.get('ax_nodes_inspected', 0)}",
+            f"visual_bands_found: {summary.get('visual_bands_found', 0)}",
+            f"bands_with_high_confidence_title: {summary.get('bands_with_high_confidence_title', 0)}",
+            f"bands_accepted_by_current_resolver: {summary.get('bands_accepted_by_current_resolver', 0)}",
+            f"bands_not_seen_by_current_resolver: {summary.get('bands_not_seen_by_current_resolver', 0)}",
+            f"bands_rejected_by_current_resolver: {summary.get('bands_rejected_by_current_resolver', 0)}",
+            f"filtered_bands_printed: {summary.get('filtered_bands_printed', 0)}",
+            f"final_outcome: {result.get('final_outcome') or result.get('status') or ''}",
+            f"actions_performed: {result.get('actions_performed') or []}",
+            f"error: {result.get('error') or ''}",
+        ]
+    )
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_open_chatgpt_project_chat_result(result: dict) -> None:
+    project = result.get("project_open_result") or {}
+    row = result.get("matched_chat_row") or {}
+    point = result.get("calculated_global_point") or {}
+    post = result.get("post_action_evidence") or {}
+    lines = [
+        "ChatGPT project chat open",
+        f"requested_project_title: {result.get('project_title') or ''}",
+        f"requested_chat_title: {result.get('chat_title') or ''}",
+        f"project_open_result: outcome={project.get('outcome') or ''} ok={project.get('ok')} visible_chat_count={project.get('visible_chat_count', 0)}",
+        f"project_chat_list_identity: {result.get('project_chat_list_identity') or 'not_confirmed'}",
+        (
+            "project_chat_list_container: "
+            f"path={result.get('project_chat_list_container_path') or ''} "
+            f"role={result.get('project_chat_list_container_role') or ''}"
+        ),
+        f"project_chat_row_shape_status: {result.get('project_chat_row_shape_status') or ''}",
+        f"valid_project_chat_row_count: {result.get('valid_project_chat_row_count', 0)}",
+        f"invalid_candidate_count: {result.get('invalid_candidate_count', 0)}",
+        f"row_height_median: {result.get('row_height_median', 0.0)}",
+        f"vertical_peer_list_confirmed: {str(bool(result.get('vertical_peer_list_confirmed'))).lower()}",
+        f"chats_tab_active_evidence: {result.get('chats_tab_active_evidence') or ''}",
+        f"identity_stability_samples: {result.get('identity_stability_samples', 1)}",
+        f"identity_failure_reasons: {result.get('identity_failure_reasons') or []}",
+        f"initial_visible_chat_count: {result.get('initial_visible_chat_count', result.get('visible_chat_count', 0))}",
+        f"visible_chat_count: {result.get('visible_chat_count', 0)}",
+        f"targeting_visible_chat_count: {result.get('targeting_visible_chat_count', result.get('visible_chat_count', 0))}",
+        f"scroll_iterations_attempted: {result.get('scroll_iterations_attempted', 0)}",
+        f"max_scroll_iterations: {result.get('max_scroll_iterations', 0)}",
+        f"search_cycles_attempted: {result.get('search_cycles_attempted', 0)}",
+        f"max_search_cycles: {result.get('max_search_cycles', 0)}",
+        f"configured_max_search_cycles: {result.get('configured_max_search_cycles', result.get('max_search_cycles', 0))}",
+        f"configured_max_search_elapsed_seconds: {result.get('configured_max_search_elapsed_seconds', 0.0)}",
+        f"scroll_pulses_posted: {result.get('scroll_pulses_posted', 0)}",
+        f"scroll_method_used: {result.get('scroll_method_used') or ''}",
+        f"computed_scroll_delta_y: {result.get('computed_scroll_delta_y', 0)}",
+        f"median_visible_row_height: {result.get('median_visible_row_height', 0.0)}",
+        f"scan_continuity: {result.get('scan_continuity') or 'confirmed'}",
+        f"recovery_scroll_pulses_posted: {result.get('recovery_scroll_pulses_posted', 0)}",
+        f"initial_hydration_status: {result.get('initial_hydration_status') or ''}",
+        f"hydration_events_observed: {result.get('hydration_events_observed', 0)}",
+        f"reset_events_observed: {result.get('reset_events_observed', 0)}",
+        f"unique_accessibility_rows_seen: {result.get('unique_accessibility_rows_seen', 0)}",
+        f"unique_effective_viewports_seen: {result.get('unique_effective_viewports_seen', 0)}",
+        f"new_accessibility_rows_seen: {result.get('new_accessibility_rows_seen', 0)}",
+        f"target_match_checked_on_samples: {result.get('target_match_checked_on_samples', 0)}",
+        f"hydration_samples_taken: {result.get('hydration_samples_taken', 0)}",
+        f"settled_cycles_completed: {result.get('settled_cycles_completed', 0)}",
+        f"progressful_cycles_completed: {result.get('progressful_cycles_completed', 0)}",
+        f"target_initially_visible: {result.get('target_initially_visible')}",
+        f"target_found_after_scrolling: {result.get('target_found_after_scrolling')}",
+        f"unique_chat_titles_printed: {result.get('unique_chat_titles_printed', 0)}",
+        f"target_exact_match_detected: {str(bool(result.get('target_exact_match_detected'))).lower()}",
+        f"target_detected_in: {result.get('target_detected_in') or ''}",
+        f"target_detected_cycle: {result.get('target_detected_cycle', 0)}",
+        f"scroll_pulses_after_target_detection: {result.get('scroll_pulses_after_target_detection', 0)}",
+        f"target_alignment_required: {str(bool(result.get('target_alignment_required'))).lower()}",
+        f"target_alignment_method: {result.get('target_alignment_method') or 'none'}",
+        f"target_alignment_posted: {str(bool(result.get('target_alignment_posted'))).lower()}",
+        f"target_alignment_row_path: {result.get('target_alignment_row_path') or ''}",
+        f"target_alignment_pre_visibility: {result.get('target_alignment_pre_visibility') or 'not_visible'}",
+        f"target_alignment_post_visibility: {result.get('target_alignment_post_visibility') or 'not_visible'}",
+        f"target_alignment_fresh_re_resolution_confirmed: {str(bool(result.get('target_alignment_fresh_re_resolution_confirmed'))).lower()}",
+        f"total_unique_valid_chats_discovered: {result.get('total_unique_valid_chats_discovered', result.get('unique_chat_titles_printed', 0))}",
+        f"search_elapsed_seconds: {result.get('search_elapsed_seconds', 0.0)}",
+        f"unique_row_count_seen: {result.get('unique_row_count_seen', 0)}",
+        f"matched_chat_row_path: {row.get('row_path') or row.get('path') or ''}",
+        f"matched_chat_title_path: {row.get('title_path') or ''}",
+        f"matched_chat_row_frame: {_compact_plain_frame(row.get('row_frame') or {})}",
+        f"matched_canonical_title: {row.get('title') or ''}",
+        f"matched_chat_title: {result.get('matched_chat_title') or row.get('title') or ''}",
+        f"matched_title_representation: {result.get('matched_title_representation') or row.get('title_representation') or ''}",
+        f"matched_accessibility_text_truncated: {result.get('matched_accessibility_text_truncated') or ''}",
+        f"matched_visibility: {row.get('visibility') or ''}",
+        f"chosen_method: {result.get('chosen_method') or ''}",
+    ]
+    if result.get("outcome") in {
+        "chat_not_found_in_project",
+        "chat_not_currently_visible_and_scroll_unavailable",
+        "chat_list_scroll_target_not_found",
+        "chat_list_scroll_failed",
+        "chat_list_scroll_no_progress",
+        "chat_list_scan_continuity_not_confirmed",
+        "chat_list_end_reached_without_match",
+        "chat_search_budget_exhausted_without_confirmed_end",
+        "chat_search_time_budget_exhausted_while_list_progressing",
+    }:
+        lines.extend(
+            [
+                f"visible_title_count_seen: {result.get('visible_title_count_seen', 0)}",
+                f"end_of_list_state: {result.get('end_of_list_state') or 'unknown'}",
+                f"previous_settled_viewport_signature: {result.get('previous_settled_viewport_signature') or ''}",
+                f"current_settled_viewport_signature: {result.get('current_settled_viewport_signature') or ''}",
+                f"overlap_row_count: {result.get('overlap_row_count', 0)}",
+                f"overlap_adjacency_confirmed: {result.get('overlap_adjacency_confirmed', True)}",
+            ]
+        )
+    if result.get("target_found_during_hydration_cycle"):
+        lines.append(f"target_found_during_hydration_cycle: {result.get('target_found_during_hydration_cycle')}")
+    for summary in result.get("search_cycle_summaries") or []:
+        lines.append(str(summary))
+    if result.get("visible_chat_count_stage_explanation"):
+        lines.append(f"visible_chat_count_stage_explanation: {result.get('visible_chat_count_stage_explanation')}")
+    if result.get("outcome") in {"chat_not_currently_visible", "chat_title_not_unambiguously_representable_by_accessibility"}:
+        lines.extend(
+            [
+                f"canonical_visible_chat_titles_considered: {result.get('canonical_visible_chat_titles_considered') or []}",
+                f"canonical_visible_chat_count_considered: {result.get('canonical_visible_chat_count_considered', 0)}",
+                f"resolver_snapshot_id: {result.get('resolver_snapshot_id') or ''}",
+                f"visible_chat_accessibility_representation_summary: {result.get('visible_chat_accessibility_representation_summary') or []}",
+            ]
+        )
+    if result.get("chosen_method") == "validated_geometry_click" or point.get("x") is not None or result.get("calculated_point_hit_test_relationship"):
+        lines.extend(
+            [
+                f"calculated_global_point: x={point.get('x')} y={point.get('y')}",
+                f"calculated_point_hit_test_relationship: {result.get('calculated_point_hit_test_relationship') or ''}",
+            ]
+        )
+    lines.extend(
+        [
+            f"post_action_evidence: {post.get('signals') or []}",
+            f"final_outcome: {result.get('outcome') or ''}",
+            f"actions_performed: {result.get('actions_performed') or []}",
+            f"error: {result.get('error') or ''}",
+        ]
+    )
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_live_project_chat_discovery_lines(lines: list[str]) -> None:
+    for line in lines:
+        print(line)
+    sys.stdout.flush()
+    sys.stdout.flush()
+
+
+def _calibration_non_action_line(confirmed: bool) -> str:
+    if confirmed:
+        return "No cursor movement, cursor warp, app activation, focus change, menu opening, scroll, typing, paste, AppleScript, browser automation, or persistent calibration write was performed."
+    return "No cursor movement, click, event post, app activation, focus change, selection change, menu opening, scroll, typing, paste, AppleScript, browser automation, or persistent calibration write was performed."
+
+
+def _first_frame_evidence(frames: list[dict], source: str) -> dict:
+    for frame in frames:
+        if frame.get("source") == source:
+            return frame
+    return {}
+
+
+def _compact_calibration_frame(frame: dict) -> str:
+    return (
+        f"source={frame.get('source') or ''} "
+        f"path={frame.get('ax_path') or ''} "
+        f"x={frame.get('x')} y={frame.get('y')} "
+        f"width={frame.get('width')} height={frame.get('height')} "
+        f"contains_cursor={frame.get('contains_global_physical_cursor')} "
+        f"contains_title={frame.get('contains_target_title_frame')} "
+        f"contains_row={frame.get('contains_target_row_frame')} "
+        f"confidence={frame.get('coordinate_space_confidence') or ''}"
+    )
+
+
+def _coordinate_diagnostics_lines(coords: dict) -> list[str]:
+    if not coords:
+        return []
+
+    def _frame(label: str, frame: dict) -> str:
+        frame = frame or {}
+        return (
+            f"{label}: x={frame.get('x')} y={frame.get('y')} "
+            f"width={frame.get('width')} height={frame.get('height')}"
+        )
+
+    def _point(label: str, point: dict) -> str:
+        point = point or {}
+        return f"{label}: x={point.get('x')} y={point.get('y')}"
+
+    raw_in = coords.get("raw_point_containment") or {}
+    inverted_in = coords.get("inverted_point_containment") or {}
+    assessment = coords.get("assessment") or {}
+    lines = [
+        "coordinate_diagnostics:",
+        "  " + _frame("raw_ax_row_frame", coords.get("raw_ax_row_frame")),
+        "  " + _frame("ax_sidebar_frame", coords.get("ax_sidebar_frame")),
+        "  " + _frame("focused_window_frame", coords.get("focused_window_frame")),
+        "  " + _frame("primary_display_bounds", coords.get("primary_display_bounds")),
+        "  " + _point("current_mouse_location", coords.get("current_mouse_location")),
+        "  " + _point("intended_event_point", coords.get("intended_event_point")),
+        "  " + _point("vertically_inverted_candidate_point", coords.get("vertically_inverted_candidate_point")),
+        (
+            "  raw_point_inside: "
+            f"row={raw_in.get('in_ax_row_frame')} "
+            f"sidebar={raw_in.get('in_ax_sidebar_frame')} "
+            f"window={raw_in.get('in_focused_window_frame')}"
+        ),
+        (
+            "  inverted_point_inside: "
+            f"row={inverted_in.get('in_ax_row_frame')} "
+            f"sidebar={inverted_in.get('in_ax_sidebar_frame')} "
+            f"window={inverted_in.get('in_focused_window_frame')}"
+        ),
+        (
+            "  assessment: "
+            f"raw_point_matches_ax_frame={assessment.get('raw_point_matches_ax_frame')} "
+            f"inverted_point_matches_ax_frame={assessment.get('inverted_point_matches_ax_frame')} "
+            f"neither_point_matches_ax_frame={assessment.get('neither_point_matches_ax_frame')} "
+            f"ambiguous_coordinate_mapping={assessment.get('ambiguous_coordinate_mapping')}"
+        ),
+        f"  cursor_unmoved: {str(bool(coords.get('cursor_unmoved'))).lower()}",
+    ]
+    if coords.get("probe_error"):
+        lines.append(f"  coordinate_probe_error: {coords.get('probe_error')}")
+    lines.append(
+        f"recommended_click_coordinate_mapping: {coords.get('recommended_click_coordinate_mapping') or 'unresolved'}"
+    )
+    return lines
+
+
+def _inspect_chatgpt_sidebar_destination_result_lines(result: dict) -> list[str]:
+    target = result.get("target") or {}
+    scope = result.get("scope") or {}
+    assessment = result.get("primary_selection_assessment") or {}
+    frame_evidence = result.get("frame_evidence") or {}
+    click_source = frame_evidence.get("chosen_click_source") or {}
+    click_point = frame_evidence.get("computed_safe_click_point") or {}
+    lines = [
+        "ChatGPT sidebar destination deep inspection",
+        f"status: {result.get('status') or ''}",
+        f"ok: {str(bool(result.get('ok'))).lower()}",
+        f"read_only: {str(bool(result.get('read_only'))).lower()}",
+        f"app_name: {result.get('app_name') or ''}",
+        f"kind: {result.get('kind') or ''}",
+        f"title: {result.get('title') or ''}",
+        f"pid_present: {str(bool(result.get('pid_present'))).lower()}",
+        f"process_resolution_method: {result.get('process_resolution_method') or ''}",
+        f"target_title_path: {target.get('title_ax_path') or ''}",
+        f"target_row_path: {target.get('computed_row_ax_path') or ''}",
+        f"existing_resolution_method: {target.get('current_resolution_method') or ''}",
+        f"retained_elements: {scope.get('retained_element_count', 0)}",
+        f"row_descendants: {scope.get('row_descendant_count', 0)}",
+        f"siblings: {scope.get('sibling_count', 0)}",
+        f"related_elements: {scope.get('related_count', 0)}",
+        f"primary_selection_classification: {assessment.get('classification') or ''}",
+        f"frame_title_node: {_compact_frame_evidence(frame_evidence.get('title_node') or {})}",
+        f"frame_computed_row: {_compact_frame_evidence(frame_evidence.get('computed_row_node') or {})}",
+        f"frame_nearest_visible_ancestor: {_compact_frame_evidence(frame_evidence.get('nearest_visible_ancestor_with_usable_frame') or {})}",
+        f"frame_sidebar_or_list: {_compact_frame_evidence(frame_evidence.get('sidebar_or_list') or {})}",
+        f"frame_focused_window: {_compact_frame_evidence(frame_evidence.get('focused_window') or {})}",
+        (
+            "computed_safe_click_point: "
+            f"x={click_point.get('x')} y={click_point.get('y')} ok={click_point.get('ok')} "
+            f"source={click_source.get('source_path') or ''}"
+        ),
+        f"error: {result.get('error') or ''}",
+        "No app activation, focus change, selection change, menu opening, clipboard, typing, paste, click, keypress, or UI action was performed.",
+    ]
+    controls = assessment.get("viable_candidate_controls") or []
+    lines.append(f"viable candidate controls: {len(controls)}")
+    for index, control in enumerate(controls[:8], start=1):
+        lines.append(
+            "  "
+            f"{index}. path={control.get('target_path') or ''} "
+            f"relation={control.get('relation_to_requested_title') or ''} "
+            f"confidence={control.get('confidence') or ''}"
+        )
+        lines.append(f"     actions={control.get('concrete_advertised_actions') or []}")
+        lines.append(f"     settable={control.get('supported_and_settable_selection_focus_attributes') or {}}")
+        lines.append(f"     why={control.get('why_primary_selection') or ''}")
+    lines.append("retained local elements:")
+    for index, element in enumerate((result.get("elements") or [])[:80], start=1):
+        lines.extend(_sidebar_destination_element_lines(index, element))
+        if _line_char_count(lines) >= DEEP_INSPECTOR_OUTPUT_CHAR_GUARD:
+            lines.append("(remaining elements omitted by output guard)")
+            break
+    return lines[:]
+
+
+def _compact_frame_evidence(item: dict) -> str:
+    frame = item.get("frame") or {}
+    if not frame:
+        frame = item
+    return (
+        f"path={item.get('path') or ''} "
+        f"x={frame.get('x')} y={frame.get('y')} "
+        f"width={frame.get('width')} height={frame.get('height')} "
+        f"valid={frame.get('valid')} "
+        f"inside_window={frame.get('fully_inside_window')} "
+        f"inside_sidebar={frame.get('inside_sidebar_or_list')} "
+        f"large_enough={frame.get('large_enough_for_safe_interior_click')}"
+    )
+
+
+def _sidebar_destination_element_lines(index: int, element: dict) -> list[str]:
+    title = element.get("title") or {}
+    value = element.get("value") or {}
+    supported = element.get("supported_attributes") or {}
+    settable = element.get("settable_attributes") or {}
+    row_structure = element.get("row_structure") or {}
+    linked = element.get("linked_elements") or []
+    return [
+        (
+            "  "
+            f"{index}. path={element.get('path') or ''} "
+            f"relation={element.get('relation_to_requested_title') or ''} "
+            f"role={element.get('role') or ''} "
+            f"subrole={element.get('subrole') or ''}"
+        ),
+        (
+            "     "
+            f"enabled={element.get('enabled')} focused={element.get('focused')} selected={element.get('selected')} "
+            f"parent={element.get('parent_path') or ''}"
+        ),
+        (
+            "     "
+            f"title_literal={title.get('literal')!r} title_redacted={title.get('redacted')} "
+            f"value_length={value.get('normalized_length', 0)} value_redacted={value.get('redacted')}"
+        ),
+        f"     actions={element.get('actions') or []}",
+        f"     action_descriptions={element.get('action_descriptions') or {}}",
+        (
+            "     "
+            f"children={element.get('direct_children_count', 0)} "
+            f"visible_children={element.get('visible_children_count', 0)}"
+        ),
+        (
+            "     "
+            f"supported_focus_selection={{"
+            f"'AXFocused': {supported.get('AXFocused')}, "
+            f"'AXSelected': {supported.get('AXSelected')}, "
+            f"'AXSelectedChildren': {supported.get('AXSelectedChildren')}, "
+            f"'AXSelectedRows': {supported.get('AXSelectedRows')}"
+            f"}}"
+        ),
+        f"     settable={settable}",
+        (
+            "     "
+            f"row_paths={row_structure.get('AXRows') or []} "
+            f"visible_rows={row_structure.get('AXVisibleRows') or []} "
+            f"selected_rows={row_structure.get('AXSelectedRows') or []} "
+            f"selected_children={row_structure.get('AXSelectedChildren') or []}"
+        ),
+        (
+            "     "
+            f"linked={[(item.get('attribute'), item.get('path')) for item in linked[:8]]}"
+        ),
+    ]
+
+
+def _sidebar_destination_action_notice(kind: str, title: str) -> None:
+    print(f'Explicit sidebar destination verification authorized for: {kind} "{title}".')
+    sys.stdout.flush()
+
+
+def _sidebar_frame_click_notice(kind: str, title: str) -> None:
+    print(f'Explicit frame-click verification authorized for: {kind} "{title}".')
+    sys.stdout.flush()
+
+
+def _open_chatgpt_sidebar_destination_notice() -> None:
+    print("Explicit ChatGPT sidebar destination open authorized.")
+    sys.stdout.flush()
+
+
+def _open_chatgpt_project_chat_notice() -> None:
+    print("Explicit ChatGPT project chat open authorized.")
+    sys.stdout.flush()
+
+
+def _synthetic_click_probe_notice() -> None:
+    print("Explicit synthetic-click probe authorized.")
+    sys.stdout.flush()
+
+
+def _current_cursor_click_notice() -> None:
+    print("Explicit current-cursor click authorized.")
+    sys.stdout.flush()
+
+
+def _coordinate_calibration_click_notice() -> None:
+    print("Explicit coordinate-calibration click authorized.")
+    sys.stdout.flush()
+
+
+def _print_verify_synthetic_click_delivery_result(result: dict) -> None:
+    button_frame = result.get("button_frame") or {}
+    window_frame = result.get("window_frame") or {}
+    click_point = result.get("click_point") or {}
+    permission = result.get("permission_preflight_state") or {}
+    lines = [
+        f"calculator_app_name: {result.get('app_name') or ''}",
+        f"calculator_window_title: {result.get('calculator_window_title') or ''}",
+        f"button_title: {result.get('digit_button_title') or ''}",
+        f"pre_display_value: {result.get('pre_display_value')}",
+        f"post_display_value: {result.get('post_display_value')}",
+        (
+            "button_frame: "
+            f"x={button_frame.get('x')} y={button_frame.get('y')} "
+            f"width={button_frame.get('width')} height={button_frame.get('height')}"
+        ),
+        (
+            "window_frame: "
+            f"x={window_frame.get('x')} y={window_frame.get('y')} "
+            f"width={window_frame.get('width')} height={window_frame.get('height')}"
+        ),
+        f"click_point: x={click_point.get('x')} y={click_point.get('y')}",
+        f"click_point_inside_button: {result.get('click_point_inside_button')}",
+        f"click_point_inside_window: {result.get('click_point_inside_window')}",
+        f"event_source_type: {result.get('event_source_type') or ''}",
+        f"event_posting_target: {result.get('event_posting_target') or ''}",
+        f"post_event_permission_available: {result.get('post_event_permission_available')}",
+        f"permission_preflight_state: available={permission.get('available')} error={permission.get('error') or ''}",
+        f"emitted_actions: {result.get('actions_performed') or []}",
+        f"outcome: {result.get('status') or ''}",
+    ]
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_verify_current_cursor_click_result(result: dict) -> None:
+    cursor = result.get("current_cursor_location") or {}
+    permission = result.get("permission_preflight_state") or {}
+    lines = [
+        "Warning: confirmed mode clicks whatever is currently under the physical cursor.",
+        f"status: {result.get('status') or ''}",
+        f"dry_run: {str(not bool(result.get('confirm_current_cursor_click'))).lower()}",
+        f"current_cursor_location: x={cursor.get('x')} y={cursor.get('y')}",
+        f"click_count: {result.get('click_count')}",
+        f"inter_click_delay_ms: {result.get('inter_click_delay_ms')}",
+        f"event_source_type: {result.get('event_source_type') or ''}",
+        f"event_posting_target: {result.get('event_posting_target') or ''}",
+        f"permission_preflight_state: available={permission.get('available')} error={permission.get('error') or ''}",
+        f"actions_performed: {result.get('actions_performed') or []}",
+        f"outcome: {result.get('status') or ''}",
+        f"error: {result.get('error') or ''}",
+    ]
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _inspect_chatgpt_navigation_ui_result_lines(result: dict) -> list[str]:
+    traversal = result.get("traversal") or {}
+    category_limits = result.get("category_limits") or {}
+    lines = [
+        "ChatGPT navigation UI diagnostic",
+        f"ok: {str(bool(result.get('ok'))).lower()}",
+        f"reason_code: {result.get('reason_code') or ''}",
+        f"app_name: {result.get('app_name') or ''}",
+        f"process_resolution_method: {result.get('process_resolution_method') or ''}",
+        f"pid_present: {str(bool(result.get('pid_present'))).lower()}",
+        f"window_available: {str(bool(result.get('window_available'))).lower()}",
+        f"visited_nodes: {traversal.get('visited_nodes', 0)}",
+        f"emitted_nodes: {traversal.get('emitted_nodes', 0)}",
+    ]
+    for key, label in (
+        ("current_chat_identity_candidates", "current_chat_identity_candidates"),
+        ("chat_history_candidates", "chat_history_candidates"),
+        ("project_candidates", "project_candidates"),
+        ("search_candidates", "search_candidates"),
+        ("sidebar_candidates", "sidebar_candidates"),
+        ("navigation_candidates", "navigation_candidates"),
+        ("ambiguous_navigation_relevant_controls", "ambiguous_navigation_relevant_controls"),
+    ):
+        limits = category_limits.get(key) or {}
+        total = limits.get("total", len(result.get(key) or []))
+        omitted = limits.get("omitted", 0)
+        lines.append(f"{label}: {total} total, {len(result.get(key) or [])} shown, {omitted} omitted")
+    lines.append(f"error: {result.get('error') or ''}")
+    lines.append(
+        "No app activation, focus change, clipboard, typing, paste, click, keypress, ledger write, or UI action was performed."
+    )
+    if result.get("visible_navigation_title_disclosure_enabled"):
+        lines.append(result.get("visible_navigation_title_disclosure_notice") or "")
+    for key, title in (
+        ("current_chat_identity_candidates", "current-chat identity"),
+        ("chat_history_candidates", "chat history"),
+        ("project_candidates", "projects"),
+        ("search_candidates", "search"),
+        ("sidebar_candidates", "sidebar"),
+        ("navigation_candidates", "navigation"),
+        ("ambiguous_navigation_relevant_controls", "ambiguous navigation-relevant controls"),
+    ):
+        lines.extend(_navigation_candidate_section_lines(title, result.get(key) or []))
+    filtering = result.get("filtering_summary") or {}
+    if filtering:
+        lines.append("filtering_summary:")
+        for key in sorted(filtering):
+            lines.append(f"  {key}: {filtering[key]}")
+    if result.get("visible_navigation_title_disclosure_enabled"):
+        lines.extend(_visible_navigation_title_inventory_lines(result, _line_char_count(lines)))
+    return lines
+
+
+def _line_char_count(lines: list[str]) -> int:
+    return sum(len(line) + 1 for line in lines)
+
+
+def _navigation_candidate_section_lines(title: str, candidates: list[dict]) -> list[str]:
+    lines = [f"{title}:"]
+    if not candidates:
+        lines.append("  (none)")
+        return lines
+    for index, candidate in enumerate(candidates, start=1):
+        label = candidate.get("label") or {}
+        relationship = candidate.get("relationship") or {}
+        lines.append(
+            "  "
+            f"{index}. path={candidate.get('path') or ''} "
+            f"role={candidate.get('role') or ''} "
+            f"subrole={candidate.get('subrole') or ''} "
+            f"confidence={candidate.get('confidence') or ''}"
+        )
+        lines.append(
+            "     "
+            f"enabled={candidate.get('enabled')} "
+            f"focused={candidate.get('focused')} "
+            f"actionable={candidate.get('appears_actionable')} "
+            f"future={candidate.get('future_explicit_approval_relevance') or ''}"
+        )
+        lines.append(
+            "     "
+            f"label_literal={label.get('literal')!r} "
+            f"label_redacted={label.get('redacted')} "
+            f"label_classification={label.get('classification') or ''} "
+            f"label_length={label.get('normalized_length', 0)} "
+            f"label_sha256={label.get('sha256') or ''}"
+        )
+        lines.append(f"     evidence={candidate.get('evidence_codes') or []}")
+        lines.append(f"     actions={candidate.get('actions') or []}")
+        lines.append(
+            "     "
+            f"parent={relationship.get('parent_path') or ''} "
+            f"container={relationship.get('container_path') or ''} "
+            f"list={relationship.get('list_path') or ''}"
+        )
+    return lines
+
+
+def _visible_navigation_title_inventory_lines(result: dict, current_chars: int) -> list[str]:
+    limits = result.get("visible_title_category_limits") or {}
+    lines = ["visible navigation title inventory:"]
+    remaining_chars = max(0, CHATGPT_NAVIGATION_COMPACT_OUTPUT_CHAR_GUARD - current_chars - _line_char_count(lines))
+    for key, title in (
+        ("visible_chat_title_candidates", "visible chat title candidates"),
+        ("visible_project_title_candidates", "visible project title candidates"),
+        ("visible_search_result_candidates", "visible search result candidates"),
+        ("actionable_parent_candidates", "actionable parent candidates"),
+        ("visible_navigation_section_labels", "visible navigation section labels"),
+    ):
+        category_limits = limits.get(key) or {}
+        total = category_limits.get("total", len(result.get(key) or []))
+        pre_omitted = category_limits.get("omitted", 0)
+        candidates = result.get(key) or []
+        if key == "actionable_parent_candidates":
+            rendered, guard_omitted = _bounded_candidate_lines(
+                candidates,
+                _actionable_parent_inventory_entry_lines,
+                remaining_chars,
+            )
+        else:
+            rendered, guard_omitted = _bounded_candidate_lines(
+                candidates,
+                _title_candidate_inventory_entry_lines,
+                remaining_chars,
+            )
+        shown = len(candidates) - guard_omitted
+        omitted = pre_omitted + guard_omitted
+        header = f"{title}: {total} total, {shown} shown, {omitted} omitted"
+        lines.append(header)
+        remaining_chars = max(0, remaining_chars - len(header) - 1)
+        if candidates and rendered:
+            lines.extend(rendered)
+            remaining_chars = max(0, remaining_chars - _line_char_count(rendered))
+        elif candidates:
+            line = "  (omitted by compact output size guard)"
+            lines.append(line)
+            remaining_chars = max(0, remaining_chars - len(line) - 1)
+        else:
+            line = "  (none)"
+            lines.append(line)
+            remaining_chars = max(0, remaining_chars - len(line) - 1)
+    return lines
+
+
+def _bounded_candidate_lines(
+    candidates: list[dict],
+    renderer: object,
+    remaining_chars: int,
+) -> tuple[list[str], int]:
+    lines: list[str] = []
+    omitted = 0
+    for index, candidate in enumerate(candidates, start=1):
+        entry = renderer(index, candidate)
+        entry_size = _line_char_count(entry)
+        if entry_size > remaining_chars:
+            omitted = len(candidates) - index + 1
+            break
+        lines.extend(entry)
+        remaining_chars -= entry_size
+    return lines, omitted
+
+
+def _title_candidate_inventory_entry_lines(index: int, candidate: dict) -> list[str]:
+    ancestor = candidate.get("nearest_actionable_ancestor") or {}
+    container = candidate.get("nearest_list_container") or {}
+    return [
+        (
+            "  "
+            f"{index}. title={candidate.get('exact_title')!r} "
+            f"path={candidate.get('path') or ''} "
+            f"role={candidate.get('role') or ''} "
+            f"subrole={candidate.get('subrole') or ''}"
+        ),
+        (
+            "     "
+            f"classification={candidate.get('classification') or ''} "
+            f"confidence={candidate.get('confidence') or ''} "
+            f"source={candidate.get('title_source_attribute') or ''} "
+            f"capability={candidate.get('capability_assessment') or ''}"
+        ),
+        (
+            "     "
+            f"enabled={candidate.get('enabled')} "
+            f"focused={candidate.get('focused')} "
+            f"title_actionable={candidate.get('title_candidate_actionable')} "
+            f"parent_actionable={candidate.get('parent_appears_actionable')}"
+        ),
+        f"     actions={candidate.get('actions') or []}",
+        (
+            "     "
+            f"ancestor_path={ancestor.get('path') or ''} "
+            f"ancestor_role={ancestor.get('role') or ''} "
+            f"ancestor_actions={ancestor.get('actions') or []}"
+        ),
+        (
+            "     "
+            f"list_path={container.get('path') or ''} "
+            f"list_role={container.get('role') or ''} "
+            f"list_purpose={container.get('purpose') or ''}"
+        ),
+        f"     evidence={candidate.get('evidence_codes') or []}",
+    ]
+
+
+def _actionable_parent_inventory_entry_lines(index: int, candidate: dict) -> list[str]:
+    container = candidate.get("nearest_list_container") or {}
+    return [
+        (
+            "  "
+            f"{index}. path={candidate.get('path') or ''} "
+            f"role={candidate.get('role') or ''} "
+            f"subrole={candidate.get('subrole') or ''} "
+            f"capability={candidate.get('capability_assessment') or ''}"
+        ),
+        (
+            "     "
+            f"enabled={candidate.get('enabled')} "
+            f"focused={candidate.get('focused')} "
+            f"actions={candidate.get('actions') or []}"
+        ),
+        (
+            "     "
+            f"list_path={container.get('path') or ''} "
+            f"list_role={container.get('role') or ''} "
+            f"list_purpose={container.get('purpose') or ''}"
+        ),
+        (
+            "     "
+            f"example_child_title_path={candidate.get('example_child_title_path') or ''} "
+            f"evidence={candidate.get('evidence_codes') or []}"
+        ),
+    ]
 
 
 def _print_chatgpt_target_paste_result(
@@ -1202,6 +2769,76 @@ def _print_human_decision(previous_status: str, next_status: str, note: str) -> 
     sys.stdout.flush()
 
 
+def _handle_human_decision_result(
+    parser: argparse.ArgumentParser,
+    result: HumanDecisionResult,
+) -> None:
+    if result.reason_code == "run_not_found":
+        parser.exit(1, f"Run not found: {result.run_id}\n")
+
+    if not result.ok:
+        print(f"error: {result.error_message}", file=sys.stderr)
+        raise SystemExit(1)
+
+    _print_human_decision(
+        result.previous_status or "",
+        result.next_status or "",
+        (result.metadata or {}).get("note", ""),
+    )
+
+
+def _decision_from_event_type(event_type: str) -> HumanDecision | None:
+    if event_type == "human_approval":
+        return HumanDecision.APPROVE
+    if event_type == "human_rejection":
+        return HumanDecision.REJECT
+    if event_type == "human_review_completed":
+        return HumanDecision.COMPLETE_REVIEW
+    return None
+
+
+class _PreloadedHumanDecisionLedger:
+    def __init__(self, run_id: str, run: dict, delegate: object) -> None:
+        self._run_id = run_id
+        self._run = run
+        self._delegate = delegate
+
+    def get_run(self, run_id: str) -> dict | None:
+        if run_id == self._run_id:
+            return self._run
+        return self._delegate.get_run(run_id)
+
+    def update_run_status(
+        self,
+        run_id: str,
+        status: RunStatus,
+        *,
+        final_summary: str | None = None,
+        error: str | None = None,
+    ) -> object:
+        return self._delegate.update_run_status(
+            run_id,
+            status,
+            final_summary=final_summary,
+            error=error,
+        )
+
+    def add_event(
+        self,
+        run_id: str,
+        event_type: str,
+        message: str,
+        *,
+        metadata: dict | None = None,
+    ) -> object:
+        return self._delegate.add_event(
+            run_id,
+            event_type,
+            message,
+            metadata,
+        )
+
+
 def _write_feedback_output(output_path_text: str, message: str) -> Path:
     output_path = Path(output_path_text).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1226,43 +2863,61 @@ def _resolve_flagged_run(
     rejected_event_type: str,
     action_label: str,
 ) -> None:
-    current_status = run["status"]
-    if current_status not in allowed_statuses:
-        allowed_statuses_text = ", ".join(sorted(allowed_statuses))
-        message = (
-            f"Cannot {action_label} run from current status "
-            f"{current_status!r}. Allowed statuses: {allowed_statuses_text}."
+    decision = _decision_from_event_type(allowed_event_type)
+    if decision is None:
+        current_status = run["status"]
+        if current_status not in allowed_statuses:
+            allowed_statuses_text = ", ".join(sorted(allowed_statuses))
+            message = (
+                f"Cannot {action_label} run from current status "
+                f"{current_status!r}. Allowed statuses: {allowed_statuses_text}."
+            )
+            ledger.add_event(
+                run_id,
+                rejected_event_type,
+                message,
+                {
+                    "current_status": current_status,
+                    "note": note,
+                },
+            )
+            print(f"error: {message}", file=sys.stderr)
+            raise SystemExit(1)
+
+        previous_status = current_status
+        ledger.update_run_status(
+            run_id,
+            next_status,
+            final_summary=run["final_summary"],
+            error=run["error"],
         )
         ledger.add_event(
             run_id,
-            rejected_event_type,
-            message,
+            allowed_event_type,
+            allowed_message,
             {
-                "current_status": current_status,
+                "previous_status": previous_status,
+                "next_status": next_status.value,
                 "note": note,
             },
         )
-        print(f"error: {message}", file=sys.stderr)
-        raise SystemExit(1)
+        _print_human_decision(previous_status, next_status.value, note)
+        return
 
-    previous_status = current_status
-    ledger.update_run_status(
+    result = resolve_human_decision(
         run_id,
-        next_status,
-        final_summary=run["final_summary"],
-        error=run["error"],
+        decision,
+        note=note,
+        ledger=_PreloadedHumanDecisionLedger(run_id, run, ledger),
     )
-    ledger.add_event(
-        run_id,
-        allowed_event_type,
-        allowed_message,
-        {
-            "previous_status": previous_status,
-            "next_status": next_status.value,
-            "note": note,
-        },
+    if not result.ok:
+        print(f"error: {result.error_message}", file=sys.stderr)
+        raise SystemExit(1)
+    _print_human_decision(
+        result.previous_status or "",
+        result.next_status or "",
+        (result.metadata or {}).get("note", ""),
     )
-    _print_human_decision(previous_status, next_status.value, note)
 
 
 def _codex_exec_validation_result(
@@ -1291,203 +2946,18 @@ def _codex_exec_validation_result(
     }
 
 
-def _delta_name_status(delta: dict | None) -> str:
-    if not isinstance(delta, dict):
-        return ""
-    statuses = {
-        "modified": "M",
-        "added": "A",
-        "deleted": "D",
-        "renamed": "R",
-    }
-    lines = []
-    for detail in delta.get("path_delta_details", []):
-        if not isinstance(detail, dict):
-            continue
-        path = str(detail.get("path") or "").strip()
-        if not path:
-            continue
-        status = statuses.get(str(detail.get("change_type") or ""), "M")
-        lines.append(f"{status}\t{path}")
-    return "\n".join(lines)
-
-
-def _delta_diff_text(delta: dict | None) -> str:
-    if not isinstance(delta, dict):
-        return ""
-    chunks = []
-    for detail in delta.get("path_delta_details", []):
-        if isinstance(detail, dict) and isinstance(detail.get("diff_unified_zero"), str):
-            chunks.append(detail["diff_unified_zero"])
-    return "\n".join(chunk for chunk in chunks if chunk)
-
-
-def _path_is_related_focused_test(path: str) -> bool:
-    lower = path.lower()
-    return lower.startswith("tests/") or "/tests/" in f"/{lower}/" or Path(path).name.lower().startswith("test_")
-
-
-def _contract_allowed_path_mismatches(contract: dict, paths: list[str]) -> list[dict]:
-    allowed_items = contract.get("allowed_paths")
-    if not isinstance(allowed_items, list) or not allowed_items:
-        return []
-    allowed = {str(item.get("path") or "") for item in allowed_items if isinstance(item, dict)}
-    allowed_names = {Path(path).name for path in allowed if path}
-    groups = contract.get("allowed_path_groups")
-    if not isinstance(groups, list):
-        groups = []
-    allows_related_tests = any(
-        isinstance(item, dict) and item.get("kind") == "related_focused_tests"
-        for item in groups
-    )
-    mismatches = []
-    for path in paths:
-        if path in allowed or Path(path).name in allowed_names:
-            continue
-        if allows_related_tests and _path_is_related_focused_test(path):
-            continue
-        mismatches.append({"type": "path_outside_explicit_contract", "path": path})
-    return mismatches
-
-
-def _path_matches_excluded_area(path: str, category: str | None, area: str) -> bool:
-    lower = path.lower()
-    category = category or ""
-    if area == "database":
-        return category == "database_migration" or lower.endswith(".sql") or "migration" in lower or "database" in lower
-    if area == "configuration":
-        return category in {"config", "dependency_manifest", "build_or_ci"} or lower.endswith((".toml", ".yaml", ".yml", ".json", ".ini", ".cfg"))
-    if area == "auth":
-        return category == "auth_security" or "auth" in lower or "session" in lower
-    if area == "infrastructure":
-        return category == "infrastructure" or "deploy" in lower or "docker" in lower or ".github/" in lower
-    if area == "backend":
-        return any(marker in lower for marker in ("server/", "api/", "backend/", "workers/", "functions/", "database/", "supabase/"))
-    if area == "networking":
-        return any(marker in lower for marker in ("network", "http", "api/", "client", "request"))
-    return False
-
-
-def _contract_exclusion_mismatches(contract: dict, paths: list[str], classification: dict | None) -> list[dict]:
-    excluded = contract.get("excluded_areas")
-    if not isinstance(excluded, list) or not excluded:
-        return []
-    files = classification.get("files") if isinstance(classification, dict) else []
-    categories = {
-        str(file.get("path") or ""): str(file.get("category") or "")
-        for file in files
-        if isinstance(file, dict)
-    }
-    mismatches = []
-    for item in excluded:
-        if not isinstance(item, dict):
-            continue
-        area = str(item.get("area") or "")
-        for path in paths:
-            if _path_matches_excluded_area(path, categories.get(path), area):
-                mismatches.append({"type": "excluded_area_changed", "area": area, "path": path})
-    return mismatches
-
-
-def _explicit_guardrails(contract: dict) -> list[str]:
-    guardrails = []
-    read_only = contract.get("read_only") if isinstance(contract.get("read_only"), dict) else {}
-    if read_only.get("explicit"):
-        guardrails.append("read_only")
-    for item in contract.get("allowed_paths", []):
-        if isinstance(item, dict) and item.get("path"):
-            guardrails.append(f"{item.get('mode') or 'allowed'}:{item['path']}")
-    for item in contract.get("excluded_areas", []):
-        if isinstance(item, dict) and item.get("area"):
-            guardrails.append(f"exclude:{item['area']}")
-    return guardrails
-
-
-def _build_governance_observation(
-    contract: dict,
-    delta: dict | None,
-    classification: dict | None,
-    sandbox: str,
-    before_snapshot: dict | None,
-) -> dict:
-    paths = attributable_paths(delta)
-    read_only = contract.get("read_only") if isinstance(contract.get("read_only"), dict) else {}
-    contract_mismatches = []
-    if read_only.get("explicit") and paths:
-        contract_mismatches.append({"type": "explicit_read_only_changed_files", "paths": paths})
-    contract_mismatches.extend(_contract_allowed_path_mismatches(contract, paths))
-    contract_mismatches.extend(_contract_exclusion_mismatches(contract, paths, classification))
-
-    diff_text = _delta_diff_text(delta)
-    content_flags = diff_content_flags(diff_text)
-    objective_failures = []
-    path_safety = contract.get("path_safety") if isinstance(contract.get("path_safety"), dict) else {}
-    if path_safety.get("valid") is False:
-        objective_failures.append("invalid_contract_path")
-    if sandbox == "read-only" and paths:
-        objective_failures.append("read_only_sandbox_attributable_write")
-    if "high_confidence_secret_literal" in content_flags:
-        objective_failures.append("high_confidence_secret_literal")
-
-    scope_observation = "matched"
-    if contract_mismatches:
-        scope_observation = "partially_matched"
-    if not paths and _explicit_guardrails(contract):
-        scope_observation = "not_evaluable" if delta and delta.get("validation_error") else "matched"
-
-    observation_flags = []
-    if before_snapshot and _working_tree_dirty(before_snapshot):
-        observation_flags.append("repo_dirty_before_codex")
-    observation_flags.extend(flag for flag in content_flags if flag != "high_confidence_secret_literal")
-
-    return {
-        "governance_version": "explicit_contract_delta_v1",
-        "prompt_contract_confidence": contract.get("confidence", "low"),
-        "scope_observation": scope_observation,
-        "attributable_changed_files": paths,
-        "preexisting_changed_files": (delta or {}).get("preexisting_changed_files", []),
-        "preexisting_untracked_files": (delta or {}).get("preexisting_untracked_files", []),
-        "explicit_guardrails": _explicit_guardrails(contract),
-        "observation_flags": observation_flags,
-        "contract_mismatches": contract_mismatches,
-        "objective_failures": objective_failures,
-        "requires_future_review": bool(contract_mismatches),
-    }
-
-
-def _governance_transition_if_blocking(observation: dict, current_transition: dict) -> dict:
-    objective_failures = observation.get("objective_failures")
-    if not objective_failures:
-        return current_transition
-    return {
-        **current_transition,
-        "next_status": RunStatus.NEEDS_REVIEW.value,
-        "reason": "objective_governance_failure",
-        "decision": "objective_failure",
-        "approval_required": False,
-        "needs_review": True,
-        "should_auto_complete": False,
-        "objective_failures": objective_failures,
-    }
-
-
 def _run_codex_exec_flow(
     run_id: str,
     run: dict,
     prompt: str,
     repo_path_text: str,
     sandbox: str,
-    timeout: int,
+    timeout: float | None,
     confirm_full_access: bool,
 ) -> dict:
     prompt_contract = parse_prompt_contract(prompt, sandbox).to_dict()
     git_snapshot = capture_git_snapshot(repo_path_text)
     invocation_state_before = capture_invocation_git_state(repo_path_text)
-    after_git_snapshot = None
-    invocation_state_after = None
-    invocation_delta = None
-    governance_observation = None
-    changed_file_classification = None
     ledger.add_event(
         run_id,
         "git_snapshot_before_codex",
@@ -1509,187 +2979,78 @@ def _run_codex_exec_flow(
         invocation_state_before,
     )
 
-    ledger.add_event(
-        run_id,
-        "codex_exec_started",
-        "Running Codex exec.",
-        {
-            "prompt": prompt,
-            "repo_path": repo_path_text,
-            "timeout": timeout,
-            "sandbox": sandbox,
-            "prompt_contract": prompt_contract,
-        },
-    )
-
     validation_error = None
-    if sandbox not in ALLOWED_CODEX_SANDBOXES:
-        validation_error = (
-            "Invalid Codex sandbox. Allowed values: "
-            f"{', '.join(ALLOWED_CODEX_SANDBOXES)}."
-        )
-    elif not prompt_contract["path_safety"]["valid"]:
+    if not prompt_contract["path_safety"]["valid"]:
         invalid_paths = ", ".join(prompt_contract["path_safety"]["invalid_paths"])
         validation_error = f"Prompt contract contains invalid path references: {invalid_paths}"
     elif sandbox == "danger-full-access" and not confirm_full_access:
         validation_error = "Codex sandbox danger-full-access requires --confirm-full-access."
 
-    if validation_error is None:
-        result = run_codex_exec(
-            prompt,
-            repo_path=repo_path_text,
-            timeout_seconds=timeout,
-            sandbox=sandbox,
-        )
-    else:
-        result = _codex_exec_validation_result(
-            prompt,
-            repo_path=repo_path_text,
-            sandbox=sandbox,
-            validation_error=validation_error,
-        )
-
-    validation_message = (
-        f" validation_error={result['validation_error']}"
-        if result["validation_error"]
-        else ""
-    )
-    ledger.add_event(
+    codex_execution = execute_codex_direct_service(
         run_id,
-        "codex_exec_finished",
-        (
-            f"found={result['found']} exit_code={result['exit_code']} "
-            f"timed_out={result['timed_out']} repo_path={result['repo_path']} "
-            f"sandbox={result['sandbox']}{validation_message}"
-        ),
-        result,
+        prompt,
+        repo_path_text,
+        sandbox,
+        timeout,
+        prompt_contract,
+        confirm_full_access=confirm_full_access,
+        preflight_validation_error=validation_error,
+        ledger=ledger,
     )
+    result = codex_execution.raw_process_result or {}
     if result["validation_error"]:
         print(f"error: {result['validation_error']}", file=sys.stderr)
     _print_codex_exec_result(result)
 
-    if not result["validation_error"]:
-        after_git_snapshot = capture_git_snapshot(repo_path_text)
-        invocation_state_after = capture_invocation_git_state(repo_path_text)
-        invocation_delta = compute_invocation_delta(invocation_state_before, invocation_state_after)
-        ledger.add_event(
-            run_id,
-            "git_snapshot_after_codex",
-            _snapshot_message(after_git_snapshot),
-            after_git_snapshot,
-        )
-        _print_git_snapshot_summary(after_git_snapshot, "after")
-        ledger.add_event(
-            run_id,
-            "invocation_git_state_after",
-            "Captured post-Codex invocation git state.",
-            invocation_state_after,
-        )
-        ledger.add_event(
-            run_id,
-            "invocation_delta_attributed",
-            (
-                "Attributed invocation delta "
-                f"files={len(attributable_paths(invocation_delta))}."
+    governance_result = apply_post_codex_governance_service(
+        run_id,
+        run,
+        prompt,
+        repo_path_text,
+        sandbox,
+        prompt_contract,
+        result,
+        git_snapshot,
+        invocation_state_before,
+        expected_scope={},
+        ledger=ledger,
+        git_snapshot_function=capture_git_snapshot,
+        invocation_state_function=capture_invocation_git_state,
+        delta_function=compute_invocation_delta,
+        file_classifier_function=classify_changed_files,
+        diagnostics_evaluator=analyze_prompt_repo_impact,
+        supervision_decision_evaluator=evaluate_supervision_decision,
+        status_policy_function=status_from_supervision_decision,
+        callbacks=PostCodexGovernanceCallbacks(
+            diagnostics_warning=lambda exc: print(
+                f"warning: prompt/repo impact diagnostics unavailable: {exc}",
+                file=sys.stderr,
             ),
-            invocation_delta,
-        )
-
-        changed_file_classification = classify_changed_files(
-            attributable_paths(invocation_delta)
-        )
-        ledger.add_event(
-            run_id,
-            "changed_file_classification",
-            _classification_message(changed_file_classification),
-            changed_file_classification,
-        )
-        _print_changed_file_classification(changed_file_classification)
-
-    try:
-        prompt_repo_impact_diagnostics = analyze_prompt_repo_impact(
-            prompt,
-            result,
-            git_snapshot,
-            after_git_snapshot,
-            changed_file_classification,
-        )
-    except Exception as exc:
-        prompt_repo_impact_diagnostics = None
-        print(f"warning: prompt/repo impact diagnostics unavailable: {exc}", file=sys.stderr)
-    ledger.add_event(
-        run_id,
-        "prompt_repo_impact_diagnostics",
-        _diagnostics_message(prompt_repo_impact_diagnostics),
-        prompt_repo_impact_diagnostics,
+            git_after_captured=lambda snapshot: _print_git_snapshot_summary(snapshot, "after"),
+            changed_file_classification_recorded=_print_changed_file_classification,
+            diagnostics_recorded=_print_prompt_repo_impact_diagnostics,
+            supervision_decision_recorded=_print_supervision_decision,
+            governance_observation_recorded=_print_governance_observation,
+            workspace_write_human_required=_print_workspace_write_human_required,
+            status_transition_recorded=_print_run_status_transition,
+        ),
     )
-    _print_prompt_repo_impact_diagnostics(prompt_repo_impact_diagnostics)
-
-    supervision_decision = evaluate_supervision_decision(prompt_repo_impact_diagnostics)
-    ledger.add_event(
-        run_id,
-        "supervision_decision",
-        _supervision_decision_message(supervision_decision),
-        supervision_decision,
-    )
-    _print_supervision_decision(supervision_decision)
-
-    transition = status_from_supervision_decision(supervision_decision, result)
-    if not result["validation_error"]:
-        governance_observation = _build_governance_observation(
-            prompt_contract,
-            invocation_delta,
-            changed_file_classification,
-            sandbox,
-            git_snapshot,
-        )
-        ledger.add_event(
-            run_id,
-            "run_governance_observation",
-            (
-                "Recorded explicit-contract and attributable-delta governance "
-                f"observation scope={governance_observation['scope_observation']}."
-            ),
-            governance_observation,
-        )
-        _print_governance_observation(governance_observation)
-        transition = _governance_transition_if_blocking(governance_observation, transition)
-        if sandbox == "workspace-write":
-            _verify_auto_workspace_write_result(
-                run_id,
-                repo_path_text,
-                sha256_text(prompt),
-                {},
-                changed_file_classification,
-                invocation_delta,
-            )
-    transition = {
-        **transition,
-        "previous_status": run["status"],
-        "next_status": transition["next_status"],
-    }
-    ledger.update_run_status(run_id, RunStatus(transition["next_status"]))
-    ledger.add_event(
-        run_id,
-        "run_status_transition",
-        _run_status_transition_message(transition),
-        transition,
-    )
-    _print_run_status_transition(transition)
+    transition = governance_result.metadata["transition"]
 
     return {
         "result": result,
         "git_snapshot": git_snapshot,
-        "after_git_snapshot": after_git_snapshot,
+        "after_git_snapshot": governance_result.git_after,
         "invocation_state_before": invocation_state_before,
-        "invocation_state_after": invocation_state_after,
-        "invocation_delta": invocation_delta,
+        "invocation_state_after": governance_result.invocation_state_after,
+        "invocation_delta": governance_result.invocation_delta,
         "prompt_contract": prompt_contract,
-        "governance_observation": governance_observation,
-        "changed_file_classification": changed_file_classification,
-        "prompt_repo_impact_diagnostics": prompt_repo_impact_diagnostics,
-        "supervision_decision": supervision_decision,
+        "governance_observation": governance_result.governance_observation,
+        "changed_file_classification": governance_result.changed_file_classification,
+        "prompt_repo_impact_diagnostics": governance_result.diagnostics,
+        "supervision_decision": governance_result.supervision_decision,
         "transition": transition,
+        "post_codex_governance": governance_result,
     }
 
 
@@ -1822,600 +3183,88 @@ def _submit_feedback_to_chatgpt_flow(
     output_path_text: str | None = None,
     approval_mode: str = "human",
 ) -> bool:
-    events = ledger.list_events(run_id)
-    feedback = build_gpt_feedback_message(run, events)
-    output_path = None
-
-    if output_path_text:
-        output_path = _write_feedback_output(output_path_text, feedback["message"])
-
-    marker_metadata = _marker_metadata(feedback)
-    generation_metadata = {
-        "run_id": feedback["run_id"],
-        "status": feedback["status"],
-        "codex_exit_code": feedback["codex_exit_code"],
-        "codex_timed_out": feedback["codex_timed_out"],
-        "changed_files": feedback["changed_files"],
-        "message_length": len(feedback["message"]),
-        "feedback_payload_version": feedback["feedback_payload_version"],
-        "feedback_payload_sha256": feedback["feedback_payload_sha256"],
-        "feedback_payload_length": feedback["feedback_payload_length"],
-        **marker_metadata,
-        "approval_mode": approval_mode,
-        "target": "ChatGPT",
-        "app_name": app_name,
-        "targeted_chatgpt": True,
-    }
-    if output_path is not None:
-        generation_metadata["output_path"] = str(output_path)
-    ledger.add_event(
+    result = submit_feedback_to_chatgpt_service(
         run_id,
-        "gpt_feedback_generated",
-        "Generated GPT feedback message for ChatGPT-targeted submit.",
-        generation_metadata,
+        run,
+        app_name=app_name,
+        output_path_text=output_path_text,
+        approval_mode=approval_mode,
+        ledger=ledger,
+        feedback_builder=build_gpt_feedback_message,
+        clipboard_copy_function=copy_to_clipboard,
+        activation_function=activate_chatgpt,
+        submission_ui_inspection_function=inspect_chatgpt_submission_ui,
+        paste_function=paste_clipboard_to_frontmost_app,
+        ax_send_button_function=press_chatgpt_send_button,
+        enter_function=press_enter_in_frontmost_app,
+        artifact_writer=_write_feedback_output,
+        monotonic_function=time.monotonic,
+        sleep_function=time.sleep,
+        paste_verify_timeout_seconds=CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS,
+        paste_verify_poll_seconds=CHATGPT_PASTE_VERIFY_POLL_SECONDS,
+        post_paste_settle_seconds=CHATGPT_POST_PASTE_SETTLE_SECONDS,
+        submission_verify_timeout_seconds=CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
+        submission_verify_poll_seconds=CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
+        submission_verification_function=_verify_submission_marker,
     )
-
-    copy_result = copy_to_clipboard(feedback["message"])
-    ledger.add_event(
-        run_id,
-        "gpt_feedback_copied",
-        (
-            "Copied GPT feedback message to clipboard for ChatGPT-targeted submit."
-            if copy_result["copied"]
-            else f"Failed to copy GPT feedback message to clipboard: {copy_result['error']}"
-        ),
-        {
-            "run_id": feedback["run_id"],
-            "copied": copy_result["copied"],
-            "method": copy_result["method"],
-            "error": copy_result["error"],
-            "message_length": len(feedback["message"]),
-            "feedback_payload_version": feedback["feedback_payload_version"],
-            "feedback_payload_sha256": feedback["feedback_payload_sha256"],
-            "feedback_payload_length": feedback["feedback_payload_length"],
-            **marker_metadata,
-            "approval_mode": approval_mode,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-        },
-    )
-
-    if not copy_result["copied"]:
-        activation_result = {
-            "activated": False,
-            "app_name": app_name,
-            "frontmost_app": None,
-            "is_frontmost": False,
-            "activation_result": None,
-            "frontmost_result": None,
-            "error": "Skipped activation because copying GPT feedback to clipboard failed.",
-        }
-        paste_result = {
-            "pasted": False,
-            "method": PASTE_METHOD,
-            "error": "Skipped paste because copying GPT feedback to clipboard failed.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        submit_result = {
-            "submit_input_sent": False,
-            "method": ENTER_METHOD,
-            "error": "Skipped submit because copying GPT feedback to clipboard failed.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        common_metadata = {
-            "run_id": feedback["run_id"],
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "submit_input_result": submit_result,
-            "message_length": len(feedback["message"]),
-            "feedback_payload_version": feedback["feedback_payload_version"],
-            "feedback_payload_sha256": feedback["feedback_payload_sha256"],
-            "feedback_payload_length": feedback["feedback_payload_length"],
-            **marker_metadata,
-            "approval_mode": approval_mode,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": "clipboard_copy_failed",
-        }
-        ledger.add_event(run_id, "gpt_feedback_pasted", "Skipped ChatGPT-targeted paste because copying GPT feedback failed.", common_metadata)
-        ledger.add_event(run_id, "gpt_feedback_submission_failed", "ChatGPT feedback submission failed before submit input.", common_metadata)
-        _print_chatgpt_feedback_submit_result(run_id, copy_result, activation_result, paste_result, submit_result, output_path, copy_result["error"])
-        return False
-
-    activation_result = activate_chatgpt(app_name)
-    if not activation_result["is_frontmost"]:
-        paste_result = {
-            "pasted": False,
-            "method": PASTE_METHOD,
-            "error": "Skipped paste because ChatGPT was not frontmost.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        submit_result = {
-            "submit_input_sent": False,
-            "method": ENTER_METHOD,
-            "error": "Skipped submit because ChatGPT was not frontmost.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        common_metadata = {
-            "run_id": feedback["run_id"],
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "submit_input_result": submit_result,
-            "message_length": len(feedback["message"]),
-            "feedback_payload_version": feedback["feedback_payload_version"],
-            "feedback_payload_sha256": feedback["feedback_payload_sha256"],
-            "feedback_payload_length": feedback["feedback_payload_length"],
-            **marker_metadata,
-            "approval_mode": approval_mode,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": "chatgpt_not_frontmost",
-        }
-        ledger.add_event(run_id, "gpt_feedback_pasted", "Skipped ChatGPT-targeted paste because ChatGPT was not frontmost.", common_metadata)
-        ledger.add_event(run_id, "gpt_feedback_submission_failed", "ChatGPT feedback submission failed before submit input.", common_metadata)
-        _print_chatgpt_feedback_submit_result(run_id, copy_result, activation_result, paste_result, submit_result, output_path, activation_result["error"])
-        return False
-
-    initial_observation = inspect_chatgpt_submission_ui(app_name, marker_text=feedback["submission_marker_text"])
-    focused_composer = _focused_composer_from_observation(initial_observation)
-    if not initial_observation.get("ok") or focused_composer is None:
-        reason_code = (
-            "chatgpt_composer_not_focused"
-            if (initial_observation.get("text_input_candidates") or [])
-            else "chatgpt_composer_not_found"
-        )
-        paste_result = {
-            "pasted": False,
-            "method": PASTE_METHOD,
-            "error": "Skipped paste because focused ChatGPT composer could not be verified.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        submit_result = {
-            "submit_input_sent": False,
-            "method": ENTER_METHOD,
-            "error": "Skipped submit because focused ChatGPT composer could not be verified.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        failure_metadata = {
-            "run_id": feedback["run_id"],
-            "approval_mode": approval_mode,
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "submit_input_result": submit_result,
-            "composer_observation": _submission_ui_observation_summary(initial_observation, feedback["submission_marker_text"]),
-            "message_length": len(feedback["message"]),
-            **marker_metadata,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": reason_code,
-        }
-        ledger.add_event(run_id, "gpt_feedback_submission_failed", f"ChatGPT feedback submission failed: {reason_code}.", failure_metadata)
-        _print_chatgpt_feedback_submit_result(run_id, copy_result, activation_result, paste_result, submit_result, output_path, reason_code)
-        return False
-
-    paste_result = paste_clipboard_to_frontmost_app()
-    ledger.add_event(
-        run_id,
-        "gpt_feedback_pasted",
-        (
-            "Pasted GPT feedback into ChatGPT for submit."
-            if paste_result["pasted"]
-            else "Failed to paste GPT feedback into ChatGPT for submit."
-        ),
-        {
-            "run_id": feedback["run_id"],
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "message_length": len(feedback["message"]),
-            "feedback_payload_version": feedback["feedback_payload_version"],
-            "feedback_payload_sha256": feedback["feedback_payload_sha256"],
-            "feedback_payload_length": feedback["feedback_payload_length"],
-            **marker_metadata,
-            "approval_mode": approval_mode,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-        },
-    )
-
-    if not paste_result["pasted"]:
-        submit_result = {
-            "submit_input_sent": False,
-            "method": ENTER_METHOD,
-            "error": "Skipped submit because paste failed.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        failure_metadata = {
-            "run_id": feedback["run_id"],
-            "approval_mode": approval_mode,
-            "human_confirmed": approval_mode == "human",
-            "auto_executed": approval_mode == "auto",
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "submit_input_result": submit_result,
-            "message_length": len(feedback["message"]),
-            "feedback_payload_version": feedback["feedback_payload_version"],
-            "feedback_payload_sha256": feedback["feedback_payload_sha256"],
-            "feedback_payload_length": feedback["feedback_payload_length"],
-            **marker_metadata,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": "chatgpt_paste_input_failed",
-        }
-        ledger.add_event(run_id, "gpt_feedback_submission_failed", "ChatGPT feedback submission failed before submit input.", failure_metadata)
-        _print_chatgpt_feedback_submit_result(run_id, copy_result, activation_result, paste_result, submit_result, output_path, paste_result["error"])
-        return False
-
-    paste_verification = _wait_for_pasted_marker(app_name, feedback["submission_marker_text"])
-    if not paste_verification["ok"]:
-        submit_result = {
-            "submit_input_sent": False,
-            "method": ENTER_METHOD,
-            "error": "Skipped submit because pasted marker was not visible in the composer.",
-            "stdout": "",
-            "stderr": "",
-            "exit_code": None,
-        }
-        failure_metadata = {
-            "run_id": feedback["run_id"],
-            "approval_mode": approval_mode,
-            "human_confirmed": approval_mode == "human",
-            "auto_executed": approval_mode == "auto",
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "paste_verification": paste_verification,
-            "submit_input_result": submit_result,
-            "message_length": len(feedback["message"]),
-            **marker_metadata,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": "chatgpt_paste_not_visible",
-        }
-        ledger.add_event(run_id, "gpt_feedback_submission_failed", "ChatGPT feedback submission failed: pasted marker was not visible.", failure_metadata)
-        _print_chatgpt_feedback_submit_result(run_id, copy_result, activation_result, paste_result, submit_result, output_path, "chatgpt_paste_not_visible")
-        return False
-
-    time.sleep(CHATGPT_POST_PASTE_SETTLE_SECONDS)
-    send_result, send_observation = _select_send_input_method(app_name, feedback["submission_marker_text"])
-    submit_input_sent = _submit_input_sent_ok(send_result)
-    submit_result = {
-        **send_result,
-        "submit_input_sent": submit_input_sent,
-    }
-    ledger.add_event(
-        run_id,
-        "gpt_feedback_submit_input_sent",
-        (
-            "Submit input sent; awaiting ChatGPT submission verification."
-            if submit_input_sent
-            else "Submit input was not confirmed."
-        ),
-        {
-            "run_id": feedback["run_id"],
-            "approval_mode": approval_mode,
-            "human_confirmed": approval_mode == "human",
-            "auto_executed": approval_mode == "auto",
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "paste_verification": paste_verification,
-            "submit_input_result": submit_result,
-            "send_observation": send_observation,
-            "message_length": len(feedback["message"]),
-            **marker_metadata,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": "submit_input_sent" if submit_input_sent else "chatgpt_submit_input_not_confirmed",
-        },
-    )
-
-    if not submit_input_sent:
-        failure_metadata = {
-            "run_id": feedback["run_id"],
-            "approval_mode": approval_mode,
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "paste_verification": paste_verification,
-            "submit_input_result": submit_result,
-            "message_length": len(feedback["message"]),
-            **marker_metadata,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "reason_code": "chatgpt_submit_input_not_confirmed",
-        }
-        ledger.add_event(run_id, "gpt_feedback_submission_failed", "ChatGPT submit input was not confirmed.", failure_metadata)
-        _print_chatgpt_feedback_submit_result(run_id, copy_result, activation_result, paste_result, submit_result, output_path, "chatgpt_submit_input_not_confirmed")
-        return False
-
-    verification = _verify_submission_marker(app_name, feedback["submission_marker_text"])
-    fallback_attempt_count = 0
-    if (
-        not verification["ok"]
-        and verification.get("reason_code") == "chatgpt_submission_not_verified"
-        and verification.get("status", {}).get("composer_contains_marker") is True
-        and verification.get("status", {}).get("submitted_candidate_count") == 0
-        and _send_result_method(send_result) == "macos_accessibility_axpress_send_button"
-    ):
-        fallback_attempt_count = 1
-        fallback_result = press_enter_in_frontmost_app()
-        fallback_submit_result = {**fallback_result, "submit_input_sent": _submit_input_sent_ok(fallback_result)}
-        ledger.add_event(
-            run_id,
-            "gpt_feedback_submit_input_sent",
-            "Fallback submit input sent; awaiting ChatGPT submission verification.",
-            {
-                "run_id": feedback["run_id"],
-                "approval_mode": approval_mode,
-                "activation_result": activation_result,
-                "paste_result": paste_result,
-                "paste_verification": paste_verification,
-                "submit_input_result": fallback_submit_result,
-                "previous_verification": verification,
-                "fallback_attempt_count": fallback_attempt_count,
-                "message_length": len(feedback["message"]),
-                **marker_metadata,
-                "target": "ChatGPT",
-                "app_name": app_name,
-                "targeted_chatgpt": True,
-                "reason_code": "submit_input_sent" if fallback_submit_result["submit_input_sent"] else "chatgpt_submit_input_not_confirmed",
-            },
-        )
-        submit_result = fallback_submit_result
-        if fallback_submit_result["submit_input_sent"]:
-            verification = _verify_submission_marker(app_name, feedback["submission_marker_text"])
-
-    terminal_error = paste_result["error"] or submit_result.get("error")
-    if verification["ok"]:
-        ledger.add_event(
-            run_id,
-            "gpt_feedback_submission_verified",
-            "Feedback submission verified; waiting for ChatGPT response.",
-            {
-                "run_id": feedback["run_id"],
-                "approval_mode": approval_mode,
-                "human_confirmed": approval_mode == "human",
-                "auto_executed": approval_mode == "auto",
-                "activation_result": activation_result,
-                "paste_result": paste_result,
-                "paste_verification": paste_verification,
-                "submit_input_result": submit_result,
-                "submission_verification": verification,
-                "fallback_attempt_count": fallback_attempt_count,
-                "message_length": len(feedback["message"]),
-                **marker_metadata,
-                "target": "ChatGPT",
-                "app_name": app_name,
-                "targeted_chatgpt": True,
-                "output_path": str(output_path) if output_path is not None else None,
-                "reason_code": "chatgpt_submission_verified",
-            },
-        )
-        _print_chatgpt_feedback_submit_result(run_id, copy_result, activation_result, paste_result, submit_result, output_path, terminal_error, verification)
-        return True
-
-    event_type = (
-        "gpt_feedback_submission_ambiguous"
-        if verification.get("reason_code") == "chatgpt_submission_ambiguous"
-        else "gpt_feedback_submission_failed"
-    )
-    ledger.add_event(
-        run_id,
-        event_type,
-        f"ChatGPT feedback submission was not verified: {verification.get('reason_code')}.",
-        {
-            "run_id": feedback["run_id"],
-            "approval_mode": approval_mode,
-            "human_confirmed": approval_mode == "human",
-            "auto_executed": approval_mode == "auto",
-            "activation_result": activation_result,
-            "paste_result": paste_result,
-            "paste_verification": paste_verification,
-            "submit_input_result": submit_result,
-            "submission_verification": verification,
-            "fallback_attempt_count": fallback_attempt_count,
-            "message_length": len(feedback["message"]),
-            **marker_metadata,
-            "target": "ChatGPT",
-            "app_name": app_name,
-            "targeted_chatgpt": True,
-            "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": verification.get("reason_code") or "chatgpt_submission_not_verified",
-        },
-    )
-
     _print_chatgpt_feedback_submit_result(
         run_id,
-        copy_result,
-        activation_result,
-        paste_result,
-        submit_result,
-        output_path,
-        terminal_error or verification.get("reason_code"),
-        verification,
+        result.copy_result or {},
+        result.activation_result or {},
+        result.paste_result or {},
+        result.send_result or {},
+        result.output_path,
+        result.error_message,
+        result.verification_result,
     )
-    return False
+    return result.ok
 
 
 def _capture_gpt_response_from_chatgpt_ax_flow(
     run_id: str,
     run: dict,
     app_name: str,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
     stable_seconds: float,
     require_sentinel_response: bool = False,
 ) -> bool:
-    events = ledger.list_events(run_id)
-    submitted_event = _latest_verified_gpt_feedback_submission(events)
-    if submitted_event is None:
-        print("Stopped: no verified ChatGPT submission was found for this run.")
-        return False
-
-    submitted_metadata = _event_metadata(submitted_event)
-    submission_marker_text = submitted_metadata.get("submission_marker_text")
-    submission_marker_sha256 = submitted_metadata.get("submission_marker_sha256")
-    if not isinstance(submission_marker_text, str) or not submission_marker_text.strip():
-        print("Stopped: verified submission event did not include a submission marker.")
-        return False
-    if not isinstance(submission_marker_sha256, str) or sha256_text(submission_marker_text) != submission_marker_sha256:
-        print("Stopped: verified submission marker hash did not match marker text.")
-        return False
-
-    activation_result = activate_chatgpt(app_name)
-    if not activation_result["is_frontmost"]:
-        capture_result = {
-            "matched_feedback": False,
-            "candidate_count": 0,
-            "response_length": 0,
-            "response_sha256": "",
-            "stable": False,
-            "sentinel_required": require_sentinel_response,
-            "error": activation_result["error"] or "ChatGPT was not frontmost.",
-        }
-        _print_chatgpt_ax_capture_result(run_id, activation_result, capture_result, None)
-        return False
-
-    ledger.add_event(
+    del timeout_seconds
+    result = capture_chatgpt_response_service(
         run_id,
-        "gpt_response_capture_started",
-        "Assistant response capture started after verified ChatGPT submission.",
-        {
-            "run_id": run_id,
-            "app_name": app_name,
-            "matched_submission_event_id": submitted_event.get("id"),
-            "source_event_type": "gpt_feedback_submission_verified",
-            "submission_marker_text": submission_marker_text,
-            "submission_marker_sha256": submission_marker_sha256,
-            "submission_marker_nonce": submitted_metadata.get("submission_marker_nonce"),
-            "submission_marker_payload_sha256": submitted_metadata.get("submission_marker_payload_sha256"),
-            "feedback_payload_sha256": submitted_metadata.get("feedback_payload_sha256"),
-            "feedback_payload_version": submitted_metadata.get("feedback_payload_version"),
-            "feedback_payload_length": submitted_metadata.get("feedback_payload_length"),
-            "timeout_seconds": timeout_seconds,
-            "stable_seconds": stable_seconds,
-            "sentinel_required": require_sentinel_response,
-            "activation_result": activation_result,
-        },
-    )
-
-    capture_result = capture_response_after_feedback(
-        "",
         app_name=app_name,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=None,
         stable_seconds=stable_seconds,
         require_sentinel_response=require_sentinel_response,
-        submission_marker_text=submission_marker_text,
+        ledger=ledger,
+        activation_function=activate_chatgpt,
+        capture_function=capture_response_after_feedback,
+        hash_function=sha256_text,
     )
-    if not capture_result["ok"]:
-        event_type = "gpt_response_capture_failed"
-        ledger.add_event(
-            run_id,
-            event_type,
-            "Failed to capture GPT response from ChatGPT desktop accessibility tree.",
-            {
-                "run_id": run_id,
-                "source": capture_result.get("source"),
-                "app_name": app_name,
-                "reason_code": capture_result.get("reason_code"),
-                "error": capture_result.get("error"),
-                "matched_submission_event_id": submitted_event.get("id"),
-                "matched_submission_event_type": "gpt_feedback_submission_verified",
-                "submission_marker_text": submission_marker_text,
-                "submission_marker_sha256": submission_marker_sha256,
-                "submission_marker_nonce": submitted_metadata.get("submission_marker_nonce"),
-                "submission_marker_payload_sha256": submitted_metadata.get("submission_marker_payload_sha256"),
-                "feedback_payload_sha256": submitted_metadata.get("feedback_payload_sha256"),
-                "feedback_payload_version": submitted_metadata.get("feedback_payload_version"),
-                "feedback_payload_length": submitted_metadata.get("feedback_payload_length"),
-                "matched_candidate_index": capture_result.get("matched_candidate_index"),
-                "matched_candidate_path": capture_result.get("matched_candidate_path"),
-                "response_candidate_index": capture_result.get("response_candidate_index"),
-                "response_candidate_path": capture_result.get("response_candidate_path"),
-                "candidate_count": capture_result.get("candidate_count", 0),
-                "sentinel_state": capture_result.get("sentinel_state"),
-                "sentinel_required": require_sentinel_response,
-                "post_feedback_candidate_summaries": capture_result.get("post_feedback_candidate_summaries", []),
-                "stability": {
-                    "stable": capture_result.get("stable", False),
-                    "stable_seconds": capture_result.get("stable_seconds"),
-                    "successful_polls": capture_result.get("successful_polls"),
-                    "poll_interval_seconds": capture_result.get("poll_interval_seconds"),
-                    "timeout_seconds": capture_result.get("timeout_seconds"),
-                },
-                "ax_stats": capture_result.get("ax_stats", {}),
-            },
-        )
-        _print_chatgpt_ax_capture_result(run_id, activation_result, capture_result, event_type)
-        return False
 
-    event_type = "gpt_response_captured"
-    ledger.add_event(
+    if result.reason_code == "no_verified_submission":
+        print("Stopped: no verified ChatGPT submission was found for this run.")
+        return False
+    if result.reason_code == "missing_submission_marker":
+        print("Stopped: verified submission event did not include a submission marker.")
+        return False
+    if result.reason_code == "submission_marker_sha_mismatch":
+        print("Stopped: verified submission marker hash did not match marker text.")
+        return False
+    if result.reason_code == "chatgpt_not_frontmost":
+        _print_chatgpt_ax_capture_result(
+            run_id,
+            result.activation_result or {},
+            result.raw_capture_result or {},
+            None,
+        )
+        return False
+    _print_chatgpt_ax_capture_result(
         run_id,
-        event_type,
-        "Captured GPT response from ChatGPT desktop accessibility tree.",
-        {
-            "run_id": run_id,
-            "source": capture_result["source"],
-            "app_name": app_name,
-            "response_text": capture_result["response_text"],
-            "response_length": capture_result["response_length"],
-            "response_sha256": capture_result["response_sha256"],
-            "matched_submission_event_id": submitted_event.get("id"),
-            "matched_submission_event_type": "gpt_feedback_submission_verified",
-            "submission_marker_text": submission_marker_text,
-            "submission_marker_sha256": submission_marker_sha256,
-            "submission_marker_nonce": submitted_metadata.get("submission_marker_nonce"),
-            "submission_marker_payload_sha256": submitted_metadata.get("submission_marker_payload_sha256"),
-            "matched_candidate_index": capture_result["matched_candidate_index"],
-            "matched_candidate_path": capture_result["matched_candidate_path"],
-            "response_candidate_index": capture_result["response_candidate_index"],
-            "response_candidate_path": capture_result["response_candidate_path"],
-            "candidate_count": capture_result["candidate_count"],
-            "stability": {
-                "stable": capture_result["stable"],
-                "stable_seconds": capture_result["stable_seconds"],
-                "successful_polls": capture_result["successful_polls"],
-                "poll_interval_seconds": capture_result["poll_interval_seconds"],
-                "timeout_seconds": capture_result["timeout_seconds"],
-            },
-            "match_score": capture_result["match_score"],
-            "capture_format": capture_result["capture_format"],
-            "format_warning": capture_result["format_warning"],
-            "ax_stats": capture_result["ax_stats"],
-            "sentinel_state": capture_result.get("sentinel_state"),
-            "reason_code": capture_result.get("reason_code"),
-        },
+        result.activation_result or {},
+        result.raw_capture_result or {},
+        result.event_type,
     )
-    _print_chatgpt_ax_capture_result(run_id, activation_result, capture_result, event_type)
-    return True
+    return result.ok
 
 
 def _extract_next_codex_prompt_flow(
@@ -2424,64 +3273,27 @@ def _extract_next_codex_prompt_flow(
     confirm_extract: bool = True,
     output_path_text: str | None = None,
 ) -> bool:
-    events = ledger.list_events(run_id)
-    selection = find_latest_valid_captured_response(events)
-    if not selection.ok:
-        _print_next_codex_prompt_extraction_result(run_id, selection, None)
-        return False
+    result = extract_next_codex_prompt_service(
+        run_id,
+        require_sentinel=require_sentinel,
+        confirm_extract=confirm_extract,
+        output_path_text=output_path_text,
+        ledger=ledger,
+    )
+    if result.reason_code == "artifact_write_failed":
+        raise OSError(result.error_message or "failed to write extracted Codex prompt output")
 
-    extraction = extract_next_codex_prompt_from_text(selection.response_text)
-    if not extraction.ok:
-        _print_next_codex_prompt_extraction_result(run_id, selection, extraction)
-        return False
-    if require_sentinel and extraction.extraction_method != "sentinel_block":
-        _print_next_codex_prompt_extraction_result(run_id, selection, extraction)
-        print("Stopped: ChatGPT did not provide a sentinel-wrapped next Codex prompt.")
-        _print_supervise_sentinel_requirement()
-        return False
-
-    output_path = None
-    ledger_event = None
-    if confirm_extract:
-        output_path = (
-            Path(output_path_text).expanduser()
-            if output_path_text
-            else Path("data") / "runs" / run_id / "next_codex_prompt.md"
-        )
-        output_path = _write_text_output(output_path, extraction.prompt_text)
-
-        ledger_event = "next_codex_prompt_extracted"
-        warnings = [*selection.warnings, *extraction.warnings]
-        ledger.add_event(
-            run_id,
-            ledger_event,
-            "Extracted next Codex prompt from captured GPT response.",
-            {
-                "source_event_id": selection.source_event["id"] if selection.source_event else None,
-                "source_event_type": "gpt_response_captured",
-                "source_response_sha256": selection.response_sha256,
-                "matched_submission_event_id": (
-                    selection.submitted_event["id"] if selection.submitted_event else None
-                ),
-                "extraction_method": extraction.extraction_method,
-                "prompt_text": extraction.prompt_text,
-                "prompt_path": str(output_path),
-                "prompt_length": extraction.prompt_length,
-                "prompt_sha256": extraction.prompt_sha256,
-                "prompt_count_detected": extraction.prompt_count_detected,
-                "selected_prompt_index": extraction.selected_prompt_index,
-                "safety_status": extraction.safety_status,
-                "warnings": warnings,
-            },
-        )
     _print_next_codex_prompt_extraction_result(
         run_id,
-        selection,
-        extraction,
-        output_path=output_path,
-        ledger_event=ledger_event,
+        result.selection,
+        result.extraction,
+        output_path=result.output_path,
+        ledger_event=result.event_type,
     )
-    return True
+    if result.reason_code == "sentinel_required":
+        print("Stopped: ChatGPT did not provide a sentinel-wrapped next Codex prompt.")
+        _print_supervise_sentinel_requirement()
+    return result.ok
 
 
 def _run_extracted_codex_prompt_flow(
@@ -2489,7 +3301,7 @@ def _run_extracted_codex_prompt_flow(
     run: dict,
     repo_path_text: str,
     sandbox: str,
-    timeout: int,
+    timeout: float | None,
     expected_extraction_event_id: int | None = None,
     expected_prompt_sha256: str | None = None,
     expected_prompt_text: str | None = None,
@@ -2500,223 +3312,62 @@ def _run_extracted_codex_prompt_flow(
     pre_run_policy: dict | None = None,
     expected_scope: dict | None = None,
 ) -> int:
-    current_run = ledger.get_run(run_id)
-    if current_run is None:
-        print(f"Run not found: {run_id}", file=sys.stderr)
-        return 1
-    run = current_run
-
-    continuation = can_continue_run(run["status"])
-    if not continuation["can_continue"]:
-        print(
-            "Run cannot continue: "
-            f"status={continuation['status']} "
-            f"reason={continuation['reason']} "
-            f"required_action={continuation['required_action'] or ''}",
-            file=sys.stderr,
-        )
-        return 2
-
-    repo_path = Path(repo_path_text).expanduser().resolve(strict=False)
-    repo_path_text = str(repo_path)
-    if not repo_path.exists():
-        print(f"Repo path does not exist: {repo_path_text}", file=sys.stderr)
-        return 2
-    if not repo_path.is_dir():
-        print(f"Repo path is not a directory: {repo_path_text}", file=sys.stderr)
-        return 2
-    if sandbox not in ALLOWED_CODEX_SANDBOXES:
-        print(
-            "Invalid Codex sandbox. Allowed values: "
-            f"{', '.join(ALLOWED_CODEX_SANDBOXES)}.",
-            file=sys.stderr,
-        )
-        return 2
-    if sandbox == "danger-full-access" and not allow_full_access:
-        print("The supervise command does not support danger-full-access in v0.1.", file=sys.stderr)
-        return 2
-    if sandbox == "danger-full-access" and not confirm_full_access:
-        print("Codex sandbox danger-full-access requires --confirm-full-access.", file=sys.stderr)
-        return 2
-
-    events = ledger.list_events(run_id)
-    if expected_extraction_event_id is None:
-        selection = select_latest_valid_extracted_codex_prompt(
-            events,
-            expect_prompt_sha256=expected_prompt_sha256,
-        )
-    else:
-        latest_extraction_event_id = -1
-        for event in events:
-            if event.get("event_type") != "next_codex_prompt_extracted":
-                continue
-            try:
-                latest_extraction_event_id = max(latest_extraction_event_id, int(event.get("id") or -1))
-            except (TypeError, ValueError):
-                continue
-        if latest_extraction_event_id > expected_extraction_event_id:
-            print("Stopped: the next prompt changed after it was shown for approval.")
-            print("No Codex run was started.")
-            print("Run supervise again to review the current prompt.")
-            return 1
-
-        extraction_event = None
-        for event in events:
-            try:
-                event_id = int(event.get("id") or -1)
-            except (TypeError, ValueError):
-                event_id = -1
-            if event_id == expected_extraction_event_id:
-                extraction_event = event
-                break
-        if extraction_event is None:
-            print("Stopped: the next prompt changed after it was shown for approval.")
-            print("No Codex run was started.")
-            print("Run supervise again to review the current prompt.")
-            return 1
-        selection = select_valid_extracted_codex_prompt_event(
-            events,
-            extraction_event,
-            expect_prompt_sha256=expected_prompt_sha256,
-        )
-    if not selection.ok:
-        event_id = selection.event.get("id") if selection.event else ""
-        print(f"extraction_event_id: {event_id}", file=sys.stderr)
-        for warning in selection.warnings:
-            print(f"warning: {warning}", file=sys.stderr)
-        print(f"Invalid extracted Codex prompt: {selection.error}", file=sys.stderr)
-        return 1
-
-    selected_event_id = selection.event.get("id") if selection.event else None
-    if expected_extraction_event_id is not None:
-        try:
-            selected_event_id_int = int(selected_event_id)
-        except (TypeError, ValueError):
-            selected_event_id_int = -1
-        if selected_event_id_int != expected_extraction_event_id:
-            print("Stopped: the next prompt changed after it was shown for approval.")
-            print("No Codex run was started.")
-            print("Run supervise again to review the current prompt.")
-            return 1
-    if expected_prompt_sha256 is not None and selection.prompt_sha256 != expected_prompt_sha256:
-        print("Stopped: the next prompt changed after it was shown for approval.")
-        print("No Codex run was started.")
-        print("Run supervise again to review the current prompt.")
-        return 1
-    if expected_prompt_text is not None:
-        if selection.prompt_text != expected_prompt_text or sha256_text(selection.prompt_text) != selection.prompt_sha256:
-            print("Stopped: the next prompt changed after it was shown for approval.")
-            print("No Codex run was started.")
-            print("Run supervise again to review the current prompt.")
-            return 1
-    if sha256_text(selection.prompt_text) != selection.prompt_sha256:
-        print("Stopped: the selected prompt failed SHA validation.")
-        print("No Codex run was started.")
-        return 1
-    if expected_extraction_method is not None:
-        selected_method = selection.metadata.get("extraction_method")
-        if selected_method != expected_extraction_method:
-            print("Stopped: the next prompt changed after it was shown for approval.")
-            print("No Codex run was started.")
-            print("Run supervise again to review the current prompt.")
-            return 1
-
-    _print_extracted_codex_prompt_preview(run_id, selection, repo_path_text, sandbox)
-
-    extraction_event_id = selection.event.get("id") if selection.event else None
-    prompt_contract = parse_prompt_contract(selection.prompt_text, sandbox).to_dict()
-    selection_metadata = {
-        "extraction_event_id": extraction_event_id,
-        "prompt_sha256": selection.prompt_sha256,
-        "prompt_length": selection.prompt_length,
-        "repo_path": repo_path_text,
-        "sandbox": sandbox,
-        "prompt_contract": prompt_contract,
-        "source_event_id": selection.source_event_id,
-        "matched_submission_event_id": selection.matched_submission_event_id,
-        "workspace_write_policy_version": WORKSPACE_WRITE_POLICY_VERSION,
-        "pre_run_policy": pre_run_policy or {},
-        "expected_scope": expected_scope or {},
-        "auto_run_allowed": approval_mode == "auto",
-        "reason_code": (pre_run_policy or {}).get("reason_code"),
-    }
-    ledger.add_event(
-        run_id,
-        "extracted_codex_prompt_selected",
-        (
-            "Selected extracted Codex prompt for automatic execution."
-            if approval_mode == "auto"
-            else "Selected extracted Codex prompt for human-confirmed execution."
-        ),
-        {
-            **selection_metadata,
-            "approval_mode": approval_mode,
-            "human_confirmed": approval_mode == "human",
-            "auto_executed": approval_mode == "auto",
-        },
-    )
-    ledger.add_event(
-        run_id,
-        "extracted_codex_prompt_run_started",
-        (
-            "Running extracted Codex prompt automatically after routine-safe classification."
-            if approval_mode == "auto"
-            else "Running extracted Codex prompt after explicit human confirmation."
-        ),
-        {
-            **selection_metadata,
-            "timeout": timeout,
-            "approval_mode": approval_mode,
-            "human_confirmed": approval_mode == "human",
-            "auto_executed": approval_mode == "auto",
-        },
-    )
-
-    flow = _run_codex_exec_flow(
+    service_result = execute_extracted_codex_prompt_service(
         run_id,
         run,
-        selection.prompt_text,
         repo_path_text,
         sandbox,
         timeout,
         confirm_full_access=confirm_full_access,
+        allow_full_access=allow_full_access,
+        approval_mode=approval_mode,
+        expected_extraction_event_id=expected_extraction_event_id,
+        expected_prompt_sha256=expected_prompt_sha256,
+        expected_prompt_text=expected_prompt_text,
+        expected_extraction_method=expected_extraction_method,
+        workspace_write_pre_run_policy=pre_run_policy,
+        expected_scope=expected_scope,
+        ledger=ledger,
+        codex_flow_coordinator=_run_codex_exec_flow,
+        hash_function=sha256_text,
+        prompt_preview_callback=_print_extracted_codex_prompt_preview,
     )
 
-    result = flow["result"]
-    supervision_decision = flow["supervision_decision"] or {}
-    transition = flow["transition"] or {}
-    ledger.add_event(
-        run_id,
-        "extracted_codex_prompt_run_finished",
-        "Finished extracted Codex prompt execution.",
-        {
-            **selection_metadata,
-            "exit_code": result["exit_code"],
-            "timed_out": result["timed_out"],
-            "status": transition.get("next_status"),
-            "supervision_decision": supervision_decision.get("decision"),
-            "validation_error": result["validation_error"],
-            "approval_mode": approval_mode,
-            "human_confirmed": approval_mode == "human",
-            "auto_executed": approval_mode == "auto",
-        },
-    )
+    if service_result.codex_flow_result is not None and service_result.selection is not None:
+        _print_extracted_codex_prompt_run_result(
+            run_id,
+            service_result.selection,
+            service_result.metadata.get("selection_metadata", {}).get("repo_path", repo_path_text),
+            sandbox,
+            service_result.codex_flow_result,
+        )
 
-    _print_extracted_codex_prompt_run_result(run_id, selection, repo_path_text, sandbox, flow)
+    if service_result.reason_code == "run_not_found":
+        print(service_result.error_message, file=sys.stderr)
+    elif service_result.reason_code == "continuation_denied":
+        print(service_result.error_message, file=sys.stderr)
+    elif service_result.reason_code in {
+        "repo_missing",
+        "repo_not_directory",
+        "invalid_sandbox",
+        "danger_full_access_blocked",
+        "full_access_confirmation_required",
+    }:
+        print(service_result.error_message, file=sys.stderr)
+    elif service_result.reason_code == "invalid_extracted_prompt":
+        print(f"extraction_event_id: {service_result.selected_event_id or ''}", file=sys.stderr)
+        for warning in service_result.metadata.get("selection_warnings", ()):
+            print(f"warning: {warning}", file=sys.stderr)
+        print(f"Invalid extracted Codex prompt: {service_result.error_message}", file=sys.stderr)
+    elif service_result.reason_code == "extracted_prompt_changed_after_approval":
+        print("Stopped: the next prompt changed after it was shown for approval.")
+        print("No Codex run was started.")
+        print("Run supervise again to review the current prompt.")
+    elif service_result.reason_code == "selected_prompt_sha_validation_failed":
+        print("Stopped: the selected prompt failed SHA validation.")
+        print("No Codex run was started.")
 
-    if result["validation_error"]:
-        return 2
-    if not result["found"]:
-        return 1
-    if result["timed_out"]:
-        return 124
-    if result["exit_code"] != 0:
-        return result["exit_code"] or 1
-    governance_observation = flow.get("governance_observation") or {}
-    if governance_observation.get("objective_failures"):
-        return 1
-
-    return 0
+    return service_result.exit_code or 0
 
 
 def _latest_event_id(events: list[dict], event_type: str) -> int:
@@ -2746,115 +3397,6 @@ def _latest_matching_workspace_write_post_run_policy(events: list[dict], codex_e
         if _event_id_from_value(metadata.get("codex_exec_finished_event_id")) == codex_event_id:
             return metadata
     return None
-
-
-def _verify_auto_workspace_write_result(
-    run_id: str,
-    repo_path_text: str,
-    prompt_sha256: str,
-    expected_scope: dict,
-    changed_file_classification: dict | None,
-    invocation_delta: dict | None = None,
-) -> dict:
-    attributable = attributable_paths(invocation_delta)
-    diff_metadata = {
-        "repo_path": repo_path_text,
-        "name_status": _delta_name_status(invocation_delta),
-        "changed_paths": attributable,
-        "diff_unified_zero": _delta_diff_text(invocation_delta),
-        "commands": {},
-        "validation_error": (invocation_delta or {}).get("validation_error"),
-        "captured_at": datetime.now(UTC).isoformat(),
-        "source": "invocation_delta",
-    }
-    ledger.add_event(
-        run_id,
-        "workspace_write_diff_metadata_captured",
-        (
-            "Captured workspace-write attributable diff metadata."
-            if not diff_metadata.get("validation_error")
-            else f"Failed to capture workspace-write diff metadata: {diff_metadata.get('validation_error')}"
-        ),
-        {
-            "run_id": run_id,
-            "prompt_sha256": prompt_sha256,
-            "workspace_write_policy_version": WORKSPACE_WRITE_POLICY_VERSION,
-            **diff_metadata,
-        },
-    )
-
-    events = ledger.list_events(run_id)
-    codex_event_id = _latest_event_id(events, "codex_exec_finished")
-    if diff_metadata.get("validation_error"):
-        post_run_policy = {
-            "tier": "post_run_human_required",
-            "allowed": False,
-            "reason_code": "post_run_diff_metadata_unavailable",
-            "policy_version": WORKSPACE_WRITE_POLICY_VERSION,
-            "expected_scope": expected_scope,
-            "changed_files": [],
-            "unexpected_files": [],
-            "prohibited_files": [],
-            "name_status_summary": [],
-            "diff_content_flags": [],
-        }
-    else:
-        verification = verify_workspace_write_post_run(
-            expected_scope,
-            diff_metadata.get("changed_paths") or [],
-            diff_metadata.get("name_status") or "",
-            diff_metadata.get("diff_unified_zero") or "",
-            changed_file_classification,
-        )
-        post_run_policy = verification.to_dict()
-
-    post_run_metadata = {
-        "run_id": run_id,
-        "prompt_sha256": prompt_sha256,
-        "codex_exec_finished_event_id": codex_event_id,
-        "workspace_write_policy_version": WORKSPACE_WRITE_POLICY_VERSION,
-        "post_run_policy": post_run_policy,
-        "auto_submit_allowed": bool(post_run_policy.get("allowed")),
-        "loop_continuation_allowed": bool(post_run_policy.get("allowed")),
-    }
-    ledger.add_event(
-        run_id,
-        "workspace_write_post_run_policy",
-        (
-            "Workspace-write post-run diff stayed within auto-approved scope."
-            if post_run_policy.get("allowed")
-            else "Workspace-write post-run diff requires human review."
-        ),
-        post_run_metadata,
-    )
-
-    if not post_run_policy.get("allowed"):
-        human_metadata = {
-            "run_id": run_id,
-            "prompt_sha256": prompt_sha256,
-            "codex_exec_finished_event_id": codex_event_id,
-            "workspace_write_policy_version": WORKSPACE_WRITE_POLICY_VERSION,
-            "reason_code": post_run_policy.get("reason_code"),
-            "changed_files": post_run_policy.get("changed_files", []),
-            "unexpected_files": post_run_policy.get("unexpected_files", []),
-            "prohibited_files": post_run_policy.get("prohibited_files", []),
-            "name_status_summary": post_run_policy.get("name_status_summary", []),
-            "diff_content_flags": post_run_policy.get("diff_content_flags", []),
-            "expected_scope": expected_scope,
-            "post_run_policy": post_run_policy,
-        }
-        ledger.add_event(
-            run_id,
-            "human_required_after_write",
-            "Codex completed, but an objective workspace-write post-run failure was detected.",
-            human_metadata,
-        )
-        print("Stopped: Codex completed, but an objective workspace-write post-run failure was detected.")
-        print(f"Reason: {post_run_policy.get('reason_code')}")
-        print("No ChatGPT submission or further Codex execution was performed.")
-        sys.stdout.flush()
-
-    return post_run_policy
 
 
 def _supervise_approval_mode(args: argparse.Namespace) -> str:
@@ -2901,61 +3443,230 @@ def _send_plan_auto_safe(plan: object, events: list[dict]) -> tuple[bool, str]:
 
 
 def _run_supervise_command(args: argparse.Namespace) -> int:
-    if args.capture_timeout_seconds <= 0:
-        print("error: --capture-timeout-seconds must be greater than 0.", file=sys.stderr)
-        return 2
     if args.stable_seconds < 0:
         print("error: --stable-seconds must be greater than or equal to 0.", file=sys.stderr)
         return 2
 
     approval_mode = _supervise_approval_mode(args)
 
-    while True:
-        run = ledger.get_run(args.run_id)
-        events = ledger.list_events(args.run_id) if run is not None else []
-        plan = detect_next_supervise_action(run, events, args.repo, sandbox=args.sandbox)
+    def submit_service(
+        run_id: str,
+        run: dict,
+        app_name: str,
+        *,
+        approval_mode: str,
+        ledger: object,
+    ) -> bool:
+        del ledger
+        return _submit_feedback_to_chatgpt_flow(
+            run_id,
+            run,
+            app_name,
+            approval_mode=approval_mode,
+        )
 
-        if plan.action == SuperviseAction.STOP:
-            if approval_mode == "auto":
-                _record_supervise_auto_stop(args.run_id, plan)
+    def capture_service(
+        run_id: str,
+        run: dict,
+        app_name: str,
+        timeout_seconds: float | None,
+        stable_seconds: float,
+        *,
+        require_sentinel_response: bool,
+        ledger: object,
+    ) -> bool:
+        del ledger
+        return _capture_gpt_response_from_chatgpt_ax_flow(
+            run_id,
+            run,
+            app_name,
+            timeout_seconds,
+            stable_seconds,
+            require_sentinel_response=require_sentinel_response,
+        )
+
+    def extraction_service(
+        run_id: str,
+        *,
+        require_sentinel: bool,
+        confirm_extract: bool,
+        ledger: object,
+    ) -> bool:
+        del ledger
+        return _extract_next_codex_prompt_flow(
+            run_id,
+            require_sentinel=require_sentinel,
+            confirm_extract=confirm_extract,
+        )
+
+    def run_prompt_service(
+        run_id: str,
+        run: dict,
+        repo_path_text: str,
+        sandbox: str,
+        timeout: float | None,
+        *,
+        expected_extraction_event_id: int | None,
+        expected_prompt_sha256: str | None,
+        expected_prompt_text: str | None,
+        expected_extraction_method: str | None,
+        approval_mode: str,
+        pre_run_policy: dict | None,
+        expected_scope: dict | None,
+        ledger: object,
+    ) -> int:
+        del ledger
+        return _run_extracted_codex_prompt_flow(
+            run_id,
+            run,
+            repo_path_text,
+            sandbox,
+            timeout,
+            expected_extraction_event_id=expected_extraction_event_id,
+            expected_prompt_sha256=expected_prompt_sha256,
+            expected_prompt_text=expected_prompt_text,
+            expected_extraction_method=expected_extraction_method,
+            approval_mode=approval_mode,
+            pre_run_policy=pre_run_policy,
+            expected_scope=expected_scope,
+        )
+
+    def auto_stop_recorder(
+        run_id: str,
+        plan: object,
+        reason: str | None = None,
+        *,
+        ledger: object,
+    ) -> dict:
+        del ledger
+        _record_supervise_auto_stop(run_id, plan, reason)
+        return {
+            "event_type": "supervise_auto_stopped",
+            "event_id": None,
+            "message": "Automatic supervise stopped at a mandatory human gate.",
+            "metadata": {
+                "run_id": run_id,
+                "approval_mode": "auto",
+                "automatic_stop_reason": reason or getattr(plan, "reason", ""),
+                "plan_reason": getattr(plan, "reason", ""),
+                "stop_message": getattr(plan, "stop_message", ""),
+                "action": str(getattr(plan, "action", "")),
+                "event_ids": getattr(plan, "event_ids", {}),
+                "prompt_sha256": getattr(plan, "prompt_sha", ""),
+                "prompt_auto_run_safe": bool(getattr(plan, "prompt_auto_run_safe", False)),
+                "prompt_auto_run_reason": getattr(plan, "prompt_auto_run_reason", ""),
+            },
+        }
+
+    def before_action(plan: object, run: dict | None, events: list[dict]) -> None:
+        del run, events
+        if plan.action == SuperviseAction.ASK_SEND_TO_GPT:
+            _print_supervise_send_gate(args.run_id, plan)
+        elif plan.action == SuperviseAction.CAPTURE_GPT_RESPONSE:
+            print("Waiting for ChatGPT to finish responding, then capturing the visible reply.")
+            print("The correct ChatGPT chat must already be open and visible.")
+        elif plan.action == SuperviseAction.EXTRACT_NEXT_PROMPT:
+            print("Extracting the next Codex prompt from the captured ChatGPT response.")
+        elif plan.action == SuperviseAction.ASK_RUN_PROMPT:
+            repo_snapshot = capture_git_snapshot(args.repo)
+            _print_supervise_run_gate(plan, repo_snapshot)
+
+    def run_step(
+        *,
+        approval_decision: str | None = None,
+        expected_plan: object | None = None,
+        emit_pre_action: bool = True,
+    ):
+        expected_event_ids = None
+        expected_prompt_sha256 = None
+        expected_planner_action = None
+        if expected_plan is not None:
+            expected_planner_action = str(getattr(expected_plan, "action", ""))
+            expected_event_ids = getattr(expected_plan, "event_ids", {})
+            expected_prompt_sha256 = getattr(expected_plan, "prompt_sha", "") or None
+        return run_supervision_step(
+            args.run_id,
+            args.repo,
+            args.sandbox,
+            approval_mode=approval_mode,
+            approval_decision=approval_decision,
+            expected_planner_action=expected_planner_action,
+            expected_event_ids=expected_event_ids,
+            expected_prompt_sha256=expected_prompt_sha256,
+            app_name=args.app_name,
+            timeout=None,
+            capture_timeout_seconds=None,
+            capture_stable_seconds=args.stable_seconds,
+            ledger=ledger,
+            planner=detect_next_supervise_action,
+            submit_service=submit_service,
+            capture_service=capture_service,
+            extraction_service=extraction_service,
+            extracted_prompt_execution_service=run_prompt_service,
+            send_auto_safety_evaluator=_send_plan_auto_safe,
+            auto_stop_recorder=auto_stop_recorder,
+            before_action_callback=before_action if emit_pre_action else None,
+        )
+
+    while True:
+        step = run_step()
+        plan = step.metadata.get("plan")
+
+        if step.requires_human_approval:
+            if step.approval_kind == "send_to_gpt":
+                if not _confirm_yes_no("Send Codex result to ChatGPT?"):
+                    run_step(approval_decision="rejected", emit_pre_action=False)
+                    print("Stopped. Feedback was not submitted to ChatGPT.")
+                    return 0
+                step = run_step(
+                    approval_decision="approved",
+                    expected_plan=plan,
+                    emit_pre_action=False,
+                )
+            elif step.approval_kind == "run_prompt":
+                if not _confirm_yes_no("Run this prompt in Codex?"):
+                    run_step(approval_decision="rejected", emit_pre_action=False)
+                    print("Stopped. Codex was not run.")
+                    return 0
+                step = run_step(
+                    approval_decision="approved",
+                    expected_plan=plan,
+                    emit_pre_action=False,
+                )
+            else:
+                _print_supervise_stop(
+                    type(
+                        "UnknownApproval",
+                        (),
+                        {
+                            "reason": step.reason_code or "approval_required",
+                            "stop_message": step.error_message or "Unknown approval requirement.",
+                            "status": step.run_status or "",
+                            "warnings": (),
+                        },
+                    )()
+                )
+                return 1
+            plan = step.metadata.get("plan")
+
+        if step.terminal and step.planner_action == str(SuperviseAction.STOP):
             _print_supervise_stop(plan)
-            if plan.reason in {"non_sentinel_prompt", "invalid_extracted_prompt"}:
+            if getattr(plan, "reason", "") in {"non_sentinel_prompt", "invalid_extracted_prompt"}:
                 _print_supervise_sentinel_requirement()
             return 1
 
-        if plan.action == SuperviseAction.ASK_SEND_TO_GPT:
-            _print_supervise_send_gate(args.run_id, plan)
-            if approval_mode == "auto":
-                auto_send_safe, auto_send_reason = _send_plan_auto_safe(plan, events)
-                if not auto_send_safe:
-                    _record_supervise_auto_stop(args.run_id, plan, auto_send_reason)
-                    print("Stopped: Codex result requires human approval before ChatGPT submission.")
-                    print(f"Reason: {auto_send_reason}")
-                    return 1
-            if approval_mode == "human" and not _confirm_yes_no("Send Codex result to ChatGPT?"):
-                print("Stopped. Feedback was not submitted to ChatGPT.")
-                return 0
-            if not _submit_feedback_to_chatgpt_flow(
-                args.run_id,
-                run,
-                args.app_name,
-                approval_mode=approval_mode,
-            ):
+        if step.planner_action == str(SuperviseAction.ASK_SEND_TO_GPT):
+            if not step.action_executed:
+                print("Stopped: Codex result requires human approval before ChatGPT submission.")
+                print(f"Reason: {step.reason_code or ''}")
+                return 1
+            if not step.ok:
                 print("Stopped: failed to submit feedback to ChatGPT.")
                 return 1
             continue
 
-        if plan.action == SuperviseAction.CAPTURE_GPT_RESPONSE:
-            print("Waiting for ChatGPT to finish responding, then capturing the visible reply.")
-            print("The correct ChatGPT chat must already be open and visible.")
-            if not _capture_gpt_response_from_chatgpt_ax_flow(
-                args.run_id,
-                run,
-                args.app_name,
-                args.capture_timeout_seconds,
-                args.stable_seconds,
-                require_sentinel_response=True,
-            ):
+        if step.planner_action == str(SuperviseAction.CAPTURE_GPT_RESPONSE):
+            if not step.ok:
                 print("Stopped: could not safely capture ChatGPT's response.")
                 print(
                     "Recovery: verify the intended ChatGPT chat is open and visible, then run "
@@ -2964,9 +3675,8 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
                 return 1
             continue
 
-        if plan.action == SuperviseAction.EXTRACT_NEXT_PROMPT:
-            print("Extracting the next Codex prompt from the captured ChatGPT response.")
-            if not _extract_next_codex_prompt_flow(args.run_id, require_sentinel=True):
+        if step.planner_action == str(SuperviseAction.EXTRACT_NEXT_PROMPT):
+            if not step.ok:
                 print("Stopped: no valid sentinel-wrapped next Codex prompt was extracted.")
                 print(
                     "Recovery: ask ChatGPT for a sentinel-wrapped prompt or run "
@@ -2975,41 +3685,18 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
                 return 1
             continue
 
-        if plan.action == SuperviseAction.ASK_RUN_PROMPT:
-            approved_codex_event_id = _event_id_from_value(plan.event_ids.get("codex_exec_finished"))
-            if approved_codex_event_id < 0:
-                approved_codex_event_id = _latest_event_id(events, "codex_exec_finished")
-            repo_snapshot = capture_git_snapshot(args.repo)
-            _print_supervise_run_gate(plan, repo_snapshot)
-            if approval_mode == "auto" and not bool(getattr(plan, "prompt_auto_run_safe", False)):
-                _record_supervise_auto_stop(
-                    args.run_id,
-                    plan,
-                    getattr(plan, "prompt_auto_run_reason", "") or "prompt_not_routine_safe",
-                )
+        if step.planner_action == str(SuperviseAction.ASK_RUN_PROMPT):
+            if not step.action_executed:
                 print("Stopped: extracted prompt requires human approval before Codex execution.")
-                print(f"Reason: {getattr(plan, 'prompt_auto_run_reason', '') or 'prompt_not_routine_safe'}")
+                print(f"Reason: {step.reason_code or ''}")
                 return 1
-            if approval_mode == "human" and not _confirm_yes_no("Run this prompt in Codex?"):
-                print("Stopped. Codex was not run.")
-                return 0
-            exit_code = _run_extracted_codex_prompt_flow(
-                args.run_id,
-                run,
-                args.repo,
-                args.sandbox,
-                args.timeout,
-                expected_extraction_event_id=plan.event_ids.get("next_codex_prompt_extracted"),
-                expected_prompt_sha256=plan.prompt_sha,
-                expected_prompt_text=plan.prompt_text,
-                expected_extraction_method=plan.extraction_method,
-                approval_mode=approval_mode,
-                pre_run_policy=getattr(plan, "pre_run_policy", {}),
-                expected_scope=getattr(plan, "expected_scope", {}),
-            )
+            exit_code = step.action_result if isinstance(step.action_result, int) else 0
             if exit_code != 0:
                 return exit_code
             refreshed_events = ledger.list_events(args.run_id)
+            approved_codex_event_id = step.metadata.get("approved_codex_event_id")
+            if not isinstance(approved_codex_event_id, int):
+                approved_codex_event_id = -1
             latest_codex_event_id = _latest_event_id(refreshed_events, "codex_exec_finished")
             if latest_codex_event_id <= approved_codex_event_id:
                 print(
@@ -3027,7 +3714,7 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
                 (),
                 {
                     "reason": "unknown_action",
-                    "stop_message": f"Unknown supervise action: {plan.action}",
+                    "stop_message": step.error_message or f"Unknown supervise action: {step.planner_action}",
                     "status": "",
                     "warnings": (),
                 },
@@ -3042,8 +3729,8 @@ def _supervise_args_for_codex_run(args: argparse.Namespace, repo_path_text: str)
         repo=repo_path_text,
         sandbox=args.sandbox,
         app_name="ChatGPT",
-        timeout=args.timeout,
-        capture_timeout_seconds=DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+        timeout=None,
+        capture_timeout_seconds=None,
         stable_seconds=DEFAULT_STABLE_SECONDS,
         interactive=bool(getattr(args, "interactive", False)),
     )
@@ -3101,9 +3788,11 @@ def main() -> None:
         return
 
     if args.command == "start":
-        run_id = ledger.create_run(args.instruction)
-        ledger.add_event(run_id, "run_created", "Run created.")
-        print(run_id)
+        result = create_run_service(args.instruction, ledger=ledger)
+        if not result.ok:
+            print(f"error: {result.error_message}", file=sys.stderr)
+            raise SystemExit(1)
+        print(result.run_id)
         return
 
     if args.command == "show":
@@ -3384,8 +4073,6 @@ def main() -> None:
                 "No ChatGPT activation, AX inspection, ledger write, clipboard access, paste, "
                 "Enter, submit, or send action was performed.\n",
             )
-        if args.timeout_seconds <= 0:
-            parser.exit(2, "error: --timeout-seconds must be greater than 0.\n")
         if args.stable_seconds < 0:
             parser.exit(2, "error: --stable-seconds must be greater than or equal to 0.\n")
 
@@ -3397,7 +4084,7 @@ def main() -> None:
             args.run_id,
             run,
             args.app_name,
-            args.timeout_seconds,
+            None,
             args.stable_seconds,
         )
         raise SystemExit(0 if ok else 1)
@@ -3659,6 +4346,218 @@ def main() -> None:
         is_frontmost = bool(result["activation_result"]["is_frontmost"])
         raise SystemExit(0 if result["activated"] and is_frontmost else 1)
 
+    if args.command == "inspect-chatgpt-navigation-ui":
+        if args.max_depth < 0:
+            parser.exit(2, "error: inspect-chatgpt-navigation-ui requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: inspect-chatgpt-navigation-ui requires --max-nodes > 0.\n")
+        result = inspect_chatgpt_navigation_ui(
+            app_name=args.app_name,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+            include_visible_navigation_titles=args.include_visible_navigation_titles,
+        )
+        _print_inspect_chatgpt_navigation_ui_result(result, include_json_details=args.include_json_details)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "verify-chatgpt-sidebar-destination":
+        title = " ".join((args.title or "").split())
+        if not title:
+            parser.exit(2, "error: verify-chatgpt-sidebar-destination requires a non-empty --title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: verify-chatgpt-sidebar-destination requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: verify-chatgpt-sidebar-destination requires --max-nodes > 0.\n")
+        result = verify_chatgpt_sidebar_destination(
+            app_name=args.app_name,
+            kind=args.kind,
+            title=title,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+            before_action_callback=_sidebar_destination_action_notice,
+        )
+        _print_verify_chatgpt_sidebar_destination_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "open-chatgpt-sidebar-destination":
+        title = " ".join((args.title or "").split())
+        if not title:
+            parser.exit(2, "error: open-chatgpt-sidebar-destination requires a non-empty --title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: open-chatgpt-sidebar-destination requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: open-chatgpt-sidebar-destination requires --max-nodes > 0.\n")
+        result = open_chatgpt_sidebar_destination(
+            app_name=args.app_name,
+            kind=args.kind,
+            title=title,
+            confirm_open_destination=args.confirm_open_destination,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+            activation_function=activate_chatgpt,
+            before_action_callback=_open_chatgpt_sidebar_destination_notice,
+        )
+        _print_open_chatgpt_sidebar_destination_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "inspect-chatgpt-sidebar-destination":
+        title = " ".join((args.title or "").split())
+        if not title:
+            parser.exit(2, "error: inspect-chatgpt-sidebar-destination requires a non-empty --title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: inspect-chatgpt-sidebar-destination requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: inspect-chatgpt-sidebar-destination requires --max-nodes > 0.\n")
+        result = inspect_chatgpt_sidebar_destination(
+            app_name=args.app_name,
+            kind=args.kind,
+            title=title,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+        )
+        _print_inspect_chatgpt_sidebar_destination_result(result, include_json_details=args.include_json_details)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "inspect-chatgpt-project-visible-chats":
+        project_title = " ".join((args.project_title or "").split())
+        if not project_title:
+            parser.exit(2, "error: inspect-chatgpt-project-visible-chats requires a non-empty --project-title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: inspect-chatgpt-project-visible-chats requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: inspect-chatgpt-project-visible-chats requires --max-nodes > 0.\n")
+        result = inspect_chatgpt_project_visible_chats(
+            app_name=args.app_name,
+            project_title=project_title,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+        )
+        _print_inspect_chatgpt_project_visible_chats_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "inspect-chatgpt-project-chat-row-ax":
+        project_title = " ".join((args.project_title or "").split())
+        chat_titles = [" ".join((title or "").split()) for title in args.chat_title or []]
+        chat_titles = [title for title in chat_titles if title]
+        if not project_title:
+            parser.exit(2, "error: inspect-chatgpt-project-chat-row-ax requires a non-empty --project-title.\n")
+        if not chat_titles:
+            parser.exit(2, "error: inspect-chatgpt-project-chat-row-ax requires at least one non-empty --chat-title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: inspect-chatgpt-project-chat-row-ax requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: inspect-chatgpt-project-chat-row-ax requires --max-nodes > 0.\n")
+        result = inspect_chatgpt_project_chat_row_ax(
+            app_name=args.app_name,
+            project_title=project_title,
+            chat_titles=chat_titles,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+        )
+        _print_inspect_chatgpt_project_chat_row_ax_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "diagnose-chatgpt-project-chat-rows":
+        project_title = " ".join((args.project_title or "").split())
+        contains_title = " ".join((args.contains_title or "").split())
+        if not project_title:
+            parser.exit(2, "error: diagnose-chatgpt-project-chat-rows requires a non-empty --project-title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: diagnose-chatgpt-project-chat-rows requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: diagnose-chatgpt-project-chat-rows requires --max-nodes > 0.\n")
+        result = diagnose_chatgpt_project_chat_rows(
+            app_name=args.app_name,
+            project_title=project_title,
+            contains_title=contains_title,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+        )
+        _print_diagnose_chatgpt_project_chat_rows_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "open-chatgpt-project-chat":
+        project_title = " ".join((args.project_title or "").split())
+        chat_title = " ".join((args.chat_title or "").split())
+        if not project_title:
+            parser.exit(2, "error: open-chatgpt-project-chat requires a non-empty --project-title.\n")
+        if not chat_title:
+            parser.exit(2, "error: open-chatgpt-project-chat requires a non-empty --chat-title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: open-chatgpt-project-chat requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: open-chatgpt-project-chat requires --max-nodes > 0.\n")
+        if args.confirm_open_chat:
+            _open_chatgpt_project_chat_notice()
+        result = open_chatgpt_project_chat(
+            app_name=args.app_name,
+            project_title=project_title,
+            chat_title=chat_title,
+            confirm_open_chat=args.confirm_open_chat,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+            activation_function=activate_chatgpt,
+            discovery_output_function=_print_live_project_chat_discovery_lines,
+        )
+        _print_open_chatgpt_project_chat_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "calibrate-chatgpt-sidebar-coordinate-mapping":
+        title = " ".join((args.title or "").split())
+        if not title:
+            parser.exit(2, "error: calibrate-chatgpt-sidebar-coordinate-mapping requires a non-empty --title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: calibrate-chatgpt-sidebar-coordinate-mapping requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: calibrate-chatgpt-sidebar-coordinate-mapping requires --max-nodes > 0.\n")
+        result = calibrate_chatgpt_sidebar_coordinate_mapping(
+            app_name=args.app_name,
+            kind=args.kind,
+            title=title,
+            confirm_calibration_click=args.confirm_calibration_click,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+            before_click_callback=_coordinate_calibration_click_notice,
+        )
+        _print_calibrate_chatgpt_sidebar_coordinate_mapping_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "verify-chatgpt-sidebar-frame-click":
+        title = " ".join((args.title or "").split())
+        if not title:
+            parser.exit(2, "error: verify-chatgpt-sidebar-frame-click requires a non-empty --title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: verify-chatgpt-sidebar-frame-click requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: verify-chatgpt-sidebar-frame-click requires --max-nodes > 0.\n")
+        result = verify_chatgpt_sidebar_frame_click(
+            app_name=args.app_name,
+            kind=args.kind,
+            title=title,
+            confirm_frame_click=args.confirm_frame_click,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+            before_click_callback=_sidebar_frame_click_notice,
+        )
+        _print_verify_chatgpt_sidebar_frame_click_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "verify-synthetic-click-delivery":
+        result = verify_synthetic_click_delivery(
+            confirm_synthetic_click_probe=args.confirm_synthetic_click_probe,
+            before_click_callback=_synthetic_click_probe_notice,
+        )
+        _print_verify_synthetic_click_delivery_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
+    if args.command == "verify-current-cursor-click":
+        result = verify_current_cursor_click(
+            confirm_current_cursor_click=args.confirm_current_cursor_click,
+            before_click_callback=_current_cursor_click_notice,
+        )
+        _print_verify_current_cursor_click_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
     if args.command == "test-chatgpt-target-paste":
         if not args.confirm_paste:
             parser.exit(
@@ -3743,56 +4642,35 @@ def main() -> None:
         raise SystemExit(0 if result["can_continue"] else 2)
 
     if args.command == "approve":
-        run = ledger.get_run(args.run_id)
-        if run is None:
-            parser.exit(1, f"Run not found: {args.run_id}\n")
-
-        _resolve_flagged_run(
-            args.run_id,
-            run,
-            args.note,
-            {RunStatus.WAITING_FOR_APPROVAL.value, RunStatus.NEEDS_REVIEW.value},
-            RunStatus.APPROVED,
-            "human_approval",
-            "Run approved by user.",
-            "human_approval_rejected_by_state",
-            "approve",
+        _handle_human_decision_result(
+            parser,
+            resolve_human_decision(
+                args.run_id,
+                HumanDecision.APPROVE,
+                note=args.note,
+            ),
         )
         return
 
     if args.command == "reject":
-        run = ledger.get_run(args.run_id)
-        if run is None:
-            parser.exit(1, f"Run not found: {args.run_id}\n")
-
-        _resolve_flagged_run(
-            args.run_id,
-            run,
-            args.note,
-            {RunStatus.WAITING_FOR_APPROVAL.value, RunStatus.NEEDS_REVIEW.value},
-            RunStatus.REJECTED,
-            "human_rejection",
-            "Run rejected by user.",
-            "human_rejection_rejected_by_state",
-            "reject",
+        _handle_human_decision_result(
+            parser,
+            resolve_human_decision(
+                args.run_id,
+                HumanDecision.REJECT,
+                note=args.note,
+            ),
         )
         return
 
     if args.command == "complete-review":
-        run = ledger.get_run(args.run_id)
-        if run is None:
-            parser.exit(1, f"Run not found: {args.run_id}\n")
-
-        _resolve_flagged_run(
-            args.run_id,
-            run,
-            args.note,
-            {RunStatus.NEEDS_REVIEW.value},
-            RunStatus.COMPLETED,
-            "human_review_completed",
-            "Run review completed by user.",
-            "human_review_completion_rejected_by_state",
-            "complete review for",
+        _handle_human_decision_result(
+            parser,
+            resolve_human_decision(
+                args.run_id,
+                HumanDecision.COMPLETE_REVIEW,
+                note=args.note,
+            ),
         )
         return
 
@@ -3852,7 +4730,7 @@ def main() -> None:
                 run,
                 args.repo,
                 args.sandbox,
-                args.timeout,
+                None,
                 expected_prompt_sha256=args.expect_prompt_sha256,
                 allow_full_access=True,
                 confirm_full_access=args.confirm_full_access,
@@ -3878,7 +4756,7 @@ def main() -> None:
             args.prompt,
             repo_path_text,
             sandbox,
-            args.timeout,
+            None,
             args.confirm_full_access,
         )
         result = flow["result"]

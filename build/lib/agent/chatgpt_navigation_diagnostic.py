@@ -212,8 +212,6 @@ PROJECT_CHAT_OPEN_OUTCOMES = {
 }
 MAX_PROJECT_CHAT_SEARCH_CYCLES = 60
 MAX_PROJECT_CHAT_SEARCH_ELAPSED_SECONDS = 90.0
-PROJECT_CHAT_FINAL_RE_RESOLUTION_MAX_RETRIES = 2
-PROJECT_CHAT_FINAL_RE_RESOLUTION_RETRY_DELAY_SECONDS = 1.0
 INITIAL_PROJECT_CHAT_HYDRATION_TIMEOUT_SECONDS = 2.0
 POST_SCROLL_HYDRATION_TIMEOUT_SECONDS = 4.0
 HYDRATION_SAMPLE_INTERVAL_SECONDS = 0.2
@@ -4805,10 +4803,6 @@ def _base_project_chat_open_result(project_title: str, chat_title: str, app_name
         "process_resolution_method": None,
         "project_open_result": {},
         "matched_chat_row": {},
-        # True once the chat-open action was physically posted against the exact
-        # freshly re-resolved target row, independent of the navigator's own
-        # (non-authoritative) post-action confirmation heuristic.
-        "chat_open_action_posted": False,
         "visible_chat_count": 0,
         "visible_chats": [],
         "targeting_visible_chat_count": 0,
@@ -4846,10 +4840,6 @@ def _base_project_chat_open_result(project_title: str, chat_title: str, app_name
         "target_detection_row_frame": _frame_geometry_report(None),
         "target_detection_canonical_title": "",
         "fresh_target_re_resolution_confirmed": False,
-        "final_re_resolution_retry_attempts": 0,
-        "final_re_resolution_max_retries": PROJECT_CHAT_FINAL_RE_RESOLUTION_MAX_RETRIES,
-        "final_re_resolution_re_resolved": False,
-        "final_re_resolution_action_posted": False,
         "scroll_pulses_after_target_detection": 0,
         "target_alignment_required": False,
         "target_alignment_method": "none",
@@ -5170,60 +5160,12 @@ def _open_ready_project_chat_plan(
         if alignment.get("status") == "ready":
             fresh_plan = alignment["plan"]
         elif alignment.get("handled"):
-            if alignment.get("outcome") == "target_detected_but_not_stably_re_resolved":
-                retry = _retry_detected_project_chat_fresh_re_resolution(
-                    result,
-                    reader,
-                    pid,
-                    project_title,
-                    chat_title,
-                    alignment.get("plan") or fresh_plan,
-                    display_probe_factory,
-                    windowserver_probe_factory,
-                    sleep_function,
-                    expected_plan=alignment.get("plan"),
-                )
-                if retry.get("status") == "ready":
-                    fresh_plan = retry["plan"]
-                elif retry.get("handled"):
-                    if retry.get("plan"):
-                        result.update(_project_chat_plan_result_fields(retry["plan"]))
-                        _apply_project_chat_count_stage_explanation(result)
-                    result["fresh_target_re_resolution_confirmed"] = bool(retry.get("fresh_re_resolution_confirmed"))
-                    result["final_re_resolution_re_resolved"] = bool(retry.get("fresh_re_resolution_confirmed"))
-                    result.update({"outcome": retry.get("outcome") or "target_detected_but_not_stably_re_resolved", "error": retry.get("error") or ""})
-                    return result
-            if fresh_plan["status"] == "ready":
-                pass
-            else:
-                result["fresh_target_re_resolution_confirmed"] = bool(alignment.get("fresh_re_resolution_confirmed"))
-                if alignment.get("plan"):
-                    result.update(_project_chat_plan_result_fields(alignment["plan"]))
-                    _apply_project_chat_count_stage_explanation(result)
-                result.update({"outcome": alignment.get("outcome") or "target_detected_but_not_stably_re_resolved", "error": alignment.get("error") or ""})
-                return result
-        if fresh_plan["status"] != "ready":
-            retry = _retry_detected_project_chat_fresh_re_resolution(
-                result,
-                reader,
-                pid,
-                project_title,
-                chat_title,
-                fresh_plan,
-                display_probe_factory,
-                windowserver_probe_factory,
-                sleep_function,
-            )
-            if retry.get("status") == "ready":
-                fresh_plan = retry["plan"]
-            elif retry.get("handled"):
-                if retry.get("plan"):
-                    result.update(_project_chat_plan_result_fields(retry["plan"]))
-                    _apply_project_chat_count_stage_explanation(result)
-                result["fresh_target_re_resolution_confirmed"] = bool(retry.get("fresh_re_resolution_confirmed"))
-                result["final_re_resolution_re_resolved"] = bool(retry.get("fresh_re_resolution_confirmed"))
-                result.update({"outcome": retry.get("outcome") or "target_detected_but_not_stably_re_resolved", "error": retry.get("error") or ""})
-                return result
+            result["fresh_target_re_resolution_confirmed"] = bool(alignment.get("fresh_re_resolution_confirmed"))
+            if alignment.get("plan"):
+                result.update(_project_chat_plan_result_fields(alignment["plan"]))
+                _apply_project_chat_count_stage_explanation(result)
+            result.update({"outcome": alignment.get("outcome") or "target_detected_but_not_stably_re_resolved", "error": alignment.get("error") or ""})
+            return result
     if fresh_plan["status"] != "ready":
         result["fresh_target_re_resolution_confirmed"] = False
         result.update(_project_chat_plan_result_fields(fresh_plan))
@@ -5239,9 +5181,6 @@ def _open_ready_project_chat_plan(
             result.update({"outcome": fresh_plan["status"], "error": fresh_plan.get("error", "")})
         return result
     result["fresh_target_re_resolution_confirmed"] = True
-    result["final_re_resolution_re_resolved"] = True
-    result.update(_project_chat_plan_result_fields(fresh_plan))
-    _apply_project_chat_count_stage_explanation(result)
     _record_project_chat_target_alignment_not_required(result, fresh_plan)
     if not result.get("target_exact_match_detected") and _project_chat_plan_materially_changed(plan, fresh_plan):
         result.update(_project_chat_plan_result_fields(fresh_plan))
@@ -5259,8 +5198,6 @@ def _open_ready_project_chat_plan(
             result["axpress_attempt"] = {"ok": False, "error": str(exc), "target": axpress_target}
         else:
             result["axpress_attempt"] = {"ok": True, "error": "", "target": axpress_target}
-            result["chat_open_action_posted"] = True
-            result["final_re_resolution_action_posted"] = True
             post = _project_chat_post_action_inspection(
                 reader,
                 pid,
@@ -5318,8 +5255,6 @@ def _open_ready_project_chat_plan(
         result.update({"outcome": "click_posting_failed", "error": posted.get("error") or "CoreGraphics click could not be posted."})
         return result
     result["actions_performed"].extend(posted.get("actions_performed") or [])
-    result["chat_open_action_posted"] = True
-    result["final_re_resolution_action_posted"] = True
     post = _project_chat_post_action_inspection(
         reader,
         pid,
@@ -5337,86 +5272,6 @@ def _open_ready_project_chat_plan(
     else:
         result.update({"outcome": "action_posted_but_chat_not_confirmed", "error": post.get("reason") or "Chat open was not confirmed after click."})
     return result
-
-
-def _retry_detected_project_chat_fresh_re_resolution(
-    result: dict,
-    reader: object,
-    pid: int,
-    project_title: str,
-    chat_title: str,
-    failed_plan: dict,
-    display_probe_factory: object,
-    windowserver_probe_factory: object,
-    sleep_function: object,
-    *,
-    expected_plan: dict | None = None,
-) -> dict:
-    if not result.get("target_exact_match_detected"):
-        return {"handled": False, "plan": failed_plan}
-
-    max_retries = max(0, int(PROJECT_CHAT_FINAL_RE_RESOLUTION_MAX_RETRIES))
-    result["final_re_resolution_max_retries"] = max_retries
-    if max_retries <= 0:
-        return _project_chat_detected_target_still_unresolved(failed_plan)
-
-    last_plan = failed_plan
-    for attempt in range(1, max_retries + 1):
-        sleep_function(PROJECT_CHAT_FINAL_RE_RESOLUTION_RETRY_DELAY_SECONDS)
-        retry_plan = _fresh_project_chat_targeting_plan(
-            reader,
-            pid,
-            project_title,
-            chat_title,
-            display_probe_factory,
-            windowserver_probe_factory,
-            sleep_function,
-        )
-        last_plan = retry_plan
-        result["final_re_resolution_retry_attempts"] = attempt
-        if retry_plan.get("status") == "ready":
-            if _project_chat_retry_plan_matches_detected_target(result, retry_plan, expected_plan=expected_plan or failed_plan):
-                return {"handled": True, "status": "ready", "plan": retry_plan, "fresh_re_resolution_confirmed": True}
-            return {
-                "handled": True,
-                "plan": retry_plan,
-                "fresh_re_resolution_confirmed": False,
-                "outcome": "target_detected_but_not_stably_re_resolved",
-                "error": "The exact target was re-resolved on retry, but it did not match the previously detected chat row.",
-            }
-        if retry_plan.get("status") == "chat_title_ambiguous":
-            return {
-                "handled": True,
-                "plan": retry_plan,
-                "fresh_re_resolution_confirmed": False,
-                "outcome": "target_detected_but_not_stably_re_resolved",
-                "error": retry_plan.get("error") or "The detected target became ambiguous during fresh pre-action re-resolution.",
-            }
-
-    return _project_chat_detected_target_still_unresolved(last_plan)
-
-
-def _project_chat_detected_target_still_unresolved(plan: dict) -> dict:
-    return {
-        "handled": True,
-        "plan": plan,
-        "fresh_re_resolution_confirmed": False,
-        "outcome": "target_detected_but_not_stably_re_resolved",
-        "error": plan.get("error") or "The exact target was detected but was not re-resolved in fresh pre-action snapshots.",
-    }
-
-
-def _project_chat_retry_plan_matches_detected_target(result: dict, plan: dict, *, expected_plan: dict | None = None) -> bool:
-    row = plan.get("matched_chat_row") or {}
-    if not row:
-        return False
-    expected_row = (expected_plan or {}).get("matched_chat_row") or {}
-    expected_title = _normalized_label(expected_row.get("title") or "")
-    detected_title = expected_title or _normalized_label(result.get("target_detection_canonical_title") or result.get("chat_title") or "")
-    row_title = _normalized_label(row.get("title") or "")
-    if not detected_title or row_title != detected_title:
-        return False
-    return True
 
 
 def _record_project_chat_target_alignment_not_required(result: dict, plan: dict) -> None:
@@ -7182,6 +7037,10 @@ def _project_chat_plan_materially_changed(before: dict, after: dict) -> bool:
     before_row = before.get("matched_chat_row") or {}
     after_row = after.get("matched_chat_row") or {}
     if before_row.get("title") != after_row.get("title"):
+        return True
+    if (before_row.get("row_path") or before_row.get("path")) != (after_row.get("row_path") or after_row.get("path")):
+        return True
+    if before_row.get("title_path") != after_row.get("title_path"):
         return True
     return _frames_materially_changed(_frame_tuple(before_row.get("row_frame")), _frame_tuple(after_row.get("row_frame"))) or _frames_materially_changed(
         _frame_tuple(before_row.get("title_frame")),

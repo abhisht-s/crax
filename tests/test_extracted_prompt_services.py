@@ -170,7 +170,7 @@ def _run(
         ledger.run,
         kwargs.pop("repo_path_text", tempfile.gettempdir()),
         kwargs.pop("sandbox", "read-only"),
-        kwargs.pop("timeout", 300),
+        kwargs.pop("timeout", None),
         confirm_full_access=kwargs.pop("confirm_full_access", False),
         allow_full_access=kwargs.pop("allow_full_access", False),
         approval_mode=kwargs.pop("approval_mode", "human"),

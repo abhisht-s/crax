@@ -269,7 +269,7 @@ class GovernanceServiceTests(unittest.TestCase):
         self.assertEqual(result.next_status, "completed")
         self.assertFalse(any("reset" in str(event["metadata"]).lower() for event in ledger.events))
 
-    def test_workspace_write_diff_metadata_unavailable_records_human_required_without_status_change(self) -> None:
+    def test_workspace_write_diff_metadata_unavailable_records_observation_only(self) -> None:
         ledger = FakeLedger()
         result = self._apply(
             ledger=ledger,
@@ -281,10 +281,10 @@ class GovernanceServiceTests(unittest.TestCase):
         event_types = [event["event_type"] for event in ledger.events]
         self.assertIn("workspace_write_diff_metadata_captured", event_types)
         self.assertIn("workspace_write_post_run_policy", event_types)
-        self.assertIn("human_required_after_write", event_types)
-        self.assertEqual(result.workspace_write_post_run_result["reason_code"], "post_run_diff_metadata_unavailable")
+        self.assertNotIn("human_required_after_write", event_types)
+        self.assertEqual(result.workspace_write_post_run_result["reason_code"], "post_run_observations_recorded")
         self.assertEqual(result.next_status, "completed")
-        self.assertTrue(result.human_review_required)
+        self.assertFalse(result.human_review_required)
 
     def test_objective_raw_outcomes_preserve_status_reasons(self) -> None:
         cases = [

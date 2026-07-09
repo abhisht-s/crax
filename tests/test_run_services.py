@@ -2,11 +2,35 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import tempfile
+import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from agent import cli
-from agent.run_services import HumanDecision, create_run_service, resolve_human_decision
+from agent import ledger as ledger_module
+from agent.run_services import (
+    CODEX_DEFAULT_SELECTION,
+    RUN_DESTINATION_BOUND_EVENT_TYPE,
+    RUN_DESTINATION_BOUND_MESSAGE,
+    RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+    RUN_EXECUTION_PROFILE_SCHEMA_VERSION,
+    RUN_EXECUTION_PROFILE_SELECTED_EVENT_TYPE,
+    RUN_EXECUTION_PROFILE_SELECTED_MESSAGE,
+    DestinationBindingLookupStatus,
+    ExecutionProfileLookupStatus,
+    HumanDecision,
+    RunDestinationBinding,
+    RunExecutionProfile,
+    bind_run_destination,
+    create_run_service,
+    get_run_destination_binding,
+    get_run_execution_profile,
+    resolve_human_decision,
+    select_run_execution_profile,
+)
 from agent.run_state import RunStatus
 
 
@@ -16,6 +40,10 @@ class FakeCreateRunLedger:
         self.runs: list[dict] = []
         self.events: list[dict] = []
         self.create_run_calls: list[str] = []
+        self.get_run_calls: list[str] = []
+        self.list_events_calls: list[str] = []
+        self.destination_bind_calls: list[dict] = []
+        self.execution_profile_bind_calls: list[dict] = []
         self._next_run_number = 1
         self._next_event_id = 200
 
@@ -54,6 +82,206 @@ class FakeCreateRunLedger:
             }
         )
         return event_id
+
+    def get_run(self, run_id: str) -> dict | None:
+        self.get_run_calls.append(run_id)
+        for run in self.runs:
+            if run["id"] == run_id:
+                return run
+        return None
+
+    def list_events(self, run_id: str) -> list[dict]:
+        self.list_events_calls.append(run_id)
+        return [event for event in self.events if event["run_id"] == run_id]
+
+    def bind_run_destination(
+        self,
+        run_id: str,
+        project_title: str,
+        chat_title: str,
+    ) -> ledger_module.AtomicDestinationBindingResult:
+        self.destination_bind_calls.append(
+            {
+                "run_id": run_id,
+                "project_title": project_title,
+                "chat_title": chat_title,
+            }
+        )
+        if self.get_run(run_id) is None:
+            return ledger_module.AtomicDestinationBindingResult(
+                status=ledger_module.AtomicDestinationBindingStatus.RUN_NOT_FOUND,
+                run_id=run_id,
+                reason_code="run_not_found",
+                error_message=f"Run not found: {run_id}",
+            )
+
+        existing = get_run_destination_binding(run_id, ledger=self)
+        if existing.status == DestinationBindingLookupStatus.INVALID:
+            return ledger_module.AtomicDestinationBindingResult(
+                status=ledger_module.AtomicDestinationBindingStatus.INVALID,
+                run_id=run_id,
+                reason_code=existing.reason_code,
+                error_message=existing.error_message,
+                event_ids=existing.event_ids,
+            )
+        if existing.status == DestinationBindingLookupStatus.PRESENT:
+            if existing.binding == RunDestinationBinding(project_title, chat_title):
+                return ledger_module.AtomicDestinationBindingResult(
+                    status=ledger_module.AtomicDestinationBindingStatus.IDEMPOTENT,
+                    run_id=run_id,
+                    project_title=existing.binding.project_title,
+                    chat_title=existing.binding.chat_title,
+                    event_ids=existing.event_ids,
+                )
+            return ledger_module.AtomicDestinationBindingResult(
+                status=ledger_module.AtomicDestinationBindingStatus.DIFFERENT_DESTINATION,
+                run_id=run_id,
+                project_title=existing.binding.project_title,
+                chat_title=existing.binding.chat_title,
+                reason_code="destination_already_bound_to_different_destination",
+                error_message="Run is already bound to a different destination.",
+                event_ids=existing.event_ids,
+            )
+
+        event_id = self.add_event(
+            run_id,
+            RUN_DESTINATION_BOUND_EVENT_TYPE,
+            RUN_DESTINATION_BOUND_MESSAGE,
+            metadata={
+                "schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                "project_title": project_title,
+                "chat_title": chat_title,
+            },
+        )
+        return ledger_module.AtomicDestinationBindingResult(
+            status=ledger_module.AtomicDestinationBindingStatus.BOUND,
+            run_id=run_id,
+            project_title=project_title,
+            chat_title=chat_title,
+            event_id=event_id,
+            event_written=True,
+        )
+
+    def bind_run_execution_profile(
+        self,
+        run_id: str,
+        sandbox: str,
+        model: str,
+        reasoning_effort: str,
+        approval_policy: str,
+        profile_source: str,
+    ) -> ledger_module.AtomicExecutionProfileResult:
+        self.execution_profile_bind_calls.append(
+            {
+                "run_id": run_id,
+                "sandbox": sandbox,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "approval_policy": approval_policy,
+                "profile_source": profile_source,
+            }
+        )
+        if self.get_run(run_id) is None:
+            return ledger_module.AtomicExecutionProfileResult(
+                status=ledger_module.AtomicExecutionProfileStatus.RUN_NOT_FOUND,
+                run_id=run_id,
+                reason_code="run_not_found",
+                error_message=f"Run not found: {run_id}",
+            )
+
+        existing = get_run_execution_profile(run_id, ledger=self)
+        if existing.status == ExecutionProfileLookupStatus.INVALID:
+            return ledger_module.AtomicExecutionProfileResult(
+                status=ledger_module.AtomicExecutionProfileStatus.INVALID,
+                run_id=run_id,
+                reason_code=existing.reason_code,
+                error_message=existing.error_message,
+                event_ids=existing.event_ids,
+            )
+
+        existing_profile = existing.profile
+        if any(
+            event["run_id"] == run_id and event["event_type"] == "codex_exec_started"
+            for event in self.events
+        ):
+            return ledger_module.AtomicExecutionProfileResult(
+                status=ledger_module.AtomicExecutionProfileStatus.EXECUTION_STARTED,
+                run_id=run_id,
+                sandbox=existing_profile.sandbox if existing_profile else None,
+                model=existing_profile.model if existing_profile else None,
+                reasoning_effort=(
+                    existing_profile.reasoning_effort if existing_profile else None
+                ),
+                approval_policy=(
+                    existing_profile.approval_policy if existing_profile else None
+                ),
+                profile_source=(
+                    existing_profile.profile_source if existing_profile else None
+                ),
+                reason_code="execution_profile_immutable_after_codex_exec_started",
+                error_message=(
+                    "Run execution profile cannot be selected after Codex execution "
+                    "has started."
+                ),
+                event_ids=existing.event_ids,
+            )
+
+        requested = RunExecutionProfile(
+            sandbox,
+            model,
+            reasoning_effort,
+            approval_policy,
+            profile_source,
+        )
+        if existing.status == ExecutionProfileLookupStatus.PRESENT:
+            if existing_profile == requested:
+                return ledger_module.AtomicExecutionProfileResult(
+                    status=ledger_module.AtomicExecutionProfileStatus.IDEMPOTENT,
+                    run_id=run_id,
+                    sandbox=existing_profile.sandbox,
+                    model=existing_profile.model,
+                    reasoning_effort=existing_profile.reasoning_effort,
+                    approval_policy=existing_profile.approval_policy,
+                    profile_source=existing_profile.profile_source,
+                    event_ids=existing.event_ids,
+                )
+            return ledger_module.AtomicExecutionProfileResult(
+                status=ledger_module.AtomicExecutionProfileStatus.DIFFERENT_PROFILE,
+                run_id=run_id,
+                sandbox=existing_profile.sandbox,
+                model=existing_profile.model,
+                reasoning_effort=existing_profile.reasoning_effort,
+                approval_policy=existing_profile.approval_policy,
+                profile_source=existing_profile.profile_source,
+                reason_code="execution_profile_already_selected_different_profile",
+                error_message="Run already has a different execution profile.",
+                event_ids=existing.event_ids,
+            )
+
+        event_id = self.add_event(
+            run_id,
+            RUN_EXECUTION_PROFILE_SELECTED_EVENT_TYPE,
+            RUN_EXECUTION_PROFILE_SELECTED_MESSAGE,
+            metadata={
+                "schema_version": RUN_EXECUTION_PROFILE_SCHEMA_VERSION,
+                "sandbox": sandbox,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "approval_policy": approval_policy,
+                "profile_source": profile_source,
+            },
+        )
+        return ledger_module.AtomicExecutionProfileResult(
+            status=ledger_module.AtomicExecutionProfileStatus.SELECTED,
+            run_id=run_id,
+            sandbox=sandbox,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            approval_policy=approval_policy,
+            profile_source=profile_source,
+            event_id=event_id,
+            event_written=True,
+        )
 
 
 class FakeDecisionLedger:
@@ -170,6 +398,347 @@ class CreateRunServiceTests(unittest.TestCase):
         self.assertEqual(ledger.create_run_calls, ["cannot create"])
         self.assertEqual(ledger.runs, [])
         self.assertEqual(ledger.events, [])
+
+    def test_create_without_destination_preserves_existing_behavior(self) -> None:
+        ledger = FakeCreateRunLedger()
+
+        result = create_run_service("no destination yet", ledger=ledger)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.event_type, "run_created")
+        self.assertIsNone(result.destination_binding)
+        self.assertIsNone(result.destination_event_id)
+        self.assertEqual(len(ledger.runs), 1)
+        self.assertEqual(
+            ledger.events,
+            [
+                {
+                    "id": 200,
+                    "run_id": "run-1",
+                    "event_type": "run_created",
+                    "message": "Run created.",
+                    "metadata": None,
+                }
+            ],
+        )
+
+    def test_create_with_one_destination_field_rejects_without_creating_run(self) -> None:
+        cases = [
+            {"project_title": "Project", "chat_title": None},
+            {"project_title": None, "chat_title": "Chat"},
+        ]
+
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                ledger = FakeCreateRunLedger()
+
+                result = create_run_service("partial", ledger=ledger, **kwargs)
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.reason_code, "partial_destination")
+                self.assertEqual(ledger.runs, [])
+                self.assertEqual(ledger.events, [])
+
+    def test_create_with_destination_persists_valid_pair(self) -> None:
+        ledger = FakeCreateRunLedger()
+
+        result = create_run_service(
+            "with destination",
+            project_title=" Project ",
+            chat_title=" Chat ",
+            ledger=ledger,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            result.destination_binding,
+            RunDestinationBinding("Project", "Chat"),
+        )
+        self.assertEqual(result.destination_event_id, 201)
+        self.assertEqual(
+            ledger.events,
+            [
+                {
+                    "id": 200,
+                    "run_id": "run-1",
+                    "event_type": "run_created",
+                    "message": "Run created.",
+                    "metadata": None,
+                },
+                {
+                    "id": 201,
+                    "run_id": "run-1",
+                    "event_type": RUN_DESTINATION_BOUND_EVENT_TYPE,
+                    "message": RUN_DESTINATION_BOUND_MESSAGE,
+                    "metadata": {
+                        "schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                        "project_title": "Project",
+                        "chat_title": "Chat",
+                    },
+                },
+            ],
+        )
+
+
+class RunDestinationBindingServiceTests(unittest.TestCase):
+    def _ledger_with_run(self) -> FakeCreateRunLedger:
+        ledger = FakeCreateRunLedger()
+        ledger.create_run("existing run")
+        return ledger
+
+    def test_valid_normalization_preserves_interior_whitespace_and_trims_edges(self) -> None:
+        binding = RunDestinationBinding(
+            "  Project   With\tInterior  Space  ",
+            "\nChat   With\tInterior  Space\n",
+        )
+
+        self.assertEqual(binding.project_title, "Project   With\tInterior  Space")
+        self.assertEqual(binding.chat_title, "Chat   With\tInterior  Space")
+
+    def test_empty_or_whitespace_only_destination_values_are_rejected(self) -> None:
+        cases = [
+            ("", "Chat", "project_title must not be empty"),
+            ("   ", "Chat", "project_title must not be empty"),
+            ("Project", "", "chat_title must not be empty"),
+            ("Project", "\n\t ", "chat_title must not be empty"),
+        ]
+
+        for project_title, chat_title, message in cases:
+            with self.subTest(project_title=project_title, chat_title=chat_title):
+                ledger = FakeCreateRunLedger()
+
+                result = bind_run_destination(
+                    "run-1",
+                    project_title,
+                    chat_title,
+                    ledger=ledger,
+                )
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.reason_code, "invalid_destination")
+                self.assertEqual(result.error_message, message)
+                self.assertEqual(ledger.destination_bind_calls, [])
+                self.assertEqual(ledger.events, [])
+
+    def test_first_bind_writes_exactly_one_durable_binding_event(self) -> None:
+        ledger = self._ledger_with_run()
+
+        result = bind_run_destination(
+            "run-1",
+            " Project   Alpha ",
+            " Chat   One ",
+            ledger=ledger,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.event_written)
+        self.assertEqual(result.event_id, 200)
+        self.assertEqual(
+            result.binding,
+            RunDestinationBinding("Project   Alpha", "Chat   One"),
+        )
+        self.assertEqual(
+            result.metadata,
+            {
+                "schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                "project_title": "Project   Alpha",
+                "chat_title": "Chat   One",
+            },
+        )
+        self.assertEqual(
+            ledger.events,
+            [
+                {
+                    "id": 200,
+                    "run_id": "run-1",
+                    "event_type": RUN_DESTINATION_BOUND_EVENT_TYPE,
+                    "message": RUN_DESTINATION_BOUND_MESSAGE,
+                    "metadata": {
+                        "schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                        "project_title": "Project   Alpha",
+                        "chat_title": "Chat   One",
+                    },
+                }
+            ],
+        )
+
+    def test_bind_to_nonexistent_run_fails_without_reading_history_or_writing_event(self) -> None:
+        ledger = FakeCreateRunLedger()
+
+        result = bind_run_destination("missing-run", "Project", "Chat", ledger=ledger)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.run_id, "missing-run")
+        self.assertEqual(result.reason_code, "run_not_found")
+        self.assertEqual(result.error_message, "Run not found: missing-run")
+        self.assertEqual(
+            ledger.destination_bind_calls,
+            [
+                {
+                    "run_id": "missing-run",
+                    "project_title": "Project",
+                    "chat_title": "Chat",
+                }
+            ],
+        )
+        self.assertEqual(ledger.get_run_calls, ["missing-run"])
+        self.assertEqual(ledger.list_events_calls, [])
+        self.assertEqual(ledger.events, [])
+
+    def test_binding_can_be_reconstructed_from_ledger_history(self) -> None:
+        ledger = FakeCreateRunLedger()
+        ledger.events.append(
+            {
+                "id": 200,
+                "run_id": "run-1",
+                "event_type": RUN_DESTINATION_BOUND_EVENT_TYPE,
+                "message": RUN_DESTINATION_BOUND_MESSAGE,
+                "metadata_json": json.dumps(
+                    {
+                        "schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                        "project_title": "Project",
+                        "chat_title": "Chat",
+                    },
+                    sort_keys=True,
+                ),
+            }
+        )
+
+        lookup = get_run_destination_binding("run-1", ledger=ledger)
+
+        self.assertEqual(lookup.status, DestinationBindingLookupStatus.PRESENT)
+        self.assertEqual(lookup.binding, RunDestinationBinding("Project", "Chat"))
+        self.assertEqual(lookup.event_ids, (200,))
+        self.assertIsNone(lookup.reason_code)
+
+    def test_same_normalized_destination_bind_is_idempotent_without_duplicate_event(self) -> None:
+        ledger = self._ledger_with_run()
+        first = bind_run_destination("run-1", " Project ", " Chat ", ledger=ledger)
+
+        second = bind_run_destination("run-1", "Project", "Chat", ledger=ledger)
+
+        self.assertTrue(first.ok)
+        self.assertTrue(second.ok)
+        self.assertFalse(second.event_written)
+        self.assertIsNone(second.event_id)
+        self.assertEqual(len(ledger.events), 1)
+        self.assertEqual(ledger.events[0]["event_type"], RUN_DESTINATION_BOUND_EVENT_TYPE)
+
+    def test_different_destination_bind_fails_closed_and_leaves_original_intact(self) -> None:
+        ledger = self._ledger_with_run()
+        bind_run_destination("run-1", "Project", "Chat", ledger=ledger)
+
+        result = bind_run_destination("run-1", "Project", "Different Chat", ledger=ledger)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.reason_code,
+            "destination_already_bound_to_different_destination",
+        )
+        self.assertEqual(result.binding, RunDestinationBinding("Project", "Chat"))
+        self.assertEqual(len(ledger.events), 1)
+        lookup = get_run_destination_binding("run-1", ledger=ledger)
+        self.assertEqual(lookup.status, DestinationBindingLookupStatus.PRESENT)
+        self.assertEqual(lookup.binding, RunDestinationBinding("Project", "Chat"))
+
+    def test_missing_binding_is_distinguished_from_invalid_history(self) -> None:
+        missing_ledger = FakeCreateRunLedger()
+        invalid_ledger = FakeCreateRunLedger()
+        invalid_ledger.runs.append(
+            {
+                "id": "run-1",
+                "status": RunStatus.CREATED.value,
+                "user_instruction": "existing run",
+            }
+        )
+        invalid_ledger.add_event(
+            "run-1",
+            RUN_DESTINATION_BOUND_EVENT_TYPE,
+            RUN_DESTINATION_BOUND_MESSAGE,
+            metadata={"schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION},
+        )
+
+        missing = get_run_destination_binding("run-1", ledger=missing_ledger)
+        invalid = get_run_destination_binding("run-1", ledger=invalid_ledger)
+        invalid_bind = bind_run_destination(
+            "run-1",
+            "Project",
+            "Chat",
+            ledger=invalid_ledger,
+        )
+
+        self.assertEqual(missing.status, DestinationBindingLookupStatus.MISSING)
+        self.assertIsNone(missing.reason_code)
+        self.assertEqual(invalid.status, DestinationBindingLookupStatus.INVALID)
+        self.assertEqual(invalid.reason_code, "malformed_destination_binding_event")
+        self.assertFalse(invalid_bind.ok)
+        self.assertEqual(invalid_bind.reason_code, "destination_binding_invalid")
+        self.assertEqual(len(invalid_ledger.events), 1)
+
+    def test_contradictory_binding_events_fail_closed(self) -> None:
+        ledger = self._ledger_with_run()
+        ledger.add_event(
+            "run-1",
+            RUN_DESTINATION_BOUND_EVENT_TYPE,
+            RUN_DESTINATION_BOUND_MESSAGE,
+            metadata={
+                "schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                "project_title": "Project",
+                "chat_title": "Chat",
+            },
+        )
+        ledger.add_event(
+            "run-1",
+            RUN_DESTINATION_BOUND_EVENT_TYPE,
+            RUN_DESTINATION_BOUND_MESSAGE,
+            metadata={
+                "schema_version": RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                "project_title": "Project",
+                "chat_title": "Other Chat",
+            },
+        )
+
+        lookup = get_run_destination_binding("run-1", ledger=ledger)
+        result = bind_run_destination("run-1", "Project", "Chat", ledger=ledger)
+
+        self.assertEqual(lookup.status, DestinationBindingLookupStatus.INVALID)
+        self.assertEqual(lookup.reason_code, "contradictory_destination_binding_events")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "destination_binding_invalid")
+        self.assertEqual(len(ledger.events), 2)
+
+    def test_operational_binding_failure_returns_structured_failure(self) -> None:
+        class OperationalFailureLedger:
+            def list_events(self, run_id: str) -> list[dict]:
+                raise AssertionError("history lookup should not be used by service")
+
+            def bind_run_destination(
+                self,
+                run_id: str,
+                project_title: str,
+                chat_title: str,
+            ) -> ledger_module.AtomicDestinationBindingResult:
+                return ledger_module.AtomicDestinationBindingResult(
+                    status=ledger_module.AtomicDestinationBindingStatus.OPERATIONAL_FAILURE,
+                    run_id=run_id,
+                    reason_code="destination_binding_transaction_failed",
+                    error_message="Failed to bind run destination: database is locked",
+                )
+
+        result = bind_run_destination(
+            "run-1",
+            "Project",
+            "Chat",
+            ledger=OperationalFailureLedger(),
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "destination_binding_transaction_failed")
+        self.assertEqual(
+            result.error_message,
+            "Failed to bind run destination: database is locked",
+        )
+        self.assertFalse(result.event_written)
 
 
 class CreateRunCliCompatibilityTests(unittest.TestCase):

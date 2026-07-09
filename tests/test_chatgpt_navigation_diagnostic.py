@@ -47,6 +47,7 @@ class _ActionReader:
         self.snapshots_by_collect = snapshots_by_collect
         self.collect_calls = 0
         self.actions: list[tuple[str, str]] = []
+        self.action_contexts: list[dict | None] = []
 
     def collect(self, pid: int) -> tuple[list[nav.AXElementSnapshot], dict, dict]:
         index = min(self.collect_calls, len(self.snapshots_by_collect) - 1)
@@ -60,8 +61,15 @@ class _ActionReader:
             "truncated_by_depth_limit": False,
         }, {"window_source": "synthetic", "window": snapshots[0] if snapshots else None}
 
-    def perform_action(self, path: str, action: str) -> bool:
+    def perform_action(self, path: str, action: str, *, action_context: dict | None = None) -> bool:
         self.actions.append((path, action))
+        self.action_contexts.append(action_context)
+        if action == "AXPress":
+            for index in range(self.collect_calls, len(self.snapshots_by_collect)):
+                snapshots = self.snapshots_by_collect[index]
+                if any(snapshot.identifier == "conversation-content" for snapshot in snapshots):
+                    self.collect_calls = index
+                    break
         return True
 
 
@@ -150,6 +158,35 @@ class _AutonomousReader(_ActionReader):
         return self.hit_result
 
 
+class _TimedActionReader(_AutonomousReader):
+    def __init__(self, snapshots_by_collect: list[list[nav.AXElementSnapshot]], hit_result: dict) -> None:
+        super().__init__(snapshots_by_collect, hit_result)
+        self.action_collect_calls: list[int] = []
+
+    def perform_action(self, path: str, action: str, *, action_context: dict | None = None) -> bool:
+        self.action_collect_calls.append(self.collect_calls)
+        return super().perform_action(path, action, action_context=action_context)
+
+
+class _FailingAlignmentReader(_TimedActionReader):
+    def perform_action(self, path: str, action: str, *, action_context: dict | None = None) -> bool:
+        if action == "AXScrollToVisible":
+            self.action_collect_calls.append(self.collect_calls)
+            self.actions.append((path, action))
+            self.action_contexts.append(action_context)
+            return False
+        return super().perform_action(path, action, action_context=action_context)
+
+
+class _AXPerformActionRecorder:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int | None, int | None]] = []
+
+    def AXUIElementPerformAction(self, element: object, action_ref: object) -> int:
+        self.calls.append((getattr(element, "value", None), getattr(action_ref, "value", None)))
+        return 0
+
+
 class _DisplayProbe:
     def __init__(
         self,
@@ -207,6 +244,18 @@ class _SleepRecorder:
 
     def __call__(self, seconds: float) -> None:
         self.calls.append(seconds)
+
+
+class _LiveOutputRecorder:
+    def __init__(self) -> None:
+        self.blocks: list[list[str]] = []
+
+    def __call__(self, lines: list[str]) -> None:
+        self.blocks.append(list(lines))
+
+    @property
+    def lines(self) -> list[str]:
+        return [line for block in self.blocks for line in block]
 
 
 class _TreeAdapter:
@@ -757,6 +806,104 @@ def _scrollable_project_chat_page(
     return snapshots
 
 
+def _visual_row_diagnostic_project_chat_page() -> list[nav.AXElementSnapshot]:
+    snapshots = _scrollable_project_chat_page(["Mock Data Insertion SQL", "Content Moderation"], list_actions=())
+    snapshots.extend(
+        [
+            nav.AXElementSnapshot(path="W.1.4.0", depth=3, role="AXOpaqueProviderGroup", frame=(282, 150, 779, 1381.5)),
+            nav.AXElementSnapshot(path="W.1.4.1.1", depth=4, role="AXStaticText", value="Mock Data Insertion SQL", frame=(302, 190, 240, 20)),
+            nav.AXElementSnapshot(path="W.1.4.1.2", depth=4, role="AXGroup", title="Title Attr Candidate", description="Description Attr Candidate", value="Value Attr Candidate", frame=(302, 214, 420, 20)),
+            nav.AXElementSnapshot(path="W.1.4.1.3", depth=4, role="AXRow", value="AXRow Candidate", frame=(302, 218, 320, 16)),
+            nav.AXElementSnapshot(path="W.1.4.1.4", depth=4, role="AXCell", value="AXCell Candidate", frame=(632, 218, 220, 16)),
+            nav.AXElementSnapshot(path="W.1.4.1.5", depth=4, role="AXLink", title="AXLink Candidate", frame=(862, 218, 150, 16)),
+            nav.AXElementSnapshot(path="W.1.4.3", depth=3, role="AXGroup", frame=(282, 340, 779, 65)),
+            nav.AXElementSnapshot(path="W.1.4.3.1", depth=4, role="AXButton", actions=("AXPress",), frame=(302, 356, 360, 18)),
+            nav.AXElementSnapshot(path="W.1.4.3.1.1", depth=5, role="AXStaticText", value="Nested Small Wrapper", frame=(314, 356, 250, 18)),
+            nav.AXElementSnapshot(path="W.1.4.98", depth=3, role="AXIncrementPage", frame=(1048, 150, 10, 32)),
+            nav.AXElementSnapshot(path="W.1.4.99", depth=3, role="AXScrollBar", value="0.5", frame=(1048, 150, 10, 520)),
+        ]
+    )
+    return snapshots
+
+
+def _mock_data_sql_project_chat_page(preview: str) -> list[nav.AXElementSnapshot]:
+    snapshots = _scrollable_project_chat_page([], list_actions=())
+    snapshots.extend(
+        [
+            nav.AXElementSnapshot(path="W.1.4.0", depth=3, role="AXOpaqueProviderGroup", frame=(282, 150, 779, 1381.5)),
+            nav.AXElementSnapshot(
+                path="W.1.4.0.15",
+                depth=4,
+                role="AXButton",
+                description=f"Mock Data Insertion SQL, {preview}",
+                actions=("AXPress", "AXScrollToVisible", "AXShowMenu"),
+                enabled=True,
+                frame=(282, 441, 352, 64.5),
+            ),
+        ]
+    )
+    return snapshots
+
+
+def _project_chat_page_with_single_row_frame(
+    title: str,
+    *,
+    path: str,
+    frame: tuple[float, float, float, float],
+    actions: tuple[str, ...] = ("AXPress",),
+) -> list[nav.AXElementSnapshot]:
+    snapshots = _scrollable_project_chat_page([], list_actions=())
+    snapshots.append(
+        nav.AXElementSnapshot(
+            path=path,
+            depth=3,
+            role="AXButton",
+            description=f"{title}, preview text must not drive matching",
+            actions=actions,
+            enabled=True,
+            frame=frame,
+        )
+    )
+    return snapshots
+
+
+def _alignment_dispatch_context(
+    *,
+    path: str = "W.1.4.11",
+    container_path: str = "W.1.4",
+    requested_title: str = "Mock Data Insertion SQL",
+    canonical_title: str = "Mock Data Insertion SQL",
+    exact_target_detected: bool = True,
+    fresh_re_resolution_confirmed: bool = True,
+    target_descends_from_confirmed_chat_list: bool = True,
+    visibility: str = "partially_clipped",
+    row_actions: tuple[str, ...] = ("AXPress", "AXScrollToVisible", "AXShowMenu"),
+    alignment_already_posted: bool = False,
+) -> dict:
+    return {
+        "kind": "exact_project_chat_target_alignment",
+        "target_path": path,
+        "requested_title": requested_title,
+        "canonical_title": canonical_title,
+        "exact_target_detected": exact_target_detected,
+        "fresh_re_resolution_confirmed": fresh_re_resolution_confirmed,
+        "confirmed_chat_list_container_path": container_path,
+        "target_descends_from_confirmed_chat_list": target_descends_from_confirmed_chat_list,
+        "visibility": visibility,
+        "row_actions": row_actions,
+        "alignment_already_posted": alignment_already_posted,
+    }
+
+
+def _autonomous_dispatch_reader(path: str = "W.1.4.11") -> tuple[nav._AutonomousSidebarAXReader, _AXPerformActionRecorder]:
+    recorder = _AXPerformActionRecorder()
+    reader = object.__new__(nav._AutonomousSidebarAXReader)
+    reader._elements_by_path = {path: 111}
+    reader._ax = recorder
+    reader._attribute_ref = lambda action: 222 if action == "AXScrollToVisible" else 333
+    return reader, recorder
+
+
 def _scroll_opened_conversation_snapshots(title: str) -> list[nav.AXElementSnapshot]:
     return [
         nav.AXElementSnapshot(path="W", depth=0, role="AXWindow", title="ChatGPT", frame=(0, 0, 1200, 900)),
@@ -765,6 +912,24 @@ def _scroll_opened_conversation_snapshots(title: str) -> list[nav.AXElementSnaps
         nav.AXElementSnapshot(path="W.1.2", depth=2, role="AXStaticText", value="assistant message", frame=(300, 180, 500, 30)),
         nav.AXElementSnapshot(path="W.1.3", depth=2, role="AXTextArea", title="Message ChatGPT", value="", frame=(320, 820, 620, 44)),
     ]
+
+
+def _project_content_shell_without_list(
+    extra: list[nav.AXElementSnapshot] | None = None,
+) -> list[nav.AXElementSnapshot]:
+    """Project content pane + header + Chats/Sources tabs, but no chat-list container."""
+    snapshots = [
+        nav.AXElementSnapshot(path="W", depth=0, role="AXWindow", title="ChatGPT", frame=(0, 0, 1200, 900)),
+        nav.AXElementSnapshot(path="W.1", depth=1, role="AXList", identifier="sidebar", subrole="AXSectionList", frame=(0, 0, 280, 900)),
+        nav.AXElementSnapshot(path="W.1.1", depth=2, role="AXHeading", value="Projects", frame=(12, 60, 240, 24)),
+        nav.AXElementSnapshot(path="W.2", depth=1, role="AXGroup", identifier="project-content", frame=(300, 0, 900, 900)),
+        nav.AXElementSnapshot(path="W.2.1", depth=2, role="AXHeading", value="PTG Assistant", frame=(320, 40, 420, 38)),
+        nav.AXElementSnapshot(path="W.2.2", depth=2, role="AXButton", title="Chats", actions=("AXPress",), frame=(320, 92, 80, 30)),
+        nav.AXElementSnapshot(path="W.2.3", depth=2, role="AXButton", title="Sources", actions=("AXPress",), frame=(408, 92, 90, 30)),
+    ]
+    if extra:
+        snapshots.extend(extra)
+    return snapshots
 
 
 def _minimal_project_chat_resolution(title: str, *, count: int = 1) -> dict:
@@ -2406,6 +2571,7 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(result["outcome"], "chat_title_not_unambiguously_representable_by_accessibility")
         self.assertEqual(result["actions_performed"], [])
+        self.assertFalse(result["target_exact_match_detected"])
 
     def test_project_chat_open_duplicate_accessibility_prefix_matches_fail_ambiguous(self) -> None:
         snapshots = _leaf_merged_project_chat_row_snapshots() + [
@@ -2653,11 +2819,62 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertTrue(result["target_initially_visible"])
         self.assertIn(("W.1.4.1", "AXPress"), reader.actions)
 
+    def test_project_chat_open_reports_action_posted_when_open_action_is_pressed(self) -> None:
+        # The structured chat_open_action_posted signal is emitted whenever the
+        # open action is physically posted against the exact target row, which
+        # lets the authoritative destination gate (not the navigator's own
+        # heuristic) decide whether the supervised handoff may proceed.
+        reader = _AutonomousReader(
+            [_scrollable_project_chat_page(["City-wise Restrictions"])] * 3
+            + [_scroll_opened_conversation_snapshots("City-wise Restrictions")] * 2,
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="City-wise Restrictions",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertIs(result["chat_open_action_posted"], True)
+        self.assertIn(("W.1.4.1", "AXPress"), reader.actions)
+
+    def test_project_chat_open_reports_no_action_posted_before_open_action(self) -> None:
+        # A dry-run (confirm_open_chat=False) resolves the target but never posts
+        # the open action, so the signal stays False and the handoff must not
+        # treat it as navigation performed.
+        reader = _AutonomousReader(
+            [_scrollable_project_chat_page(["City-wise Restrictions"])] * 3,
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="City-wise Restrictions",
+                confirm_open_chat=False,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertIs(result["chat_open_action_posted"], False)
+
     def test_project_chat_open_finds_target_after_one_controlled_scroll(self) -> None:
         page_1 = _scrollable_project_chat_page(["Content Moderation", "AWS Profile Photo Verification"])
         page_2 = _scrollable_project_chat_page(["City-wise Restrictions", "Other Later Chat"], row_offset=10)
         reader = _AutonomousReader(
-            [page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_2, _scroll_opened_conversation_snapshots("City-wise Restrictions"), _scroll_opened_conversation_snapshots("City-wise Restrictions")],
+            [page_1, page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_2, _scroll_opened_conversation_snapshots("City-wise Restrictions"), _scroll_opened_conversation_snapshots("City-wise Restrictions")],
             {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
         )
 
@@ -2688,7 +2905,7 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         page_3 = _scrollable_project_chat_page(["City-wise Restrictions"], row_offset=20)
         opened = _scroll_opened_conversation_snapshots("City-wise Restrictions")
         reader = _AutonomousReader(
-            [page_1, page_1, page_1, page_2, page_2, page_2, page_3, page_3, page_3, page_3, page_3, opened, opened],
+            [page_1, page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_3, page_3, page_3, page_3, page_3, opened, opened],
             {"available": True, "path": "W.1.4.21", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
         )
 
@@ -2733,9 +2950,15 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(result["outcome"], "chat_list_end_reached_without_match")
         self.assertEqual(result["end_of_list_state"], "confirmed")
-        self.assertEqual(result["actions_performed"], [{"path": "W.1.4", "action": "AXScrollDown"}, {"path": "W.1.4", "action": "AXScrollDown"}])
+        # Authoritative scrollbar bottom evidence plus one continuity-confirmed
+        # unchanged forward cycle is sufficient to conclude the end.
+        self.assertEqual(result["actions_performed"], [{"path": "W.1.4", "action": "AXScrollDown"}])
+        self.assertEqual(result["scan_continuity"], "confirmed")
 
-    def test_project_chat_open_repeated_no_progress_snapshots_stop_safely(self) -> None:
+    def test_project_chat_repeated_identical_viewport_confirms_end_via_anchors(self) -> None:
+        # Two complete forward scroll-plus-settle cycles whose top-most and
+        # bottom-most rows never change confirm the end of the list via the
+        # anchor-based fallback (no scrollbar bottom token is present here).
         page = _scrollable_project_chat_page(["Content Moderation"])
         reader = _AutonomousReader(
             [page, page, page, page, page, page, page],
@@ -2755,11 +2978,13 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
                 sleep_function=_SleepRecorder(),
             )
 
-        self.assertEqual(result["outcome"], "chat_list_scroll_no_progress")
+        self.assertEqual(result["outcome"], "chat_list_end_reached_without_match")
+        self.assertEqual(result["end_of_list_state"], "confirmed")
         self.assertEqual(result["scroll_iterations_attempted"], 2)
         self.assertEqual(reader.actions.count(("W.1.4", "AXScrollDown")), 2)
         self.assertEqual(result["search_cycles_attempted"], 2)
         self.assertEqual(result["scroll_pulses_posted"], 2)
+        self.assertNotEqual(result["outcome"], "chat_list_scroll_no_progress")
 
     def test_project_chat_scroll_reset_then_hydrate_exposes_new_rows_without_no_progress(self) -> None:
         page_1 = _scrollable_project_chat_page(["Content Moderation"])
@@ -2770,7 +2995,7 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
             {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Content Moderation, preview text must not drive matching"}},
         )
 
-        with mock.patch.object(nav, "MAX_CHAT_SEARCH_CYCLES", 2), mock.patch.object(nav.sys, "platform", "darwin"):
+        with mock.patch.object(nav, "MAX_PROJECT_CHAT_SEARCH_CYCLES", 2), mock.patch.object(nav.sys, "platform", "darwin"):
             result = nav.open_chatgpt_project_chat(
                 project_title="PTG Assistant",
                 chat_title="Not In Loaded Rows",
@@ -2786,7 +3011,7 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "chat_search_budget_exhausted_without_confirmed_end")
         self.assertGreaterEqual(result["reset_events_observed"], 1)
         self.assertGreaterEqual(result["hydration_events_observed"], 1)
-        self.assertIn("cycle_2: scroll_posted -> list_reset_then_changed", result["search_cycle_summaries"][-1])
+        self.assertTrue(any("reset_then_changed" in summary for summary in result["search_cycle_summaries"]))
         self.assertNotEqual(result["outcome"], "chat_list_scroll_no_progress")
 
     def test_project_chat_target_appears_after_reset_and_hydrate_then_stops_scrolling(self) -> None:
@@ -2795,7 +3020,7 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         page_3 = _scrollable_project_chat_page(["City-wise Restrictions"], row_offset=20)
         opened = _scroll_opened_conversation_snapshots("City-wise Restrictions")
         reader = _AutonomousReader(
-            [page_1, page_1, page_1, page_2, page_2, page_2, page_1, page_3, page_3, page_3, page_3, page_3, opened, opened],
+            [page_1, page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_1, page_3, page_3, page_3, page_3, page_3, opened, opened],
             {"available": True, "path": "W.1.4.21", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
         )
 
@@ -2814,8 +3039,10 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
 
         self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
         self.assertEqual(reader.actions.count(("W.1.4", "AXScrollDown")), 2)
-        self.assertIn("list_reset_then_changed", result["search_cycle_summaries"][-1])
         self.assertTrue(result["target_found_after_scrolling"])
+        self.assertTrue(result["target_exact_match_detected"])
+        self.assertEqual(result["target_detected_in"], "hydration")
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
 
     def test_project_chat_no_progress_not_emitted_after_one_unchanged_hydration_cycle(self) -> None:
         page_1 = _scrollable_project_chat_page(["Content Moderation"])
@@ -2840,8 +3067,10 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
             )
 
         self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
-        self.assertEqual(result["scroll_pulses_posted"], 2)
-        self.assertEqual(result["search_cycle_summaries"][0], "cycle_1: scroll_posted -> list_stable_no_change -> 0_new_rows_observed")
+        self.assertEqual(result["scroll_pulses_posted"], 1)
+        self.assertEqual(result["target_found_during_hydration_cycle"], 1)
+        self.assertTrue(result["target_exact_match_detected"])
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
 
     def test_project_chat_search_budget_exhaustion_keeps_unknown_end_distinct(self) -> None:
         page_1 = _scrollable_project_chat_page(["Content Moderation"])
@@ -2852,7 +3081,7 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
             {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Content Moderation, preview text must not drive matching"}},
         )
 
-        with mock.patch.object(nav, "MAX_CHAT_SEARCH_CYCLES", 2), mock.patch.object(nav.sys, "platform", "darwin"):
+        with mock.patch.object(nav, "MAX_PROJECT_CHAT_SEARCH_CYCLES", 2), mock.patch.object(nav.sys, "platform", "darwin"):
             result = nav.open_chatgpt_project_chat(
                 project_title="PTG Assistant",
                 chat_title="Missing Chat",
@@ -2890,9 +3119,184 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
                 sleep_function=sleeper,
             )
 
-        self.assertEqual(result["outcome"], "chat_list_scroll_no_progress")
+        self.assertEqual(result["outcome"], "chat_list_end_reached_without_match")
         self.assertGreater(reader.collect_calls, result["scroll_pulses_posted"])
         self.assertGreaterEqual(len(sleeper.calls), result["scroll_pulses_posted"])
+
+    def test_project_chat_target_found_in_intermediate_hydration_sample_opens_without_next_scroll(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        target_page = _scrollable_project_chat_page(["Mock Data Insertion SQL"], row_offset=10)
+        opened = _scroll_opened_conversation_snapshots("Mock Data Insertion SQL")
+        reader = _AutonomousReader(
+            [page_1, page_1, page_1, page_1, target_page, target_page, target_page, target_page, opened, opened, opened],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "Mock Data Insertion SQL, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
+        self.assertEqual(reader.actions.count(("W.1.4", "AXScrollDown")), 1)
+        self.assertEqual(result["target_found_during_hydration_cycle"], 1)
+        self.assertIn(("W.1.4.11", "AXPress"), reader.actions)
+
+    def test_project_chat_observer_marks_new_rows_as_progress_not_no_progress(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        page_2 = _scrollable_project_chat_page(["AWS Profile Photo Verification"], row_offset=10)
+        first_plan = nav._project_chat_open_plan_from_snapshots(
+            page_1,
+            {"visited_nodes": len(page_1)},
+            {"window_source": "synthetic", "window": page_1[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Missing Chat",
+            _DisplayFactory(_DisplayProbe()),
+        )
+        reader = _AutonomousReader([page_2, page_2, page_2], {"available": True, "path": "W.1.4.11"})
+
+        observation = nav._observe_project_chat_list_hydration(
+            reader,
+            123,
+            "PTG Assistant",
+            "Missing Chat",
+            first_plan,
+            first_plan,
+            _DisplayFactory(_DisplayProbe()),
+            _WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+            _SleepRecorder(),
+            timeout_seconds=1.0,
+            known_accessibility_rows={"Content Moderation, preview text must not drive matching"},
+            require_change_before_early_settle=True,
+        )
+
+        self.assertGreater(observation["new_accessibility_rows"], 0)
+        self.assertTrue(observation["meaningful_change"])
+        self.assertFalse(observation["no_meaningful_change"])
+
+    def test_project_chat_search_can_continue_past_twelve_cycles_within_time_budget(self) -> None:
+        pages = [_scrollable_project_chat_page([f"Chat {index}"], row_offset=index * 10) for index in range(14)]
+        target_page = _scrollable_project_chat_page(["Mock Data Insertion SQL"], row_offset=140)
+        opened = _scroll_opened_conversation_snapshots("Mock Data Insertion SQL")
+        snapshots: list[list[nav.AXElementSnapshot]] = [pages[0], pages[0], pages[0]]
+        for index in range(1, 14):
+            snapshots.extend([pages[index - 1], pages[index], pages[index], pages[index]])
+        snapshots.extend([pages[13], target_page, target_page, target_page, target_page, opened, opened, opened])
+        reader = _AutonomousReader(
+            snapshots,
+            {"available": True, "path": "W.1.4.141", "role": "AXButton", "title": {"literal": "Mock Data Insertion SQL, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
+        self.assertGreater(result["scroll_pulses_posted"], 12)
+        self.assertEqual(result["configured_max_search_cycles"], 60)
+
+    def test_project_chat_hydration_stability_counter_resets_on_viewport_changes(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        page_2 = _scrollable_project_chat_page(["AWS Profile Photo Verification"], row_offset=10)
+        page_3 = _scrollable_project_chat_page(["Later Chat"], row_offset=20)
+        first_plan = nav._project_chat_open_plan_from_snapshots(
+            page_1,
+            {"visited_nodes": len(page_1)},
+            {"window_source": "synthetic", "window": page_1[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Missing Chat",
+            _DisplayFactory(_DisplayProbe()),
+        )
+        reader = _AutonomousReader([page_2, page_3, page_3, page_3], {"available": True, "path": "W.1.4.21"})
+
+        observation = nav._observe_project_chat_list_hydration(
+            reader,
+            123,
+            "PTG Assistant",
+            "Missing Chat",
+            first_plan,
+            first_plan,
+            _DisplayFactory(_DisplayProbe()),
+            _WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+            _SleepRecorder(),
+            timeout_seconds=1.0,
+            known_accessibility_rows={"Content Moderation, preview text must not drive matching"},
+            require_change_before_early_settle=True,
+        )
+
+        self.assertEqual(observation["samples_taken"], 4)
+        self.assertTrue(observation["settled"])
+        self.assertEqual(observation["new_accessibility_rows"], 2)
+
+    def test_project_chat_does_not_post_next_scroll_while_current_list_is_hydrating(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        page_2 = _scrollable_project_chat_page(["AWS Profile Photo Verification"], row_offset=10)
+        page_3 = _scrollable_project_chat_page(["Later Chat"], row_offset=20)
+        reader = _TimedActionReader(
+            [page_1, page_1, page_1, page_1, page_2, page_3, page_3, page_3, page_3, page_3, page_3, page_3],
+            {"available": True, "path": "W.1.4.21"},
+        )
+
+        with mock.patch.object(nav, "MAX_PROJECT_CHAT_SEARCH_CYCLES", 2), mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Missing Chat",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertGreaterEqual(result["scroll_pulses_posted"], 2)
+        self.assertGreaterEqual(reader.action_collect_calls[1] - reader.action_collect_calls[0], 4)
+
+    def test_project_chat_time_budget_exhausted_while_rows_still_progress_returns_distinct_outcome(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        page_2 = _scrollable_project_chat_page(["AWS Profile Photo Verification"], row_offset=10)
+        reader = _AutonomousReader(
+            [page_1, page_1, page_1, page_1, page_2, page_2, page_2],
+            {"available": True, "path": "W.1.4.11"},
+        )
+
+        with mock.patch.object(nav, "MAX_PROJECT_CHAT_SEARCH_ELAPSED_SECONDS", 1.0), mock.patch.object(nav.time, "monotonic", side_effect=[0.0, 0.0, 2.0, 2.0]), mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Missing Chat",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "chat_search_time_budget_exhausted_while_list_progressing")
+        self.assertGreater(result["new_accessibility_rows_seen"], 0)
 
     def test_project_chat_virtualized_ax_path_changes_do_not_create_new_identity(self) -> None:
         row_a = {"title": "City-wise Restrictions", "accessibility_row_text": "City-wise Restrictions", "row_path": "W.1.4.1", "row_frame": {"x": 282, "y": 176, "width": 779, "height": 65}}
@@ -2905,6 +3309,482 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
 
         self.assertTrue(nav._project_chat_row_match_representation(row, "City-wise Restrictions")["matched"])
         self.assertFalse(nav._project_chat_row_match_representation(row, "preview text must not drive matching")["matched"])
+
+    def test_direct_axbutton_merged_description_sql_preview_is_valid_project_chat_row(self) -> None:
+        snapshots = _mock_data_sql_project_chat_page("SELECT * FROM users WHERE id = 1; ```sql INSERT INTO users VALUES (1); ```")
+        resolution = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", snapshots, (0, 0, 1200, 900))
+
+        self.assertEqual(resolution["status"], "visible_chats_found")
+        self.assertEqual(resolution["visible_chat_count"], 1)
+        row = resolution["visible_chats"][0]
+        self.assertEqual(row["title"], "Mock Data Insertion SQL")
+        self.assertEqual(row["preview"], "SELECT * FROM users WHERE id = 1; ```sql INSERT INTO users VALUES (1); ```")
+        self.assertEqual(row["row_path"], "W.1.4.0.15")
+        self.assertEqual(row["row_role"], "AXButton")
+        self.assertTrue(row["ax_press_available"])
+        self.assertEqual(row["title_representation"], "canonical_accessibility_description_prefix")
+
+    def test_preview_code_json_links_and_message_prose_do_not_reject_valid_row(self) -> None:
+        previews = [
+            "function seed() { return fetch('https://example.test/mock.json'); }",
+            '{"migration": "2026_01_01_seed_mock_data", "sql": "INSERT INTO t VALUES (1)"}',
+            "user: run this SQL then check https://example.test/docs",
+        ]
+        for preview in previews:
+            with self.subTest(preview=preview):
+                resolution = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", _mock_data_sql_project_chat_page(preview), (0, 0, 1200, 900))
+                self.assertEqual(resolution["status"], "visible_chats_found")
+                self.assertEqual(resolution["visible_chats"][0]["title"], "Mock Data Insertion SQL")
+
+    def test_canonical_title_eligibility_is_independent_of_preview_content(self) -> None:
+        accepted = nav._project_visible_row_title(
+            nav.AXElementSnapshot(
+                path="W.1",
+                depth=1,
+                role="AXButton",
+                description="Mock Data Insertion SQL, function seed() { return 'preview code'; }",
+                actions=("AXPress",),
+                frame=(282, 441, 352, 64.5),
+            )
+        )
+        rejected = nav._project_visible_row_title(
+            nav.AXElementSnapshot(
+                path="W.2",
+                depth=1,
+                role="AXButton",
+                description="function seed(), harmless preview",
+                actions=("AXPress",),
+                frame=(282, 522, 352, 64.5),
+            )
+        )
+
+        self.assertEqual(accepted, "Mock Data Insertion SQL")
+        self.assertEqual(rejected, "")
+
+    def test_title_only_direct_row_remains_accepted(self) -> None:
+        snapshots = _scrollable_project_chat_page([], list_actions=())
+        snapshots.append(
+            nav.AXElementSnapshot(
+                path="W.1.4.7",
+                depth=3,
+                role="AXButton",
+                title="Title Only Chat",
+                actions=("AXPress",),
+                frame=(282, 176, 779, 65),
+            )
+        )
+        resolution = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", snapshots, (0, 0, 1200, 900))
+
+        self.assertEqual(resolution["status"], "visible_chats_found")
+        self.assertEqual(resolution["visible_chats"][0]["title"], "Title Only Chat")
+        self.assertEqual(resolution["visible_chats"][0]["title_representation"], "exact_axtitle")
+
+    def test_generic_composer_sidebar_and_page_controls_remain_rejected(self) -> None:
+        snapshots = _scrollable_project_chat_page([], list_actions=())
+        snapshots.extend(
+            [
+                nav.AXElementSnapshot(path="W.1.4.1", depth=3, role="AXButton", title="Chats", actions=("AXPress",), frame=(282, 176, 779, 65)),
+                nav.AXElementSnapshot(path="W.1.4.2", depth=3, role="AXTextArea", title="Message ChatGPT", frame=(282, 258, 779, 65)),
+                nav.AXElementSnapshot(path="W.1.4.3", depth=3, role="AXIncrementPage", frame=(1048, 150, 10, 32)),
+                nav.AXElementSnapshot(path="W.0.9", depth=2, role="AXButton", title="Sidebar Chat", actions=("AXPress",), frame=(20, 176, 220, 65)),
+            ]
+        )
+        resolution = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", snapshots, (0, 0, 1200, 900))
+
+        self.assertIn(resolution["status"], {"visible_chat_rows_not_found", "project_chat_list_identity_not_confirmed"})
+        self.assertEqual(resolution.get("visible_chats") or [], [])
+
+    def test_discovery_output_prints_canonical_title_only_never_sql_preview(self) -> None:
+        preview = "SELECT * FROM seed_table; function seedMockData() { return true; }"
+        page = _mock_data_sql_project_chat_page(preview)
+        output = _LiveOutputRecorder()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Missing Chat",
+                confirm_open_chat=False,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "dry_run_ready", "visible_chat_count": 0}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(_AutonomousReader([page], {"available": True, "path": "W.1.4.0.15"})),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+                discovery_output_function=output,
+            )
+
+        self.assertEqual(output.lines, ["Chats discovered:", "1. Mock Data Insertion SQL"])
+        self.assertNotIn("SELECT", "\n".join(output.lines))
+        self.assertEqual(result["unique_chat_titles_printed"], 1)
+
+    def test_dispatch_allows_axscrolltovisible_only_with_exact_target_alignment_context(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader()
+
+        self.assertTrue(reader.perform_action("W.1.4.11", "AXScrollToVisible", action_context=_alignment_dispatch_context()))
+
+        self.assertEqual(recorder.calls, [(111, 222)])
+
+    def test_dispatch_rejects_axscrolltovisible_without_explicit_alignment_context(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader()
+
+        with self.assertRaisesRegex(nav.AXDiagnosticError, "Unsupported autonomous sidebar action"):
+            reader.perform_action("W.1.4.11", "AXScrollToVisible")
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_dispatch_rejects_axscrolltovisible_for_sidebar_project_button(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader(path="W.0.7")
+        context = _alignment_dispatch_context(path="W.0.7", container_path="W.1.4", target_descends_from_confirmed_chat_list=False)
+
+        with self.assertRaisesRegex(nav.AXDiagnosticError, "Unsupported autonomous sidebar action"):
+            reader.perform_action("W.0.7", "AXScrollToVisible", action_context=context)
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_dispatch_rejects_axscrolltovisible_without_exact_title_evidence(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader()
+        context = _alignment_dispatch_context(exact_target_detected=False)
+
+        with self.assertRaisesRegex(nav.AXDiagnosticError, "Unsupported autonomous sidebar action"):
+            reader.perform_action("W.1.4.11", "AXScrollToVisible", action_context=context)
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_dispatch_keeps_axshowmenu_rejected_even_with_alignment_context(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader()
+
+        with self.assertRaisesRegex(nav.AXDiagnosticError, "Unsupported autonomous sidebar action"):
+            reader.perform_action("W.1.4.11", "AXShowMenu", action_context=_alignment_dispatch_context())
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_dispatch_rejects_second_axscrolltovisible_alignment_attempt(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader()
+        context = _alignment_dispatch_context(alignment_already_posted=True)
+
+        with self.assertRaisesRegex(nav.AXDiagnosticError, "Unsupported autonomous sidebar action"):
+            reader.perform_action("W.1.4.11", "AXScrollToVisible", action_context=context)
+
+        self.assertEqual(recorder.calls, [])
+
+    def test_dispatch_existing_axpress_authorization_is_unchanged(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader()
+
+        self.assertTrue(reader.perform_action("W.1.4.11", "AXPress"))
+
+        self.assertEqual(recorder.calls, [(111, 333)])
+
+    def test_target_detection_on_canonical_title_posts_zero_additional_scrolls_and_fresh_axpress(self) -> None:
+        preview = "SELECT * FROM users; function hydratePreview() { return true; }"
+        page = _mock_data_sql_project_chat_page(preview)
+        opened = _scroll_opened_conversation_snapshots("Mock Data Insertion SQL")
+        output = _LiveOutputRecorder()
+        reader = _TimedActionReader([page, page, opened, opened], {"available": True, "path": "W.1.4.0.15", "role": "AXButton"})
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+                discovery_output_function=output,
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_via_axpress")
+        self.assertTrue(result["target_exact_match_detected"])
+        self.assertEqual(result["scroll_pulses_posted"], 0)
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
+        self.assertFalse(result["target_alignment_required"])
+        self.assertEqual(result["target_alignment_method"], "none")
+        self.assertFalse(result["target_alignment_posted"])
+        self.assertNotIn(("W.1.4.0.15", "AXScrollToVisible"), reader.actions)
+        self.assertIn("target_exact_match_detected: Mock Data Insertion SQL", output.lines)
+        self.assertIn(("W.1.4.0.15", "AXPress"), reader.actions)
+        self.assertGreaterEqual(reader.action_collect_calls[-1], 2)
+
+    def test_partially_clipped_target_aligns_once_then_actions_fresh_visible_row(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        clipped_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.11",
+            frame=(282, 650, 779, 65),
+            actions=("AXPress", "AXScrollToVisible", "AXShowMenu"),
+        )
+        clipped_alignment_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.12",
+            frame=(282, 650, 779, 65),
+            actions=("AXPress", "AXScrollToVisible", "AXShowMenu"),
+        )
+        fresh_visible_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.21",
+            frame=(282, 176, 779, 65),
+        )
+        opened = _scroll_opened_conversation_snapshots("Mock Data Insertion SQL")
+        output = _LiveOutputRecorder()
+        reader = _TimedActionReader(
+            [page_1, page_1, page_1, page_1, clipped_target, clipped_alignment_target, fresh_visible_target, opened, opened],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton"},
+        )
+        scroller = _ScrollService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                scroll_service_factory=_ScrollFactory(scroller),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+                discovery_output_function=output,
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
+        self.assertTrue(result["target_exact_match_detected"])
+        self.assertEqual(result["target_detected_in"], "hydration")
+        self.assertEqual(result["target_detection_row_path"], "W.1.4.11")
+        self.assertEqual(result["target_detection_canonical_title"], "Mock Data Insertion SQL")
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
+        self.assertEqual(reader.actions.count(("W.1.4", "AXScrollDown")), 1)
+        self.assertEqual(scroller.scrolls, [])
+        self.assertTrue(result["target_alignment_required"])
+        self.assertEqual(result["target_alignment_method"], "axscrolltovisible")
+        self.assertTrue(result["target_alignment_posted"])
+        self.assertEqual(result["target_alignment_row_path"], "W.1.4.12")
+        self.assertEqual(result["target_alignment_pre_visibility"], "partially_clipped")
+        self.assertEqual(result["target_alignment_post_visibility"], "fully_visible")
+        self.assertTrue(result["target_alignment_fresh_re_resolution_confirmed"])
+        self.assertEqual(reader.actions.count(("W.1.4.12", "AXScrollToVisible")), 1)
+        alignment_action_index = reader.actions.index(("W.1.4.12", "AXScrollToVisible"))
+        alignment_context = reader.action_contexts[alignment_action_index] or {}
+        self.assertEqual(alignment_context.get("kind"), "exact_project_chat_target_alignment")
+        self.assertEqual(alignment_context.get("target_path"), "W.1.4.12")
+        self.assertEqual(alignment_context.get("canonical_title"), "Mock Data Insertion SQL")
+        self.assertEqual(alignment_context.get("requested_title"), "Mock Data Insertion SQL")
+        self.assertEqual(alignment_context.get("visibility"), "partially_clipped")
+        self.assertFalse(alignment_context.get("alignment_already_posted"))
+        self.assertIn({"path": "W.1.4.12", "action": "AXScrollToVisible"}, result["actions_performed"])
+        self.assertIn("target_exact_match_detected: Mock Data Insertion SQL", output.lines)
+        self.assertEqual(sum(1 for line in output.lines if line.endswith(". Mock Data Insertion SQL")), 1)
+        self.assertTrue(result["fresh_target_re_resolution_confirmed"])
+        self.assertIn(("W.1.4.21", "AXPress"), reader.actions)
+        self.assertNotIn(("W.1.4.11", "AXPress"), reader.actions)
+        self.assertNotIn(("W.1.4.12", "AXPress"), reader.actions)
+
+    def test_partially_clipped_target_without_axscrolltovisible_fails_closed(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        clipped_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.11",
+            frame=(282, 650, 779, 65),
+        )
+        still_clipped_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.11",
+            frame=(282, 650, 779, 65),
+        )
+        reader = _TimedActionReader(
+            [page_1, page_1, page_1, page_1, clipped_target, still_clipped_target, still_clipped_target],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton"},
+        )
+        clicker = _ClickService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "target_alignment_not_supported")
+        self.assertTrue(result["target_exact_match_detected"])
+        self.assertTrue(result["fresh_target_re_resolution_confirmed"])
+        self.assertTrue(result["target_alignment_required"])
+        self.assertEqual(result["target_alignment_method"], "none")
+        self.assertFalse(result["target_alignment_posted"])
+        self.assertEqual(result["target_alignment_pre_visibility"], "partially_clipped")
+        self.assertEqual(result["target_alignment_post_visibility"], "partially_clipped")
+        self.assertEqual(result["target_detection_row_path"], "W.1.4.11")
+        self.assertNotIn(("W.1.4.11", "AXScrollToVisible"), reader.actions)
+        self.assertNotIn(("W.1.4.11", "AXPress"), reader.actions)
+        self.assertEqual(clicker.clicks, [])
+        self.assertEqual(result["calculated_global_point"], nav._xy_report(None))
+
+    def test_target_alignment_posted_true_only_after_successful_dispatch(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        clipped_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.11",
+            frame=(282, 650, 779, 65),
+            actions=("AXPress", "AXScrollToVisible"),
+        )
+        reader = _FailingAlignmentReader(
+            [page_1, page_1, page_1, page_1, clipped_target, clipped_target],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton"},
+        )
+        clicker = _ClickService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "target_alignment_action_post_failed")
+        self.assertTrue(result["target_alignment_required"])
+        self.assertEqual(result["target_alignment_method"], "axscrolltovisible")
+        self.assertFalse(result["target_alignment_posted"])
+        self.assertNotIn({"path": "W.1.4.11", "action": "AXScrollToVisible"}, result["actions_performed"])
+        self.assertEqual(reader.actions.count(("W.1.4.11", "AXScrollToVisible")), 1)
+        self.assertEqual(clicker.clicks, [])
+
+    def test_target_alignment_remaining_partially_clipped_fails_closed(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        clipped_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.11",
+            frame=(282, 650, 779, 65),
+            actions=("AXPress", "AXScrollToVisible"),
+        )
+        still_clipped_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.12",
+            frame=(282, 650, 779, 65),
+            actions=("AXPress", "AXScrollToVisible"),
+        )
+        reader = _TimedActionReader(
+            [page_1, page_1, page_1, page_1, clipped_target, clipped_target, still_clipped_target, still_clipped_target],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton"},
+        )
+        clicker = _ClickService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "target_alignment_posted_but_target_not_fully_visible")
+        self.assertTrue(result["target_alignment_posted"])
+        self.assertEqual(result["target_alignment_post_visibility"], "partially_clipped")
+        self.assertTrue(result["target_alignment_fresh_re_resolution_confirmed"])
+        self.assertEqual(reader.actions.count(("W.1.4.11", "AXScrollToVisible")), 1)
+        self.assertNotIn(("W.1.4.12", "AXPress"), reader.actions)
+        self.assertEqual(clicker.clicks, [])
+
+    def test_target_alignment_disappearing_target_fails_closed(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        clipped_target = _project_chat_page_with_single_row_frame(
+            "Mock Data Insertion SQL",
+            path="W.1.4.11",
+            frame=(282, 650, 779, 65),
+            actions=("AXPress", "AXScrollToVisible"),
+        )
+        missing_after_alignment = _scrollable_project_chat_page(["Another Chat"])
+        reader = _TimedActionReader(
+            [page_1, page_1, page_1, page_1, clipped_target, clipped_target, missing_after_alignment, missing_after_alignment],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton"},
+        )
+        clicker = _ClickService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "target_alignment_posted_but_target_not_re_resolved")
+        self.assertTrue(result["target_alignment_posted"])
+        self.assertEqual(result["target_alignment_post_visibility"], "not_visible")
+        self.assertFalse(result["target_alignment_fresh_re_resolution_confirmed"])
+        self.assertEqual(reader.actions.count(("W.1.4.11", "AXScrollToVisible")), 1)
+        self.assertNotIn(("W.1.4.11", "AXPress"), reader.actions)
+        self.assertEqual(clicker.clicks, [])
+
+    def test_comma_titles_fail_closed_without_axtitle_but_exact_axtitle_can_match(self) -> None:
+        description_only = _scrollable_project_chat_page(["Alpha, Bravo"])
+        description_plan = nav._project_chat_open_plan_from_snapshots(
+            description_only,
+            {"visited_nodes": len(description_only)},
+            {"window_source": "synthetic", "window": description_only[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Alpha, Bravo",
+            _DisplayFactory(_DisplayProbe()),
+        )
+        self.assertEqual(description_plan["status"], "chat_title_not_unambiguously_representable_by_accessibility")
+
+        explicit_title = _scrollable_project_chat_page([], list_actions=())
+        explicit_title.append(
+            nav.AXElementSnapshot(path="W.1.4.1", depth=3, role="AXButton", title="Alpha, Bravo", actions=("AXPress",), frame=(282, 176, 779, 65))
+        )
+        title_plan = nav._project_chat_open_plan_from_snapshots(
+            explicit_title,
+            {"visited_nodes": len(explicit_title)},
+            {"window_source": "synthetic", "window": explicit_title[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Alpha, Bravo",
+            _DisplayFactory(_DisplayProbe()),
+        )
+        self.assertEqual(title_plan["status"], "ready")
+        self.assertEqual(title_plan["matched_title_representation"], "exact_axtitle")
+
+    def test_diagnostic_visual_bands_exclude_giant_provider_scrollbar_and_page_controls(self) -> None:
+        result = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _visual_row_diagnostic_project_chat_page(),
+            (0, 0, 1200, 900),
+        )
+
+        band_paths = {path for band in result["visual_row_bands"] for path in band.get("node_paths", [])}
+        self.assertNotIn("W.1.4.0", band_paths)
+        self.assertNotIn("W.1.4.98", band_paths)
+        self.assertNotIn("W.1.4.99", band_paths)
+        self.assertTrue(any(path.startswith("W.1.4.1") for path in band_paths))
 
     def test_project_chat_scroll_target_is_confirmed_chat_list_not_sidebar_or_transcript(self) -> None:
         snapshots = _scrollable_project_chat_page(["Content Moderation"], list_actions=())
@@ -2932,7 +3812,7 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         page_2 = _scrollable_project_chat_page(["City-wise Restrictions"], row_offset=40)
         opened = _scroll_opened_conversation_snapshots("City-wise Restrictions")
         reader = _AutonomousReader(
-            [page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_2, opened, opened],
+            [page_1, page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_2, opened, opened],
             {"available": True, "path": "W.1.4.41", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
         )
 
@@ -2954,12 +3834,15 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertNotIn(("W.1.4.1", "AXPress"), reader.actions)
 
     def test_project_chat_scroll_fallback_uses_one_coregraphics_scroll_inside_chat_list(self) -> None:
-        page_1 = _scrollable_project_chat_page(["Content Moderation"], list_actions=())
-        page_2 = _scrollable_project_chat_page(["City-wise Restrictions"], row_offset=10, list_actions=())
+        # Overlapping multi-row viewports: page_2 shares its first two rows with
+        # page_1's last two rows, so a single overlap-safe micro-scroll advances
+        # to the target without triggering recovery.
+        page_1 = _scrollable_project_chat_page(["Alpha Chat", "Bravo Chat", "Charlie Chat"], list_actions=())
+        page_2 = _scrollable_project_chat_page(["Bravo Chat", "Charlie Chat", "City-wise Restrictions"], row_offset=10, list_actions=())
         opened = _scroll_opened_conversation_snapshots("City-wise Restrictions")
         reader = _AutonomousReader(
-            [page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_2, opened, opened],
-            {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
+            [page_1, page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_2, opened, opened],
+            {"available": True, "path": "W.1.4.13", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
         )
         scroller = _ScrollService()
 
@@ -2982,6 +3865,596 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertEqual(len(scroller.scrolls), 1)
         x, y, _delta = scroller.scrolls[0]
         self.assertTrue(nav._point_inside_frame((x, y), (282, 150, 779, 520)))
+
+    def test_live_project_chat_initial_valid_chats_print_once_in_order(self) -> None:
+        page = _scrollable_project_chat_page(["Content Moderation", "AWS Profile Photo Verification"])
+        output = _LiveOutputRecorder()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Missing Chat",
+                confirm_open_chat=False,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "dry_run_ready", "visible_chat_count": 0}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(_AutonomousReader([page], {"available": True, "path": "W.1.4.1"})),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+                discovery_output_function=output,
+            )
+
+        self.assertEqual(
+            output.lines,
+            ["Chats discovered:", "1. Content Moderation", "2. AWS Profile Photo Verification"],
+        )
+        self.assertEqual(result["unique_chat_titles_printed"], 2)
+
+    def test_live_project_chat_newly_exposed_chats_append_once_without_duplicates(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation", "AWS Profile Photo Verification"])
+        page_2 = _scrollable_project_chat_page(["AWS Profile Photo Verification", "Create Hangout Draft Persistence"], row_offset=10)
+        output = _LiveOutputRecorder()
+        reader = _AutonomousReader([page_1, page_1, page_1, page_1, page_2, page_2, page_2], {"available": True, "path": "W.1.4.11"})
+
+        with mock.patch.object(nav, "MAX_PROJECT_CHAT_SEARCH_CYCLES", 1), mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Missing Chat",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 2}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+                discovery_output_function=output,
+            )
+
+        self.assertIn(["Chats discovered after cycle 1:", "3. Create Hangout Draft Persistence"], output.blocks)
+        self.assertEqual(output.lines.count("2. AWS Profile Photo Verification"), 1)
+        self.assertEqual(result["unique_chat_titles_printed"], 3)
+
+    def test_live_project_chat_does_not_print_composer_transcript_or_sidebar_controls(self) -> None:
+        page = _scrollable_project_chat_page(["Content Moderation"]) + [
+            nav.AXElementSnapshot(path="W.0.1", depth=2, role="AXButton", title="New chat", actions=("AXPress",), frame=(20, 20, 120, 32)),
+            nav.AXElementSnapshot(path="W.1.5.1", depth=3, role="AXStaticText", value="Transcript text", frame=(300, 720, 300, 24)),
+            nav.AXElementSnapshot(path="W.1.6", depth=2, role="AXTextArea", title="Message ChatGPT", frame=(320, 820, 620, 44)),
+        ]
+        output = _LiveOutputRecorder()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Missing Chat",
+                confirm_open_chat=False,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "dry_run_ready", "visible_chat_count": 0}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(_AutonomousReader([page], {"available": True, "path": "W.1.4.1"})),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+                discovery_output_function=output,
+            )
+
+        self.assertEqual(output.lines, ["Chats discovered:", "1. Content Moderation"])
+        self.assertNotIn("New chat", "\n".join(output.lines))
+        self.assertNotIn("Transcript text", "\n".join(output.lines))
+        self.assertNotIn("Message ChatGPT", "\n".join(output.lines))
+
+    def test_target_found_in_initial_row_posts_zero_scroll_events(self) -> None:
+        page = _scrollable_project_chat_page(["City-wise Restrictions"])
+        opened = _scroll_opened_conversation_snapshots("City-wise Restrictions")
+        reader = _AutonomousReader([page, page, opened, opened], {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}})
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="City-wise Restrictions",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_via_axpress")
+        self.assertTrue(result["target_exact_match_detected"])
+        self.assertEqual(result["target_detected_in"], "initial")
+        self.assertEqual(result["scroll_pulses_posted"], 0)
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
+
+    def test_target_found_during_hydration_stops_window_and_posts_no_further_scrolls(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        target_page = _scrollable_project_chat_page(["Mock Data Insertion SQL"], row_offset=10)
+        opened = _scroll_opened_conversation_snapshots("Mock Data Insertion SQL")
+        reader = _TimedActionReader(
+            [page_1, page_1, page_1, page_1, target_page, target_page, opened, opened],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "Mock Data Insertion SQL, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Mock Data Insertion SQL",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
+        self.assertEqual(result["target_detected_in"], "hydration")
+        self.assertEqual(result["scroll_pulses_posted"], 1)
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
+        self.assertEqual(reader.actions[-1], ("W.1.4.11", "AXPress"))
+        self.assertGreaterEqual(reader.action_collect_calls[-1], 5)
+
+    def test_target_found_in_settled_post_scroll_row_posts_zero_additional_scrolls(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        target_page = _scrollable_project_chat_page(["Settled Target"], row_offset=10)
+        opened = _scroll_opened_conversation_snapshots("Settled Target")
+        reader = _AutonomousReader([page_1, page_1, page_1, target_page, opened, opened], {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "Settled Target, preview text must not drive matching"}})
+        ready_plan = nav._project_chat_open_plan_from_snapshots(
+            target_page,
+            {"visited_nodes": len(target_page)},
+            {"window_source": "synthetic", "window": target_page[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Settled Target",
+            _DisplayFactory(_DisplayProbe()),
+        )
+
+        initial_plan = nav._project_chat_open_plan_from_snapshots(
+            page_1,
+            {"visited_nodes": len(page_1)},
+            {"window_source": "synthetic", "window": page_1[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Settled Target",
+            _DisplayFactory(_DisplayProbe()),
+        )
+
+        initial_observation = {
+            "classification": "list_stable_no_change",
+            "plan": initial_plan,
+            "plans": [initial_plan],
+            "states": [nav._project_chat_effective_list_state(initial_plan)],
+            "new_accessibility_rows": 0,
+            "no_meaningful_change": True,
+            "reset_then_changed": False,
+            "hydration_events_observed": 0,
+            "reset_events_observed": 0,
+            "settled": True,
+            "meaningful_change": False,
+            "target_found": False,
+            "samples_taken": 1,
+            "target_match_checked_on_samples": 1,
+        }
+
+        def settled_observation():
+            return {
+                "classification": "list_advanced",
+                "plan": ready_plan,
+                "plans": [ready_plan],
+                "states": [nav._project_chat_effective_list_state(ready_plan)],
+                "new_accessibility_rows": 1,
+                "no_meaningful_change": False,
+                "reset_then_changed": False,
+                "hydration_events_observed": 1,
+                "reset_events_observed": 0,
+                "settled": True,
+                "meaningful_change": True,
+                "target_found": False,
+                "samples_taken": 1,
+                "target_match_checked_on_samples": 1,
+            }
+
+        with mock.patch.object(nav, "_observe_project_chat_list_hydration", side_effect=[initial_observation, settled_observation()]), mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Settled Target",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["target_detected_in"], "settled")
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
+
+    def test_target_found_during_recovery_posts_no_further_recovery_or_forward_scrolls(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Alpha", "Bravo", "Charlie"], list_actions=())
+        jump = _scrollable_project_chat_page(["Xray", "Yankee", "Zulu"], row_offset=10, list_actions=())
+        target_page = _scrollable_project_chat_page(["Recovery Target"], row_offset=20, list_actions=())
+        opened = _scroll_opened_conversation_snapshots("Recovery Target")
+        reader = _AutonomousReader(
+            [page_1, page_1, page_1, page_1, jump, jump, jump, target_page, target_page, opened, opened],
+            {"available": True, "path": "W.1.4.21", "role": "AXButton", "title": {"literal": "Recovery Target, preview text must not drive matching"}},
+        )
+        scroller = _ScrollService()
+        result = self._run_open_chatgpt_project_chat(reader, chat_title="Recovery Target", scroller=scroller)
+
+        self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
+        self.assertEqual(result["target_detected_in"], "recovery")
+        self.assertEqual(result["scroll_pulses_after_target_detection"], 0)
+        self.assertEqual(result["scroll_pulses_posted"], 1)
+        self.assertEqual(result["recovery_scroll_pulses_posted"], 1)
+        self.assertEqual(len(scroller.scrolls), 2)
+
+    def test_target_disappearance_before_fresh_re_resolution_fails_closed_without_click(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Content Moderation"])
+        target_page = _scrollable_project_chat_page(["Transient Target"], row_offset=10)
+        missing_page = _scrollable_project_chat_page(["Other Chat"], row_offset=20)
+        reader = _TimedActionReader(
+            [page_1, page_1, page_1, page_1, target_page, missing_page, missing_page],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "Transient Target, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Transient Target",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "target_detected_but_not_stably_re_resolved")
+        self.assertTrue(result["target_exact_match_detected"])
+        self.assertNotIn(("W.1.4.11", "AXPress"), reader.actions)
+
+    def test_detected_target_re_resolution_retry_can_proceed_to_existing_axpress_path(self) -> None:
+        target_page = _scrollable_project_chat_page(["Patient Target"])
+        missing_page = _scrollable_project_chat_page(["Other Chat"], row_offset=10)
+        opened = _scroll_opened_conversation_snapshots("Patient Target")
+        reader = _TimedActionReader(
+            [target_page, missing_page, target_page, opened, opened],
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Patient Target, preview text must not drive matching"}},
+        )
+        sleeper = _SleepRecorder()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Patient Target",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=sleeper,
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_via_axpress")
+        self.assertEqual(result["final_re_resolution_retry_attempts"], 1)
+        self.assertEqual(result["final_re_resolution_max_retries"], 2)
+        self.assertTrue(result["final_re_resolution_re_resolved"])
+        self.assertTrue(result["final_re_resolution_action_posted"])
+        self.assertTrue(result["chat_open_action_posted"])
+        self.assertIn(("W.1.4.1", "AXPress"), reader.actions)
+        self.assertIn(nav.PROJECT_CHAT_FINAL_RE_RESOLUTION_RETRY_DELAY_SECONDS, sleeper.calls)
+
+    def test_detected_target_re_resolution_retry_remains_bounded_when_missing(self) -> None:
+        target_page = _scrollable_project_chat_page(["Patient Target"])
+        missing_page = _scrollable_project_chat_page(["Other Chat"], row_offset=10)
+        reader = _TimedActionReader(
+            [target_page, missing_page, missing_page, missing_page, target_page],
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Patient Target, preview text must not drive matching"}},
+        )
+        sleeper = _SleepRecorder()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Patient Target",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=sleeper,
+            )
+
+        self.assertEqual(result["outcome"], "target_detected_but_not_stably_re_resolved")
+        self.assertEqual(result["final_re_resolution_retry_attempts"], 2)
+        self.assertFalse(result["final_re_resolution_re_resolved"])
+        self.assertFalse(result["final_re_resolution_action_posted"])
+        self.assertFalse(result["chat_open_action_posted"])
+        self.assertNotIn(("W.1.4.1", "AXPress"), reader.actions)
+        self.assertEqual(sleeper.calls.count(nav.PROJECT_CHAT_FINAL_RE_RESOLUTION_RETRY_DELAY_SECONDS), 2)
+        self.assertEqual(reader.collect_calls, 4)
+
+    def test_detected_target_re_resolution_retry_fails_closed_when_ambiguous(self) -> None:
+        target_page = _scrollable_project_chat_page(["Patient Target"])
+        missing_page = _scrollable_project_chat_page(["Other Chat"], row_offset=10)
+        ambiguous_page = _scrollable_project_chat_page(["Patient Target", "Patient Target"], row_offset=20)
+        reader = _TimedActionReader(
+            [target_page, missing_page, ambiguous_page],
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Patient Target, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Patient Target",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "target_detected_but_not_stably_re_resolved")
+        self.assertEqual(result["final_re_resolution_retry_attempts"], 1)
+        self.assertFalse(result["final_re_resolution_re_resolved"])
+        self.assertFalse(result["chat_open_action_posted"])
+        self.assertEqual(reader.actions, [])
+
+    def test_detected_target_re_resolution_retry_proceeds_when_only_row_path_changes(self) -> None:
+        target_page = _scrollable_project_chat_page(["Patient Target"])
+        missing_page = _scrollable_project_chat_page(["Other Chat"], row_offset=10)
+        changed_path_page = _scrollable_project_chat_page(["Patient Target"], row_offset=20)
+        opened = _scroll_opened_conversation_snapshots("Patient Target")
+        reader = _TimedActionReader(
+            [target_page, missing_page, changed_path_page, opened, opened],
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Patient Target, preview text must not drive matching"}},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Patient Target",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_via_axpress")
+        self.assertEqual(result["target_detection_row_path"], "W.1.4.1")
+        self.assertEqual(result["matched_chat_row"]["row_path"], "W.1.4.21")
+        self.assertEqual(result["final_re_resolution_retry_attempts"], 1)
+        self.assertTrue(result["final_re_resolution_re_resolved"])
+        self.assertTrue(result["chat_open_action_posted"])
+        self.assertIn(("W.1.4.21", "AXPress"), reader.actions)
+
+    def test_final_re_resolution_retry_source_is_bounded_and_not_deadline_based(self) -> None:
+        source = Path(nav.__file__).read_text(encoding="utf-8")
+        retry_source = source[
+            source.index("def _retry_detected_project_chat_fresh_re_resolution"):
+            source.index("def _project_chat_detected_target_still_unresolved")
+        ]
+
+        self.assertIn("PROJECT_CHAT_FINAL_RE_RESOLUTION_MAX_RETRIES", retry_source)
+        self.assertIn("range(1, max_retries + 1)", retry_source)
+        self.assertNotIn("while ", retry_source)
+        self.assertNotIn("time.monotonic", retry_source)
+        self.assertNotIn("MAX_PROJECT_CHAT_SEARCH_ELAPSED_SECONDS", retry_source)
+
+    def test_identity_not_confirmed_prints_no_discovered_chats_and_posts_no_action(self) -> None:
+        output = _LiveOutputRecorder()
+        reader = _AutonomousReader([_scrollable_project_chat_page(["Content Moderation"])], {"available": True, "path": "W.1.4.1"})
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Content Moderation",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": False, "outcome": "project_chat_list_identity_not_confirmed", "visible_chat_count": 0}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+                discovery_output_function=output,
+            )
+
+        self.assertEqual(result["outcome"], "project_chat_list_identity_not_confirmed")
+        self.assertEqual(output.lines, [])
+        self.assertEqual(reader.actions, [])
+        self.assertEqual(result["unique_chat_titles_printed"], 0)
+
+    # --- Focused tests: overlap-safe scan continuity and valid termination ----
+
+    def _run_open_chatgpt_project_chat(self, reader, *, chat_title, scroller=None, max_cycles=None):
+        patches = [mock.patch.object(nav.sys, "platform", "darwin")]
+        if max_cycles is not None:
+            patches.append(mock.patch.object(nav, "MAX_PROJECT_CHAT_SEARCH_CYCLES", max_cycles))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            kwargs = dict(
+                project_title="PTG Assistant",
+                chat_title=chat_title,
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+            if scroller is not None:
+                kwargs["scroll_service_factory"] = _ScrollFactory(scroller)
+            return nav.open_chatgpt_project_chat(**kwargs)
+
+    @staticmethod
+    def _effective_state(page: list) -> dict:
+        plan = nav._project_chat_open_plan_from_snapshots(
+            page,
+            {"visited_nodes": len(page)},
+            {"window_source": "synthetic", "window": page[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Unused Target",
+            _DisplayFactory(_DisplayProbe()),
+        )
+        return nav._project_chat_effective_list_state(plan)
+
+    def test_focused_coregraphics_delta_derived_from_row_height_not_minus_360(self) -> None:
+        snapshots = _scrollable_project_chat_page(["Content Moderation"], list_actions=())
+        plan = nav._project_chat_open_plan_from_snapshots(
+            snapshots, {"visited_nodes": len(snapshots)}, {"window_source": "synthetic", "window": snapshots[0]},
+            (0, 0, 1200, 900), (0, 0, 1200, 900), "PTG Assistant", "City-wise Restrictions", _DisplayFactory(_DisplayProbe()),
+        )
+        target = nav._project_chat_scroll_target(plan)
+        self.assertEqual(target["method"], "coregraphics_scroll")
+        # Row height is 65 -> 0.75 * 65 = 48.75 -> -49 (not the legacy fixed -360).
+        self.assertEqual(target["median_visible_row_height"], 65.0)
+        self.assertEqual(target["computed_scroll_delta_y"], -49)
+        self.assertNotEqual(target["computed_scroll_delta_y"], -360)
+        # A different row height yields a different delta; clamps are honored.
+        self.assertEqual(nav._project_chat_computed_scroll_delta_y(120.0), -90)
+        self.assertEqual(nav._project_chat_computed_scroll_delta_y(2.0), -nav.PROJECT_CHAT_SCROLL_MIN_PIXEL_DELTA)
+        self.assertEqual(nav._project_chat_computed_scroll_delta_y(10000.0), -nav.PROJECT_CHAT_SCROLL_MAX_PIXEL_DELTA)
+
+    def test_focused_two_ordered_shared_rows_establish_continuity(self) -> None:
+        overlap = nav._project_chat_viewport_overlap({"row_texts": ("A", "B", "C")}, {"row_texts": ("B", "C", "D")})
+        self.assertTrue(overlap["adjacency_confirmed"])
+        self.assertEqual(overlap["overlap_row_count"], 2)
+        # A single non-adjacent shared row is not sufficient.
+        partial = nav._project_chat_viewport_overlap({"row_texts": ("A", "B", "C")}, {"row_texts": ("X", "B", "Z")})
+        self.assertFalse(partial["adjacency_confirmed"])
+        self.assertEqual(partial["overlap_row_count"], 1)
+        # Short viewports use the strongest feasible rule (all available rows).
+        short = nav._project_chat_viewport_overlap({"row_texts": ("A",)}, {"row_texts": ("A",)})
+        self.assertTrue(short["adjacency_confirmed"])
+
+    def test_focused_overlap_identity_is_row_text_not_ax_path(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Alpha", "Bravo", "Charlie"])
+        page_2 = _scrollable_project_chat_page(["Bravo", "Charlie", "Delta"], row_offset=50)
+        overlap = nav._project_chat_viewport_overlap(self._effective_state(page_1), self._effective_state(page_2))
+        # page_2 rows live at entirely different AX paths (row_offset=50) yet
+        # overlap is detected purely by normalized row text.
+        self.assertTrue(overlap["adjacency_confirmed"])
+        self.assertGreaterEqual(overlap["overlap_row_count"], 2)
+
+    def test_focused_target_in_overlapping_viewport_opens_immediately(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Alpha Chat", "Bravo Chat", "Charlie Chat"], list_actions=())
+        page_2 = _scrollable_project_chat_page(["Bravo Chat", "Charlie Chat", "City-wise Restrictions"], row_offset=10, list_actions=())
+        opened = _scroll_opened_conversation_snapshots("City-wise Restrictions")
+        reader = _AutonomousReader(
+            [page_1, page_1, page_1, page_1, page_2, page_2, page_2, page_2, page_2, opened, opened],
+            {"available": True, "path": "W.1.4.13", "role": "AXButton", "title": {"literal": "City-wise Restrictions, preview text must not drive matching"}},
+        )
+        scroller = _ScrollService()
+        result = self._run_open_chatgpt_project_chat(reader, chat_title="City-wise Restrictions", scroller=scroller)
+        self.assertEqual(result["outcome"], "chat_opened_after_scrolling_via_axpress")
+        self.assertEqual(result["scan_continuity"], "confirmed")
+        self.assertTrue(result["overlap_adjacency_confirmed"])
+        self.assertEqual(result["recovery_scroll_pulses_posted"], 0)
+        self.assertEqual(len(scroller.scrolls), 1)
+        self.assertIn(("W.1.4.13", "AXPress"), reader.actions)
+
+    def test_focused_overlap_gap_triggers_recovery_not_blind_forward(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Alpha", "Bravo", "Charlie"], list_actions=())
+        jump = _scrollable_project_chat_page(["Xray", "Yankee", "Zulu"], row_offset=10, list_actions=())
+        reader = _AutonomousReader(
+            [page_1] * 8 + [jump],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "Xray, preview text must not drive matching"}},
+        )
+        scroller = _ScrollService()
+        result = self._run_open_chatgpt_project_chat(reader, chat_title="Missing Chat", scroller=scroller, max_cycles=4)
+        # A reverse (positive-delta) recovery pulse was posted instead of blindly
+        # scrolling further forward over a skipped range.
+        self.assertGreaterEqual(result["recovery_scroll_pulses_posted"], 1)
+        self.assertTrue(any(delta > 0 for _x, _y, delta in scroller.scrolls))
+        self.assertTrue(any("recovery_required" in summary or "reverse_micro_scroll" in summary for summary in result["search_cycle_summaries"]))
+
+    def test_focused_no_progress_cannot_fire_while_continuity_unconfirmed(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Alpha", "Bravo", "Charlie"], list_actions=())
+        jump = _scrollable_project_chat_page(["Xray", "Yankee", "Zulu"], row_offset=10, list_actions=())
+        reader = _AutonomousReader(
+            [page_1] * 8 + [jump],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "Xray, preview text must not drive matching"}},
+        )
+        result = self._run_open_chatgpt_project_chat(reader, chat_title="Missing Chat", scroller=_ScrollService(), max_cycles=4)
+        self.assertEqual(result["outcome"], "chat_list_scan_continuity_not_confirmed")
+        self.assertNotEqual(result["outcome"], "chat_list_scroll_no_progress")
+        self.assertEqual(result["end_of_list_state"], "unknown")
+
+    def test_focused_anchor_end_requires_two_unchanged_forward_cycles(self) -> None:
+        page = _scrollable_project_chat_page(["Alpha", "Bravo", "Charlie"])
+        reader = _AutonomousReader(
+            [page] * 12,
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Alpha, preview text must not drive matching"}},
+        )
+        result = self._run_open_chatgpt_project_chat(reader, chat_title="Missing Chat")
+        self.assertEqual(result["outcome"], "chat_list_end_reached_without_match")
+        self.assertEqual(result["end_of_list_state"], "confirmed")
+        self.assertEqual(result["scroll_pulses_posted"], 2)
+
+        # A single forward cycle is not enough to conclude the end.
+        reader_one = _AutonomousReader(
+            [page] * 12,
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Alpha, preview text must not drive matching"}},
+        )
+        one_cycle = self._run_open_chatgpt_project_chat(reader_one, chat_title="Missing Chat", max_cycles=1)
+        self.assertNotEqual(one_cycle["outcome"], "chat_list_end_reached_without_match")
+
+    def test_focused_insufficient_continuity_never_concludes_not_found(self) -> None:
+        page_1 = _scrollable_project_chat_page(["Alpha", "Bravo", "Charlie"], list_actions=())
+        jump = _scrollable_project_chat_page(["Xray", "Yankee", "Zulu"], row_offset=10, list_actions=())
+        reader = _AutonomousReader(
+            [page_1] * 8 + [jump],
+            {"available": True, "path": "W.1.4.11", "role": "AXButton", "title": {"literal": "Xray, preview text must not drive matching"}},
+        )
+        result = self._run_open_chatgpt_project_chat(reader, chat_title="Missing Chat", scroller=_ScrollService(), max_cycles=4)
+        self.assertEqual(result["outcome"], "chat_list_scan_continuity_not_confirmed")
+        self.assertNotEqual(result["outcome"], "chat_not_found_in_project")
+        self.assertEqual(result["scan_continuity"], "not_confirmed")
+
+    def test_focused_strict_matching_axpress_and_safety_boundaries_unchanged(self) -> None:
+        # Strict exact / exact-prefix matching and comma fail-closed are intact.
+        comma_row = {"accessibility_row_text": "City-wise Restrictions, preview text must not drive matching"}
+        self.assertTrue(nav._project_chat_row_match_representation(comma_row, "City-wise Restrictions")["matched"])
+        self.assertFalse(nav._project_chat_row_match_representation(comma_row, "preview text must not drive matching")["matched"])
+        # A requested title containing a comma stays fail-closed at the plan level.
+        comma_plan = nav._project_chat_open_plan_from_snapshots(
+            _scrollable_project_chat_page(["Alpha"]),
+            {"visited_nodes": 1},
+            {"window_source": "synthetic", "window": _scrollable_project_chat_page(["Alpha"])[0]},
+            (0, 0, 1200, 900),
+            (0, 0, 1200, 900),
+            "PTG Assistant",
+            "Alpha, Bravo",
+            _DisplayFactory(_DisplayProbe()),
+        )
+        self.assertEqual(comma_plan["status"], "chat_title_not_unambiguously_representable_by_accessibility")
+        # AXPress remains preferred when the row exposes it.
+        row_node = nav.AXElementSnapshot(path="W.1.4.1", depth=3, role="AXButton", actions=("AXPress",))
+        title_node = nav.AXElementSnapshot(path="W.1.4.1.1", depth=4, role="AXStaticText")
+        self.assertEqual(nav._project_chat_axpress_target(title_node, row_node)["relation"], "row_node")
+        # The scan/recovery slice contains no keyboard, OCR, browser, or text-entry.
+        source = Path(nav.__file__).read_text(encoding="utf-8")
+        slice_source = source[
+            source.index("def _bounded_project_chat_scroll_search"):
+            source.index("def _project_chat_scroll_search_result(")
+        ]
+        for token in ("keyDown", "CGEventKeyboardEvent", "paste_clipboard", "press_enter", "screenshot", "ocr", "playwright", "selenium", "write_text"):
+            self.assertNotIn(token, slice_source)
 
     def test_project_chat_open_prefers_axpress_and_requires_post_action_evidence(self) -> None:
         reader = _AutonomousReader(
@@ -3275,6 +4748,89 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertIn("AXTitle: Content Moderation, preview", output)
         self.assertIn("actions_performed: []", output)
 
+    def test_diagnose_project_chat_rows_cli_dispatches_read_only_visual_row_diagnostic(self) -> None:
+        stdout = io.StringIO()
+        result = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _visual_row_diagnostic_project_chat_page(),
+            (0, 0, 1200, 900),
+            contains_title="Mock Data Insertion SQL",
+        )
+        result["app_name"] = "ChatGPT"
+        result["pid_present"] = True
+
+        with (
+            mock.patch.object(
+                cli.sys,
+                "argv",
+                [
+                    "agent-loop",
+                    "diagnose-chatgpt-project-chat-rows",
+                    "--project-title",
+                    "PTG Assistant",
+                    "--contains-title",
+                    "Mock Data Insertion SQL",
+                ],
+            ),
+            mock.patch.object(cli, "diagnose_chatgpt_project_chat_rows", return_value=result) as diagnose,
+            contextlib.redirect_stdout(stdout),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            cli.main()
+
+        self.assertEqual(raised.exception.code, 0)
+        diagnose.assert_called_once_with(
+            app_name="ChatGPT",
+            project_title="PTG Assistant",
+            contains_title="Mock Data Insertion SQL",
+            max_depth=16,
+            max_nodes=900,
+        )
+        output = stdout.getvalue()
+        for heading in (
+            "ChatGPT Project Chat Row Diagnostic",
+            "Project/list identity",
+            "Confirmed list viewport",
+            "Current resolver accepted rows",
+            "Visual row bands",
+            "Band candidate evidence",
+            "Current resolver comparison",
+            "Experimental canonical titles",
+            "Summary",
+        ):
+            self.assertIn(heading, output)
+        self.assertIn("filtered_bands_printed: 1", output)
+        self.assertIn("final_outcome: diagnostic_ready", output)
+        self.assertIn("actions_performed: []", output)
+
+    def test_existing_project_chat_open_cli_dispatch_remains_unchanged(self) -> None:
+        result = {"ok": False, "outcome": "dry_run_ready", "project_title": "PTG Assistant", "chat_title": "Content Moderation"}
+
+        with (
+            mock.patch.object(
+                cli.sys,
+                "argv",
+                [
+                    "agent-loop",
+                    "open-chatgpt-project-chat",
+                    "--project-title",
+                    "PTG Assistant",
+                    "--chat-title",
+                    "Content Moderation",
+                ],
+            ),
+            mock.patch.object(cli, "open_chatgpt_project_chat", return_value=result) as open_chat,
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            cli.main()
+
+        open_chat.assert_called_once()
+        _, kwargs = open_chat.call_args
+        self.assertEqual(kwargs["project_title"], "PTG Assistant")
+        self.assertEqual(kwargs["chat_title"], "Content Moderation")
+        self.assertFalse(kwargs["confirm_open_chat"])
+
     def test_project_chat_open_cli_confirmation_notice_and_dispatch(self) -> None:
         stdout = io.StringIO()
         result = {
@@ -3430,7 +4986,9 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
             "visible_chat_count": 3,
             "targeting_visible_chat_count": 3,
             "search_cycles_attempted": 2,
-            "max_search_cycles": 12,
+            "max_search_cycles": 60,
+            "configured_max_search_cycles": 60,
+            "configured_max_search_elapsed_seconds": 90.0,
             "scroll_pulses_posted": 2,
             "scroll_method_used": "semantic_ax_scroll",
             "initial_hydration_status": "list_stable_no_change",
@@ -3438,10 +4996,24 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
             "reset_events_observed": 1,
             "unique_accessibility_rows_seen": 9,
             "unique_effective_viewports_seen": 3,
+            "new_accessibility_rows_seen": 6,
+            "target_match_checked_on_samples": 8,
+            "hydration_samples_taken": 6,
+            "settled_cycles_completed": 2,
+            "progressful_cycles_completed": 1,
+            "target_found_during_hydration_cycle": 2,
             "target_found_after_scrolling": False,
             "end_of_list_state": "unknown",
+            "computed_scroll_delta_y": -48,
+            "median_visible_row_height": 64.0,
+            "previous_settled_viewport_signature": "viewport:23:12:64:43|more_below:True",
+            "current_settled_viewport_signature": "viewport:23:18:64:43|more_below:True",
+            "overlap_row_count": 2,
+            "overlap_adjacency_confirmed": True,
+            "scan_continuity": "confirmed",
+            "recovery_scroll_pulses_posted": 0,
             "search_elapsed_seconds": 2.4,
-            "search_cycle_summaries": ["cycle_2: scroll_posted -> list_reset_then_changed -> 4_new_rows_observed"],
+            "search_cycle_summaries": ["cycle_2: micro_scroll_posted -> overlap_confirmed -> 4_new_rows -> settled"],
             "matched_chat_row": {},
             "post_action_evidence": {},
             "actions_performed": [{"path": "W.1.4", "action": "AXScrollDown"}],
@@ -3453,16 +5025,39 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
 
         text = stdout.getvalue()
         self.assertIn("search_cycles_attempted: 2", text)
-        self.assertIn("max_search_cycles: 12", text)
+        self.assertIn("max_search_cycles: 60", text)
+        self.assertIn("configured_max_search_cycles: 60", text)
+        self.assertIn("configured_max_search_elapsed_seconds: 90.0", text)
         self.assertIn("scroll_pulses_posted: 2", text)
         self.assertIn("initial_hydration_status: list_stable_no_change", text)
         self.assertIn("hydration_events_observed: 1", text)
         self.assertIn("reset_events_observed: 1", text)
         self.assertIn("unique_accessibility_rows_seen: 9", text)
         self.assertIn("unique_effective_viewports_seen: 3", text)
+        self.assertIn("new_accessibility_rows_seen: 6", text)
+        self.assertIn("target_match_checked_on_samples: 8", text)
+        self.assertIn("hydration_samples_taken: 6", text)
+        self.assertIn("settled_cycles_completed: 2", text)
+        self.assertIn("progressful_cycles_completed: 1", text)
         self.assertIn("end_of_list_state: unknown", text)
+        self.assertIn("computed_scroll_delta_y: -48", text)
+        self.assertIn("median_visible_row_height: 64.0", text)
+        self.assertIn("scan_continuity: confirmed", text)
+        self.assertIn("recovery_scroll_pulses_posted: 0", text)
+        self.assertIn("overlap_row_count: 2", text)
+        self.assertIn("overlap_adjacency_confirmed: True", text)
+        self.assertIn("current_settled_viewport_signature: viewport:23:18:64:43|more_below:True", text)
         self.assertIn("search_elapsed_seconds: 2.4", text)
-        self.assertIn("cycle_2: scroll_posted -> list_reset_then_changed -> 4_new_rows_observed", text)
+        self.assertIn("target_found_during_hydration_cycle: 2", text)
+        self.assertIn("cycle_2: micro_scroll_posted -> overlap_confirmed -> 4_new_rows -> settled", text)
+
+    def test_project_chat_live_discovery_printer_flushes_incrementally(self) -> None:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), mock.patch.object(stdout, "flush", wraps=stdout.flush) as flushed:
+            cli._print_live_project_chat_discovery_lines(["Chats discovered:", "1. Content Moderation"])
+
+        self.assertEqual(stdout.getvalue(), "Chats discovered:\n1. Content Moderation\n")
+        flushed.assert_called()
 
     def test_autonomous_command_parser_is_separate_from_manual_calibration(self) -> None:
         parser = cli._build_parser()
@@ -3640,7 +5235,10 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
                 sleep_function=_SleepRecorder(),
             )
 
-        self.assertEqual(result["outcome"], "project_opened_but_visible_chats_not_resolved")
+        # The project content pane is present but no Chats-list container can be
+        # forward-resolved, so the identity gate fails closed without any extra
+        # interaction.
+        self.assertEqual(result["outcome"], "project_chat_list_identity_not_confirmed")
         self.assertEqual(result["visible_chat_count"], 0)
         self.assertEqual(reader.actions, [("W.1.3.3", "AXPress")])
         self.assertEqual(clicker.clicks, [])
@@ -3983,6 +5581,297 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         ]
         for token in ("CGEventKeyboard", "ScrollWheel", "drag", "double", "osascript", "AppleScript", "clipboard", "selenium", "playwright"):
             self.assertNotIn(token, frame_source)
+
+    # --- Project Chats-list identity gate -------------------------------------
+
+    def test_identity_gate_rejects_composer_controls_as_project_chat_rows(self) -> None:
+        # Composer controls placed outside the resolved Chats-list container must
+        # never be admitted alongside the real rows.
+        snapshots = _project_visible_chats_snapshots(partial_last_row=False) + [
+            nav.AXElementSnapshot(path="W.2.20", depth=2, role="AXButton", title="Attach", actions=("AXPress",), frame=(340, 820, 60, 28)),
+            nav.AXElementSnapshot(path="W.2.21", depth=2, role="AXButton", title="Work with Apps", actions=("AXPress",), frame=(410, 820, 130, 28)),
+        ]
+        result = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", snapshots, (0, 0, 1200, 900))
+        self.assertEqual(result["status"], "visible_chats_found")
+        titles = [chat["title"] for chat in result["visible_chats"]]
+        self.assertNotIn("Attach", titles)
+        self.assertNotIn("Work with Apps", titles)
+        self.assertEqual(result["valid_project_chat_row_count"], 3)
+
+        # And when composer controls are the *only* candidates inside a list-shaped
+        # frame, the gate fails closed because they are below the minimum row height.
+        composer_only = _project_content_shell_without_list([
+            nav.AXElementSnapshot(path="W.2.5", depth=2, role="AXScrollArea", subrole="AXList", frame=(320, 140, 760, 520)),
+            nav.AXElementSnapshot(path="W.2.5.1", depth=3, role="AXButton", title="Attach", actions=("AXPress",), frame=(330, 150, 60, 15)),
+            nav.AXElementSnapshot(path="W.2.5.2", depth=3, role="AXButton", title="Work with Apps", actions=("AXPress",), frame=(330, 172, 130, 15)),
+        ])
+        contaminated = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", composer_only, (0, 0, 1200, 900))
+        self.assertEqual(contaminated["status"], "project_chat_list_identity_not_confirmed")
+        self.assertEqual(contaminated["project_chat_list_identity"], "not_confirmed")
+        self.assertIn("candidate_row_height_below_minimum", contaminated["identity_failure_reasons"])
+        self.assertEqual(contaminated["visible_chats"], [])
+
+    def test_identity_gate_never_accepts_whole_window_as_chats_list_container(self) -> None:
+        snapshots = _project_content_shell_without_list([
+            nav.AXElementSnapshot(path="W.2.5", depth=2, role="AXButton", title="Real Looking Chat One", actions=("AXPress",), frame=(320, 160, 760, 65)),
+            nav.AXElementSnapshot(path="W.2.6", depth=2, role="AXButton", title="Real Looking Chat Two", actions=("AXPress",), frame=(320, 232, 760, 65)),
+        ])
+        result = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", snapshots, (0, 0, 1200, 900))
+        self.assertEqual(result["status"], "project_chat_list_identity_not_confirmed")
+        self.assertIn("no_forward_resolved_chats_list_container", result["identity_failure_reasons"])
+        self.assertEqual(result["project_chat_list_container_path"], "")
+        self.assertNotEqual(result["project_chat_list_container_path"], "W")
+
+    def test_identity_gate_rejects_rows_outside_resolved_container(self) -> None:
+        snapshots = _project_visible_chats_snapshots(partial_last_row=False) + [
+            nav.AXElementSnapshot(path="W.2.30", depth=2, role="AXButton", title="Outside Container Row", actions=("AXPress",), frame=(320, 760, 760, 65)),
+        ]
+        result = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", snapshots, (0, 0, 1200, 900))
+        self.assertEqual(result["status"], "visible_chats_found")
+        titles = [chat["title"] for chat in result["visible_chats"]]
+        self.assertNotIn("Outside Container Row", titles)
+        self.assertEqual(result["valid_project_chat_row_count"], 3)
+        self.assertGreaterEqual(result["excluded_candidate_counts"].get("outside_forward_resolved_chats_list", 0), 1)
+
+    def test_identity_gate_rejects_rows_below_minimum_height(self) -> None:
+        page = _scrollable_project_chat_page(["Alpha Chat", "Beta Chat"])
+        page.append(
+            nav.AXElementSnapshot(path="W.1.4.3", depth=3, role="AXButton", description="Gamma Chat, preview must not drive matching", actions=("AXPress",), enabled=True, frame=(282, 340, 779, 30))
+        )
+        result = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", page, (0, 0, 1200, 900))
+        self.assertEqual(result["status"], "visible_chats_found")
+        self.assertEqual(result["valid_project_chat_row_count"], 2)
+        self.assertEqual(result["invalid_candidate_count"], 1)
+        titles = [chat["title"] for chat in result["visible_chats"]]
+        self.assertNotIn("Gamma Chat", titles)
+
+    def test_identity_gate_accepts_historical_style_list_with_merged_accessibility(self) -> None:
+        page = _scrollable_project_chat_page(["Content Moderation", "AWS Profile Photo Verification"])
+        result = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", page, (0, 0, 1200, 900))
+        self.assertEqual(result["status"], "visible_chats_found")
+        self.assertEqual(result["project_chat_list_identity"], "confirmed")
+        self.assertEqual(result["project_chat_row_shape_status"], "valid")
+        self.assertEqual(result["valid_project_chat_row_count"], 2)
+        self.assertEqual(result["row_height_median"], 65.0)
+        self.assertTrue(result["vertical_peer_list_confirmed"])
+        self.assertEqual(result["project_chat_list_container_role"], "AXScrollArea")
+        self.assertEqual(
+            [chat["title"] for chat in result["visible_chats"]],
+            ["Content Moderation", "AWS Profile Photo Verification"],
+        )
+
+    def test_identity_gate_requires_vertical_peer_list_geometry(self) -> None:
+        page = _scrollable_project_chat_page([])
+        page.extend([
+            nav.AXElementSnapshot(path="W.1.4.1", depth=3, role="AXButton", description="Overlap A, preview must not drive matching", actions=("AXPress",), enabled=True, frame=(282, 200, 779, 65)),
+            nav.AXElementSnapshot(path="W.1.4.2", depth=3, role="AXButton", description="Overlap B, preview must not drive matching", actions=("AXPress",), enabled=True, frame=(282, 210, 779, 65)),
+        ])
+        result = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", page, (0, 0, 1200, 900))
+        self.assertEqual(result["status"], "project_chat_list_identity_not_confirmed")
+        self.assertFalse(result["vertical_peer_list_confirmed"])
+        self.assertIn("vertical_peer_list_not_confirmed", result["identity_failure_reasons"])
+
+    def test_identity_gate_not_confirmed_from_project_title_and_tab_labels_alone(self) -> None:
+        snapshots = _project_content_shell_without_list()
+        result = nav.resolve_open_project_content_and_visible_chats("PTG Assistant", snapshots, (0, 0, 1200, 900))
+        self.assertTrue(result["project_identity_confirmed"])
+        self.assertTrue(result["chats_tab_confirmed"])
+        self.assertTrue(result["sources_tab_visible"])
+        self.assertEqual(result["project_chat_list_identity"], "not_confirmed")
+        self.assertEqual(result["status"], "project_chat_list_identity_not_confirmed")
+        self.assertIn("no_forward_resolved_chats_list_container", result["identity_failure_reasons"])
+
+    def test_identity_stability_fails_closed_on_transient_conversation_sample(self) -> None:
+        good = _scrollable_project_chat_page(["Stable Chat"])
+        transient = _scroll_opened_conversation_snapshots("Stable Chat")
+
+        def sample(snaps: list[nav.AXElementSnapshot]) -> dict:
+            return {"snapshots": snaps, "stats": {}, "window_metadata": {}, "ax_window_frame": (0, 0, 1200, 900)}
+
+        result = nav._confirm_stable_project_chat_list_identity([sample(transient), sample(good)], "PTG Assistant")
+        self.assertEqual(result["identity_stability_samples"], 2)
+        self.assertEqual(result["status"], "project_chat_list_identity_not_confirmed")
+        self.assertIn("list_identity_unstable_across_samples", result["identity_failure_reasons"])
+
+        # Two compatible confirmed samples remain confirmed.
+        stable = nav._confirm_stable_project_chat_list_identity([sample(good), sample(good)], "PTG Assistant")
+        self.assertEqual(stable["status"], "visible_chats_found")
+        self.assertEqual(stable["identity_stability_samples"], 2)
+
+    def test_identity_not_confirmed_posts_no_scroll_axpress_or_click(self) -> None:
+        composer_only = _project_content_shell_without_list([
+            nav.AXElementSnapshot(path="W.2.9", depth=2, role="AXTextArea", title="Message ChatGPT", value="", frame=(340, 820, 620, 44)),
+        ])
+        reader = _AutonomousReader([composer_only] * 8, {"available": False, "path": "", "role": "", "title": ""})
+        clicker = _ClickService()
+        scroller = _ScrollService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Any Chat",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                scroll_service_factory=_ScrollFactory(scroller),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "project_chat_list_identity_not_confirmed")
+        self.assertEqual(result["actions_performed"], [])
+        self.assertEqual(clicker.clicks, [])
+        self.assertEqual(scroller.scrolls, [])
+        self.assertEqual(reader.actions, [])
+        self.assertEqual(result["scroll_pulses_posted"], 0)
+
+    def test_correct_project_list_still_flows_into_matching_and_scroll_paths(self) -> None:
+        # Canonical and historical-style fixtures both confirm identity and expose
+        # their rows so downstream target-matching / scroll-search is reachable.
+        canonical = nav.resolve_open_project_content_and_visible_chats(
+            "PTG Assistant", _project_visible_chats_snapshots(partial_last_row=False), (0, 0, 1200, 900)
+        )
+        self.assertEqual(canonical["status"], "visible_chats_found")
+        self.assertEqual(canonical["project_chat_list_identity"], "confirmed")
+        self.assertEqual(canonical["valid_project_chat_row_count"], 3)
+
+        scrollable = nav.resolve_open_project_content_and_visible_chats(
+            "PTG Assistant", _scrollable_project_chat_page(["City-wise Restrictions"]), (0, 0, 1200, 900)
+        )
+        self.assertEqual(scrollable["status"], "visible_chats_found")
+        self.assertEqual(scrollable["project_chat_list_identity"], "confirmed")
+        self.assertEqual([chat["title"] for chat in scrollable["visible_chats"]], ["City-wise Restrictions"])
+
+    def test_visual_row_diagnostic_is_read_only_and_reports_rows_without_actions(self) -> None:
+        reader = _ActionReader([_visual_row_diagnostic_project_chat_page()])
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.diagnose_chatgpt_project_chat_rows(
+                project_title="PTG Assistant",
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+            )
+
+        self.assertEqual(result["status"], "diagnostic_ready")
+        self.assertEqual(result["actions_performed"], [])
+        self.assertEqual(reader.actions, [])
+        self.assertGreater(result["summary"]["ax_nodes_inspected"], 0)
+        source = Path(nav.__file__).read_text(encoding="utf-8")
+        diagnostic_source = source[
+            source.index("def diagnose_chatgpt_project_chat_rows("):
+            source.index("def _base_project_chat_row_ax_audit_result")
+        ]
+        for token in ("activate_chatgpt", "perform_action", "AXPress)", "left_click", "scroll_down", "paste", "cursor", "screenshot", "ocr", "selenium", "playwright"):
+            self.assertNotIn(token, diagnostic_source)
+
+    def test_visual_row_diagnostic_fails_closed_when_identity_not_confirmed(self) -> None:
+        result = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _project_content_shell_without_list(),
+            (0, 0, 1200, 900),
+        )
+
+        self.assertEqual(result["status"], "project_chat_list_identity_not_confirmed")
+        self.assertEqual(result["final_outcome"], "project_chat_list_identity_not_confirmed")
+        self.assertEqual(result["visual_row_bands"], [])
+        self.assertEqual(result["summary"]["filtered_bands_printed"], 0)
+
+    def test_visual_row_diagnostic_collects_title_bearing_roles_and_attributes(self) -> None:
+        result = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _visual_row_diagnostic_project_chat_page(),
+            (0, 0, 1200, 900),
+        )
+
+        self.assertEqual(result["status"], "diagnostic_ready")
+        first_band = result["visual_row_bands"][0]
+        roles = {candidate["source_role"] for candidate in first_band["title_candidates"]}
+        self.assertTrue({"AXGroup", "AXRow", "AXCell", "AXButton", "AXLink", "AXStaticText"}.issubset(roles))
+        attrs = {(candidate["source_attribute"], candidate["raw_text"]) for candidate in first_band["title_candidates"]}
+        self.assertIn(("AXTitle", "Title Attr Candidate"), attrs)
+        self.assertIn(("AXDescription", "Description Attr Candidate"), attrs)
+        self.assertIn(("AXValue", "Value Attr Candidate"), attrs)
+
+    def test_visual_row_diagnostic_reports_nested_small_wrapper_rejected_with_outer_band_evidence(self) -> None:
+        result = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _visual_row_diagnostic_project_chat_page(),
+            (0, 0, 1200, 900),
+        )
+
+        band = next(
+            band
+            for band in result["visual_row_bands"]
+            if any(candidate["raw_text"] == "Nested Small Wrapper" for candidate in band["title_candidates"])
+        )
+        comparison = band["current_resolver_comparison"]
+        self.assertEqual(comparison["current_resolver_status"], "rejected_currently")
+        self.assertIn("row_container_frame_below_minimum", comparison["current_resolver_rejection_reasons"])
+        self.assertEqual(band["outermost_candidate_path"], "W.1.4.3")
+        self.assertEqual(band["outermost_candidate_role"], "AXGroup")
+
+    def test_visual_row_diagnostic_distinguishes_accepted_rejected_and_not_seen_bands(self) -> None:
+        snapshots = _visual_row_diagnostic_project_chat_page()
+        snapshots.append(nav.AXElementSnapshot(path="W.1.4.4", depth=3, role="AXImage", description="Decorative Image Label", frame=(302, 430, 240, 44)))
+        result = nav.diagnose_chatgpt_project_chat_rows_from_snapshots("PTG Assistant", snapshots, (0, 0, 1200, 900))
+
+        statuses = [band["current_resolver_comparison"]["current_resolver_status"] for band in result["visual_row_bands"]]
+        self.assertIn("accepted_currently", statuses)
+        self.assertIn("rejected_currently", statuses)
+        self.assertIn("not_seen_by_current_resolver", statuses)
+        self.assertGreaterEqual(result["summary"]["bands_accepted_by_current_resolver"], 2)
+        self.assertGreaterEqual(result["summary"]["bands_rejected_by_current_resolver"], 1)
+        self.assertGreaterEqual(result["summary"]["bands_not_seen_by_current_resolver"], 1)
+
+    def test_visual_row_diagnostic_contains_title_filters_output_not_collection(self) -> None:
+        full = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _visual_row_diagnostic_project_chat_page(),
+            (0, 0, 1200, 900),
+        )
+        filtered = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _visual_row_diagnostic_project_chat_page(),
+            (0, 0, 1200, 900),
+            contains_title="Mock Data Insertion SQL",
+        )
+
+        self.assertEqual(filtered["collection_counts_before_filter"], full["collection_counts_before_filter"])
+        self.assertLess(len(filtered["visual_row_bands"]), len(full["visual_row_bands"]))
+        self.assertGreater(filtered["hidden_unrelated_band_count"], 0)
+        self.assertEqual(filtered["summary"]["filtered_bands_printed"], 1)
+        self.assertIn("Mock Data Insertion SQL", json.dumps(filtered["visual_row_bands"]))
+        self.assertNotIn("Nested Small Wrapper", json.dumps(filtered["visual_row_bands"]))
+
+    def test_visual_row_diagnostic_experimental_titles_do_not_change_strict_matching(self) -> None:
+        result = nav.diagnose_chatgpt_project_chat_rows_from_snapshots(
+            "PTG Assistant",
+            _visual_row_diagnostic_project_chat_page(),
+            (0, 0, 1200, 900),
+        )
+
+        titles = [(band["experimental_canonical"]["experimental_canonical_title"], band["current_resolver_comparison"]["current_resolver_title"]) for band in result["visual_row_bands"]]
+        self.assertIn(("Title Attr Candidate", "Mock Data Insertion SQL"), titles)
+        rejected = next(item for item in titles if item[0] == "Nested Small Wrapper")
+        self.assertEqual(rejected[1], "")
+        self.assertEqual(result["actions_performed"], [])
+
+    def test_identity_outcome_registered_and_resolver_avoids_disallowed_channels(self) -> None:
+        for outcome_set in (
+            nav.AUTONOMOUS_OPEN_OUTCOMES,
+            nav.PROJECT_VISIBLE_CHAT_INSPECTION_OUTCOMES,
+            nav.PROJECT_CHAT_OPEN_OUTCOMES,
+        ):
+            self.assertIn("project_chat_list_identity_not_confirmed", outcome_set)
+        source = Path(nav.__file__).read_text(encoding="utf-8")
+        resolver_source = source[
+            source.index("def _forward_resolve_project_chats_list_container"):
+            source.index("def _project_text(")
+        ]
+        for token in ("CGEventKeyboard", "ScrollWheel", "press_enter", "paste_clipboard", "screenshot", "ocr", "osascript", "selenium", "playwright"):
+            self.assertNotIn(token, resolver_source)
 
 
 class ChatGPTNavigationDiagnosticCLITests(unittest.TestCase):

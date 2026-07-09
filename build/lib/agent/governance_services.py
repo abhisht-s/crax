@@ -382,9 +382,9 @@ def _verify_auto_workspace_write_result(
     codex_event_id = _latest_event_id(events, "codex_exec_finished")
     if diff_metadata.get("validation_error"):
         post_run_policy = {
-            "tier": "workspace_write_scoped_auto",
-            "allowed": True,
-            "reason_code": "post_run_observations_recorded",
+            "tier": "post_run_human_required",
+            "allowed": False,
+            "reason_code": "post_run_diff_metadata_unavailable",
             "policy_version": WORKSPACE_WRITE_POLICY_VERSION,
             "expected_scope": expected_scope,
             "changed_files": [],
@@ -392,7 +392,6 @@ def _verify_auto_workspace_write_result(
             "prohibited_files": [],
             "name_status_summary": [],
             "diff_content_flags": [],
-            "matched_rules": ["safety_classifiers_disabled"],
         }
     else:
         verification = post_run_evaluator(

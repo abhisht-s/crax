@@ -598,6 +598,31 @@ extract-next-codex-prompt
 run-extracted-codex-prompt
 ```
 
+### Manual stale ChatGPT UI lease release
+
+The ChatGPT Desktop UI lease does not auto-expire. If a supervising process is
+interrupted after acquiring the lease, inspect the ledger first, verify the
+recorded owner process is not still active, and only then append a manual release
+event:
+
+```sh
+agent-loop release-stale-chatgpt-ui-lease \
+  --owning-run-id <run_id> \
+  --owner-pid <pid> \
+  --acquired-at <timestamp> \
+  --active-event-id <chatgpt_ui_lease_acquired_event_id> \
+  --expected-run-status completed \
+  --expected-lease-token-sha256 <sha256> \
+  --reason "operator verified stale lease" \
+  --confirm-stale
+```
+
+The command fails without `--confirm-stale`, fails if the active lease no longer
+matches the supplied run/PID/timestamp/event id, and fails if the owner PID
+currently exists unless `--allow-owner-pid-alive` is passed after separate PID
+reuse verification. It appends a normal `chatgpt_ui_lease_released` event; it
+does not delete or rewrite ledger history.
+
 ## Autonomous Workspace-Write Test
 
 This is a temporary local test of scoped autonomous edits.

@@ -199,10 +199,13 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
         self.assertEqual(result["response_text"], SENTINEL_RESPONSE)
         self.assertEqual(result["reason_code"], "complete_sentinel_stable")
 
-    def test_sentinel_required_times_out_on_only_thinking(self) -> None:
+    def test_sentinel_required_waits_past_prior_timeout_and_captures(self) -> None:
         reader = _FakeAXReader(
             [
                 [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, "Thinking")],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, "Thinking")],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, SENTINEL_RESPONSE)],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, SENTINEL_RESPONSE)],
             ]
         )
         clock = _FakeClock()
@@ -221,18 +224,20 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
                 submission_marker_text=MARKER,
             )
 
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["matched_feedback"])
-        self.assertEqual(result["matched_candidate_index"], 0)
-        self.assertEqual(result["reason_code"], "sentinel_not_found_timeout")
-        self.assertEqual(result["sentinel_state"], "sentinel_pending")
-        self.assertEqual(result["post_feedback_candidate_summaries"][0]["sentinel_status"], "no_markers")
-        self.assertEqual(result["post_feedback_candidate_summaries"][0]["text_preview_repr"], "'Thinking'")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason_code"], "complete_sentinel_stable")
+        self.assertEqual(result["sentinel_state"], "complete_sentinel_stable")
+        self.assertIsNone(result["timeout_seconds"])
 
-    def test_incomplete_sentinel_times_out_with_specific_reason(self) -> None:
+    def test_incomplete_sentinel_waits_until_complete(self) -> None:
         partial = "BEGIN_NEXT_CODEX_PROMPT\nSay exactly: still streaming"
         reader = _FakeAXReader(
-            [[_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, partial)]]
+            [
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, partial)],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, partial)],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, SENTINEL_RESPONSE)],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, SENTINEL_RESPONSE)],
+            ]
         )
         clock = _FakeClock()
 
@@ -250,10 +255,9 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
                 submission_marker_text=MARKER,
             )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason_code"], "sentinel_incomplete_timeout")
-        self.assertEqual(result["sentinel_state"], "streaming_incomplete_sentinel")
-        self.assertNotIn("response_text", result)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason_code"], "complete_sentinel_stable")
+        self.assertEqual(result["response_text"], SENTINEL_RESPONSE)
 
     def test_changing_complete_sentinel_captures_only_final_stable_text(self) -> None:
         first = SENTINEL_RESPONSE.replace("STEP_2", "EARLY")
@@ -346,14 +350,26 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
         self.assertEqual(match["reason_code"], "multiple_complete_sentinels")
         self.assertEqual(match["sentinel_state"], "multiple_complete_sentinels")
 
-    def test_status_and_chrome_candidates_do_not_cause_malformed_failure(self) -> None:
+    def test_status_and_chrome_candidates_do_not_end_capture_before_sentinel(self) -> None:
         reader = _FakeAXReader(
             [
                 [
                     _candidate(0, MARKER + "\n" + FEEDBACK),
                     _candidate(1, "Thought for 4s"),
                     _candidate(2, "Search the web"),
-                ]
+                ],
+                [
+                    _candidate(0, MARKER + "\n" + FEEDBACK),
+                    _candidate(1, "Thought for 4s"),
+                    _candidate(2, "Search the web"),
+                    _candidate(3, SENTINEL_RESPONSE),
+                ],
+                [
+                    _candidate(0, MARKER + "\n" + FEEDBACK),
+                    _candidate(1, "Thought for 4s"),
+                    _candidate(2, "Search the web"),
+                    _candidate(3, SENTINEL_RESPONSE),
+                ],
             ]
         )
         clock = _FakeClock()
@@ -372,17 +388,13 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
                 submission_marker_text=MARKER,
             )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason_code"], "sentinel_not_found_timeout")
-        self.assertEqual(result["sentinel_state"], "sentinel_pending")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason_code"], "complete_sentinel_stable")
         summaries = result["post_feedback_candidate_summaries"]
         self.assertEqual(summaries[0]["candidate_classification"], "ui_status")
         self.assertEqual(summaries[1]["candidate_classification"], "ui_chrome")
-        self.assertTrue(
-            all(summary["sentinel_status"] == "no_markers" for summary in summaries)
-        )
 
-    def test_complete_sentinel_not_stable_before_timeout_uses_stability_timeout(self) -> None:
+    def test_complete_sentinel_waits_until_stable_without_timeout(self) -> None:
         reader = _FakeAXReader(
             [[_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, SENTINEL_RESPONSE)]]
         )
@@ -402,12 +414,19 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
                 submission_marker_text=MARKER,
             )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason_code"], "response_not_stable_timeout")
-        self.assertEqual(result["sentinel_state"], "complete_sentinel_unstable")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason_code"], "complete_sentinel_stable")
+        self.assertEqual(result["sentinel_state"], "complete_sentinel_stable")
+        self.assertIsNone(result["timeout_seconds"])
 
-    def test_anchor_pending_timeout_reports_sentinel_not_found(self) -> None:
-        reader = _FakeAXReader([[_candidate(0, "Conversation without anchor")]])
+    def test_anchor_pending_waits_until_submission_marker_is_visible(self) -> None:
+        reader = _FakeAXReader(
+            [
+                [_candidate(0, "Conversation without anchor")],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, SENTINEL_RESPONSE)],
+                [_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, SENTINEL_RESPONSE)],
+            ]
+        )
         clock = _FakeClock()
 
         with (
@@ -424,9 +443,8 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
                 submission_marker_text=MARKER,
             )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["reason_code"], "sentinel_not_found_timeout")
-        self.assertEqual(result["sentinel_state"], "anchor_pending")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason_code"], "complete_sentinel_stable")
 
     def test_multiple_markers_in_single_candidate_remain_malformed_after_stable_observation(self) -> None:
         text = (
@@ -489,6 +507,11 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
                         "stderr": "raw stderr\n",
                         "exit_code": 0,
                         "timed_out": False,
+                        "final_message": "Codex completed the requested work.",
+                        "final_message_path": "/tmp/run-1/final-message.md",
+                        "final_message_status": "valid",
+                        "final_message_error": None,
+                        "final_message_length": len("Codex completed the requested work."),
                     },
                     sort_keys=True,
                 ),
@@ -545,35 +568,47 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
             "error": None,
         }
 
-    def test_submit_flow_fails_before_send_when_paste_marker_not_visible(self) -> None:
+    def test_submit_flow_waits_for_paste_marker_visibility_before_send(self) -> None:
         fake_ledger = _FakeLedger(self._base_events())
         stdout = io.StringIO()
+        calls = {"count": 0}
+
+        def inspect_side_effect(app_name, marker_text=None):
+            marker = str(marker_text)
+            calls["count"] += 1
+            if calls["count"] <= 2:
+                return self._observation(marker, composer_text="")
+            if calls["count"] <= 4:
+                return self._observation(marker, composer_text=marker)
+            return self._observation(marker, composer_text="", candidates=[marker])
+
         with (
             mock.patch.object(cli, "ledger", fake_ledger),
             mock.patch.object(cli, "copy_to_clipboard", return_value={"copied": True, "method": "pbcopy", "error": None}),
             mock.patch.object(cli, "activate_chatgpt", return_value=self._activation()),
             mock.patch.object(cli, "paste_clipboard_to_frontmost_app", return_value={"pasted": True, "method": "paste", "error": None}),
-            mock.patch.object(cli, "press_enter_in_frontmost_app") as enter,
+            mock.patch.object(cli, "press_enter_in_frontmost_app", return_value={"submitted": True, "method": "enter", "error": None}) as enter,
             mock.patch.object(cli, "inspect_chatgpt_submission_ui") as inspect,
-            mock.patch.object(cli, "CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS", 0.0),
             mock.patch.object(cli.time, "sleep", return_value=None),
             mock.patch("sys.stdout", new=stdout),
         ):
-            inspect.side_effect = lambda app_name, marker_text=None: self._observation(str(marker_text), composer_text="")
+            inspect.side_effect = inspect_side_effect
             ok = cli._submit_feedback_to_chatgpt_flow("run-1", self._run_record(), "ChatGPT", approval_mode="auto")
 
-        self.assertFalse(ok)
-        enter.assert_not_called()
-        self.assertEqual(fake_ledger.added_events[-1][0][1], "gpt_feedback_submission_failed")
-        self.assertIn("chatgpt_paste_not_visible", stdout.getvalue())
+        self.assertTrue(ok)
+        enter.assert_called_once()
+        self.assertEqual(fake_ledger.added_events[-1][0][1], "gpt_feedback_submission_verified")
 
-    def test_enter_input_sent_but_marker_remains_in_composer_is_not_verified(self) -> None:
+    def test_enter_input_sent_waits_until_marker_leaves_composer(self) -> None:
         fake_ledger = _FakeLedger(self._base_events())
-        marker_holder = {}
+        calls = {"count": 0}
 
         def inspect_side_effect(app_name, marker_text=None):
-            marker_holder["marker"] = str(marker_text)
-            return self._observation(str(marker_text), composer_text=str(marker_text))
+            marker = str(marker_text)
+            calls["count"] += 1
+            if calls["count"] <= 4:
+                return self._observation(marker, composer_text=marker)
+            return self._observation(marker, composer_text="", candidates=[f"user message\n{marker}"])
 
         with (
             mock.patch.object(cli, "ledger", fake_ledger),
@@ -582,16 +617,15 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
             mock.patch.object(cli, "paste_clipboard_to_frontmost_app", return_value={"pasted": True, "method": "paste", "error": None}),
             mock.patch.object(cli, "press_enter_in_frontmost_app", return_value={"submitted": True, "method": "enter", "error": None}),
             mock.patch.object(cli, "inspect_chatgpt_submission_ui", side_effect=inspect_side_effect),
-            mock.patch.object(cli, "CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS", 0.0),
             mock.patch.object(cli.time, "sleep", return_value=None),
             mock.patch("sys.stdout", new=io.StringIO()),
         ):
             ok = cli._submit_feedback_to_chatgpt_flow("run-1", self._run_record(), "ChatGPT", approval_mode="auto")
 
-        self.assertFalse(ok)
+        self.assertTrue(ok)
         event_types = [event[0][1] for event in fake_ledger.added_events]
         self.assertIn("gpt_feedback_submit_input_sent", event_types)
-        self.assertNotIn("gpt_feedback_submission_verified", event_types)
+        self.assertIn("gpt_feedback_submission_verified", event_types)
 
     def test_send_button_axpress_verifies_submission(self) -> None:
         fake_ledger = _FakeLedger(self._base_events())
@@ -762,7 +796,7 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
             "stable_seconds": 0.0,
             "successful_polls": 2,
             "poll_interval_seconds": 1.0,
-            "timeout_seconds": 60.0,
+            "timeout_seconds": None,
             "match_score": 1.0,
             "ax_stats": {"candidate_count": 2},
             "format_warning": "warning",
@@ -778,7 +812,7 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
                 "run-1",
                 {"id": "run-1", "status": "completed"},
                 "ChatGPT",
-                60.0,
+                None,
                 0.0,
             )
 
@@ -792,9 +826,9 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
             repo="/tmp",
             sandbox="read-only",
             app_name="ChatGPT",
-            capture_timeout_seconds=60.0,
+            capture_timeout_seconds=None,
             stable_seconds=2.0,
-            timeout=300,
+            timeout=None,
         )
         plans = [
             SupervisePlan(
@@ -831,12 +865,12 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
             "candidate_count": 2,
             "stable": False,
             "sentinel_required": True,
-            "sentinel_state": "sentinel_pending",
-            "reason_code": "sentinel_not_found_timeout",
+            "sentinel_state": "stable_malformed_sentinel",
+            "reason_code": "sentinel_malformed_stable",
             "stable_seconds": 2.0,
             "successful_polls": 0,
             "poll_interval_seconds": 1.0,
-            "timeout_seconds": 60.0,
+            "timeout_seconds": None,
             "ax_stats": {"candidate_count": 2},
             "post_feedback_candidate_summaries": [
                 {
@@ -850,7 +884,7 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
                     "classification_reason": "not_known_ui_chrome",
                 }
             ],
-            "error": "No complete sentinel-wrapped assistant response was found after the matched feedback.",
+            "error": "Malformed sentinel markers were found after the verified submission marker.",
         }
         stdout = io.StringIO()
 
@@ -864,7 +898,7 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
                 "run-1",
                 {"id": "run-1", "status": "completed"},
                 "ChatGPT",
-                60.0,
+                None,
                 2.0,
                 require_sentinel_response=True,
             )
@@ -878,8 +912,8 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
             [event[0][1] for event in fake_ledger.added_events],
         )
         failed_metadata = fake_ledger.added_events[1][0][3]
-        self.assertEqual(failed_metadata["reason_code"], "sentinel_not_found_timeout")
-        self.assertEqual(failed_metadata["sentinel_state"], "sentinel_pending")
+        self.assertEqual(failed_metadata["reason_code"], "sentinel_malformed_stable")
+        self.assertEqual(failed_metadata["sentinel_state"], "stable_malformed_sentinel")
         self.assertEqual(failed_metadata["matched_submission_event_id"], 1)
         self.assertEqual(failed_metadata["candidate_count"], 2)
         self.assertEqual(failed_metadata["matched_candidate_index"], 0)
@@ -889,8 +923,8 @@ class ChatGPTAXCLIWiringTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("matched_candidate_index: 0", output)
         self.assertIn("candidate_count: 2", output)
-        self.assertIn("capture_reason: sentinel_not_found_timeout", output)
-        self.assertIn("sentinel_state: sentinel_pending", output)
+        self.assertIn("capture_reason: sentinel_malformed_stable", output)
+        self.assertIn("sentinel_state: stable_malformed_sentinel", output)
         self.assertIn("post_feedback_candidate: index=1", output)
         self.assertIn("sentinel_status=no_markers", output)
 

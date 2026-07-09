@@ -106,48 +106,6 @@ dd {
   min-width: 0;
 }
 
-.lease-grid {
-  margin-top: 0.75rem;
-}
-
-.codex-live-grid {
-  margin-top: 0.75rem;
-}
-
-.lease-controls {
-  display: grid;
-  grid-template-columns: minmax(8rem, 12rem) minmax(0, 1fr);
-  gap: 0.65rem;
-  align-items: center;
-  margin-top: 1rem;
-}
-
-.checkbox-cell {
-  display: flex;
-  gap: 0.5rem;
-  align-items: flex-start;
-}
-
-.checkbox-cell input[type="checkbox"] {
-  width: auto;
-  margin-top: 0.25rem;
-}
-
-.field-stack {
-  display: grid;
-  gap: 0.35rem;
-}
-
-.locked-value {
-  display: block;
-  width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.55rem 0.65rem;
-  background: var(--soft);
-  color: var(--muted);
-}
-
 dt,
 label {
   font-weight: 650;
@@ -280,33 +238,19 @@ pre {
   gap: 0.75rem;
 }
 
-.progress-events {
-  list-style: none;
-  padding: 0;
-  margin: 0.75rem 0 0;
-  display: grid;
-  gap: 0.6rem;
-}
-
-.timeline-item,
-.progress-event {
+.timeline-item {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 0.75rem;
   background: #fbfcfe;
 }
 
-.timeline-meta,
-.progress-meta {
+.timeline-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
   color: var(--muted);
   font-size: 0.86rem;
-}
-
-.progress-event p {
-  margin-bottom: 0;
 }
 
 .hidden {
@@ -317,7 +261,6 @@ pre {
   .app-header,
   .layout,
   .form-grid,
-  .lease-controls,
   .summary-grid,
   .summary-list {
     display: block;

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 AX_CAPTURE_SOURCE = "chatgpt_desktop_ax"
 AX_CAPTURE_FORMAT = "rendered_ax_text"
-DEFAULT_CAPTURE_TIMEOUT_SECONDS = 60.0
+DEFAULT_CAPTURE_TIMEOUT_SECONDS: float | None = None
 DEFAULT_STABLE_SECONDS = 2.0
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_MAX_DEPTH = 18
@@ -560,7 +560,7 @@ def find_response_candidate_after_marker(
 def capture_response_after_feedback(
     feedback_text: str,
     app_name: str = "ChatGPT",
-    timeout_seconds: float = DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = DEFAULT_CAPTURE_TIMEOUT_SECONDS,
     stable_seconds: float = DEFAULT_STABLE_SECONDS,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     max_depth: int = DEFAULT_MAX_DEPTH,
@@ -568,7 +568,7 @@ def capture_response_after_feedback(
     require_sentinel_response: bool = False,
     submission_marker_text: str | None = None,
 ) -> dict:
-    deadline = time.monotonic() + timeout_seconds
+    del timeout_seconds
     reader = _AXReader(app_name=app_name, max_depth=max_depth, max_nodes=max_nodes)
     last_stability_fingerprint: str | None = None
     last_response_text = ""
@@ -577,9 +577,8 @@ def capture_response_after_feedback(
     last_error: str | None = None
     last_stats: dict = {}
     last_match: dict = {}
-    last_observed_sentinel_state: str | None = None
 
-    while time.monotonic() <= deadline:
+    while True:
         try:
             candidates, stats = reader.collect_text_candidates()
             last_stats = stats
@@ -596,7 +595,6 @@ def capture_response_after_feedback(
                     require_sentinel_response=require_sentinel_response,
                 )
             last_match = _match_summary(match)
-            last_observed_sentinel_state = last_match.get("sentinel_state") or last_observed_sentinel_state
             if not match["ok"]:
                 last_error = match["error"]
                 if match.get("fatal"):
@@ -612,7 +610,7 @@ def capture_response_after_feedback(
                         "stable_seconds": stable_seconds,
                         "successful_polls": successful_polls,
                         "poll_interval_seconds": poll_interval_seconds,
-                        "timeout_seconds": timeout_seconds,
+                        "timeout_seconds": None,
                         "ax_stats": stats,
                         "sentinel_required": require_sentinel_response,
                         **last_match,
@@ -627,7 +625,8 @@ def capture_response_after_feedback(
                         successful_polls = 1
                         stable_since = time.monotonic()
                         last_stability_fingerprint = malformed_fingerprint
-                    elapsed_stable_seconds = time.monotonic() - (stable_since or time.monotonic())
+                    stable_started_at = stable_since if stable_since is not None else time.monotonic()
+                    elapsed_stable_seconds = time.monotonic() - stable_started_at
                     if successful_polls >= 2 and elapsed_stable_seconds >= stable_seconds:
                         return {
                             "ok": False,
@@ -641,7 +640,7 @@ def capture_response_after_feedback(
                             "stable_seconds": stable_seconds,
                             "successful_polls": successful_polls,
                             "poll_interval_seconds": poll_interval_seconds,
-                            "timeout_seconds": timeout_seconds,
+                            "timeout_seconds": None,
                             "ax_stats": stats,
                             "sentinel_required": require_sentinel_response,
                             **last_match,
@@ -665,7 +664,8 @@ def capture_response_after_feedback(
                     last_stability_fingerprint = response_fingerprint
                     last_response_text = response_candidate.text
 
-                elapsed_stable_seconds = time.monotonic() - (stable_since or time.monotonic())
+                stable_started_at = stable_since if stable_since is not None else time.monotonic()
+                elapsed_stable_seconds = time.monotonic() - stable_started_at
                 if successful_polls >= 2 and elapsed_stable_seconds >= stable_seconds:
                     response_sha256 = hashlib.sha256(last_response_text.encode("utf-8")).hexdigest()
                     return {
@@ -686,7 +686,7 @@ def capture_response_after_feedback(
                         "stable_seconds": stable_seconds,
                         "successful_polls": successful_polls,
                         "poll_interval_seconds": poll_interval_seconds,
-                        "timeout_seconds": timeout_seconds,
+                        "timeout_seconds": None,
                         "match_score": match["match_score"],
                         "ax_stats": stats,
                         "sentinel_required": require_sentinel_response,
@@ -716,30 +716,8 @@ def capture_response_after_feedback(
             last_error = f"Unexpected AX capture error: {exc}"
             last_match = {}
 
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(poll_interval_seconds, remaining))
-
-    timeout_reason_code = _timeout_reason_code(last_observed_sentinel_state, require_sentinel_response)
-    return {
-        "ok": False,
-        "source": AX_CAPTURE_SOURCE,
-        "capture_format": AX_CAPTURE_FORMAT,
-        "error": last_error or "Response did not become stable before timeout.",
-        "matched_feedback": bool(last_match.get("matched_feedback", False)),
-        "candidate_count": last_stats.get("candidate_count", 0),
-        "stable": False,
-        "stable_seconds": stable_seconds,
-        "successful_polls": successful_polls,
-        "poll_interval_seconds": poll_interval_seconds,
-        "timeout_seconds": timeout_seconds,
-        "ax_stats": last_stats,
-        "sentinel_required": require_sentinel_response,
-        **last_match,
-        "reason_code": timeout_reason_code,
-    }
-
+        if poll_interval_seconds > 0:
+            time.sleep(poll_interval_seconds)
 
 def _match_summary(match: dict) -> dict:
     summary = {
@@ -869,18 +847,6 @@ def _candidate_fingerprint_parts(candidate: TextCandidate) -> list[str]:
         hashlib.sha256(candidate.text.encode("utf-8")).hexdigest(),
         _sentinel_marker_status(candidate.text),
     ]
-
-
-def _timeout_reason_code(sentinel_state: str | None, require_sentinel_response: bool) -> str:
-    if not require_sentinel_response:
-        return "response_not_stable_timeout"
-    if sentinel_state == SENTINEL_STATE_STREAMING_INCOMPLETE:
-        return "sentinel_incomplete_timeout"
-    if sentinel_state == SENTINEL_STATE_COMPLETE_UNSTABLE:
-        return "response_not_stable_timeout"
-    if sentinel_state == SENTINEL_STATE_MALFORMED_UNSTABLE:
-        return "response_not_stable_timeout"
-    return "sentinel_not_found_timeout"
 
 
 def _sentinel_marker_status(text: str) -> str:

@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 import hashlib
 import shutil
 import time
-import uuid
 from datetime import UTC, datetime
 from typing import Any, Callable
 
@@ -236,33 +235,6 @@ def _reason_code(result: dict[str, Any]) -> str:
     return "codex_exec_completed"
 
 
-def _new_codex_invocation_id() -> str:
-    return f"codex-invocation-{uuid.uuid4().hex}"
-
-
-def _supports_progress_events(event_ledger: Any) -> bool:
-    return callable(getattr(event_ledger, "add_codex_progress_event", None))
-
-
-def _progress_callback(
-    event_ledger: Any,
-    *,
-    run_id: str,
-    codex_invocation_id: str,
-) -> Callable[[dict[str, object]], None]:
-    def record(progress_event: dict[str, object]) -> None:
-        try:
-            event_ledger.add_codex_progress_event(
-                run_id,
-                codex_invocation_id,
-                progress_event,
-            )
-        except Exception:
-            return
-
-    return record
-
-
 def _error_message(result: dict[str, Any], reason_code: str) -> str | None:
     if reason_code == "codex_exec_completed":
         return None
@@ -314,8 +286,6 @@ def execute_codex_direct_service(
 
     profile = resolved_profile.profile
     model = profile.model if profile is not None else CODEX_DEFAULT_SELECTION
-    progress_enabled = _supports_progress_events(event_ledger)
-    codex_invocation_id = _new_codex_invocation_id() if progress_enabled else None
     started_metadata = {
         "prompt": prompt,
         "repo_path": repo_path,
@@ -323,9 +293,6 @@ def execute_codex_direct_service(
         "sandbox": sandbox,
         "prompt_contract": prompt_contract,
     }
-    if codex_invocation_id is not None:
-        started_metadata["codex_invocation_id"] = codex_invocation_id
-        started_metadata["json_stream"] = True
     if model != CODEX_DEFAULT_SELECTION:
         started_metadata["model"] = model
     started_event_id = _event_id(
@@ -347,48 +314,14 @@ def execute_codex_direct_service(
         }
         if model != CODEX_DEFAULT_SELECTION:
             runner_kwargs["model"] = model
-        if codex_invocation_id is not None:
-            runner_kwargs["json_stream"] = True
-            runner_kwargs["codex_invocation_id"] = codex_invocation_id
-            runner_kwargs["progress_callback"] = _progress_callback(
-                event_ledger,
-                run_id=run_id,
-                codex_invocation_id=codex_invocation_id,
-            )
         result = codex_runner(prompt, **runner_kwargs)
-        if codex_invocation_id is not None:
-            result["codex_invocation_id"] = codex_invocation_id
-            result["json_stream"] = bool(result.get("json_stream", True))
     else:
-        if codex_invocation_id is not None:
-            _progress_callback(
-                event_ledger,
-                run_id=run_id,
-                codex_invocation_id=codex_invocation_id,
-            )(
-                {
-                    "source": "codex_service",
-                    "kind": "error",
-                    "status": "failed",
-                    "title": "Codex preflight validation failed",
-                    "summary": preflight_validation_error,
-                    "metadata": {
-                        "repo_path": repo_path,
-                        "sandbox": sandbox,
-                        "codex_invocation_id": codex_invocation_id,
-                        "validation_error": preflight_validation_error,
-                    },
-                }
-            )
         result = validation_result_builder(
             prompt,
             repo_path,
             sandbox,
             preflight_validation_error,
         )
-        if codex_invocation_id is not None:
-            result["codex_invocation_id"] = codex_invocation_id
-            result["json_stream"] = False
     end_time = monotonic_clock()
     duration_seconds = end_time - start_time
 

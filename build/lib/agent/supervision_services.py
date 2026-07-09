@@ -20,10 +20,7 @@ from agent.chatgpt_services import (
 )
 from agent.extracted_prompt_services import execute_extracted_codex_prompt_service
 from agent.run_services import (
-    DestinationBindingLookupStatus,
-    RunDestinationBinding,
     acquire_chatgpt_ui_lease,
-    get_run_destination_binding,
     release_chatgpt_ui_lease,
     verify_chatgpt_destination_for_run,
 )
@@ -46,78 +43,6 @@ CHATGPT_DESTINATION_GATE_BLOCKED_STATUS_ERROR = (
     "Automatic ChatGPT handoff blocked by exact destination verification gate; "
     "manual review is required before retry."
 )
-
-# --- Stage 3A: operator-approved navigation-before-gate handoff -------------
-#
-# Bounded handoff phase vocabulary. This is intentionally a small enum of state
-# labels (not a prose trace) so the local read model can surface where the
-# most recent handoff transaction stopped. Navigation, when it runs, is a
-# separate actor invoked *before* the read-only destination gate; the gate is
-# never given navigation behavior.
-HANDOFF_PHASE_NAVIGATION_NOT_REQUESTED = "navigation_not_requested"
-HANDOFF_PHASE_NAVIGATION_STARTED = "navigation_started"
-HANDOFF_PHASE_NAVIGATION_SUCCEEDED = "navigation_succeeded"
-HANDOFF_PHASE_NAVIGATION_FAILED = "navigation_failed"
-HANDOFF_PHASE_VERIFICATION_STARTED = "verification_started"
-HANDOFF_PHASE_VERIFICATION_FAILED = "verification_failed"
-HANDOFF_PHASE_VERIFICATION_SUCCEEDED = "verification_succeeded"
-HANDOFF_PHASE_SUBMISSION_STARTED = "submission_started"
-HANDOFF_PHASE_CAPTURE_STARTED = "capture_started"
-HANDOFF_PHASE_CONTINUATION_STARTED = "continuation_started"
-
-HANDOFF_PHASES = frozenset(
-    {
-        HANDOFF_PHASE_NAVIGATION_NOT_REQUESTED,
-        HANDOFF_PHASE_NAVIGATION_STARTED,
-        HANDOFF_PHASE_NAVIGATION_SUCCEEDED,
-        HANDOFF_PHASE_NAVIGATION_FAILED,
-        HANDOFF_PHASE_VERIFICATION_STARTED,
-        HANDOFF_PHASE_VERIFICATION_FAILED,
-        HANDOFF_PHASE_VERIFICATION_SUCCEEDED,
-        HANDOFF_PHASE_SUBMISSION_STARTED,
-        HANDOFF_PHASE_CAPTURE_STARTED,
-        HANDOFF_PHASE_CONTINUATION_STARTED,
-    }
-)
-
-CHATGPT_HANDOFF_PHASE_EVENT_TYPE = "chatgpt_handoff_phase"
-CHATGPT_HANDOFF_PHASE_MESSAGE = "ChatGPT handoff phase state recorded."
-CHATGPT_DESTINATION_NAVIGATION_ATTEMPT_EVENT_TYPE = "chatgpt_destination_navigation_attempt"
-CHATGPT_DESTINATION_NAVIGATION_ATTEMPT_MESSAGE = (
-    "Operator-approved autonomous ChatGPT destination navigation attempted."
-)
-CHATGPT_DESTINATION_NAVIGATION_BLOCKED_STATUS_ERROR = (
-    "Automatic ChatGPT handoff blocked because operator-approved destination "
-    "navigation did not reach the bound destination; manual review is required "
-    "before retry."
-)
-CHATGPT_HANDOFF_MAX_UI_ATTEMPTS = 5
-
-# Navigator outcomes that count as a confirmed chat open. Any other outcome is
-# treated as fail-closed navigation.
-CHAT_OPENED_NAVIGATION_OUTCOMES = frozenset(
-    {
-        "chat_opened_via_axpress",
-        "chat_opened_via_validated_click",
-        "chat_opened_after_scrolling_via_axpress",
-        "chat_opened_after_scrolling_via_validated_click",
-    }
-)
-
-
-@dataclass(frozen=True)
-class NavigationAttemptResult:
-    # ``ok`` means the navigation *action* was performed against the exact
-    # re-resolved target, so the authoritative read-only destination gate may
-    # now run. It does NOT mean the destination is proven — only the gate
-    # decides that. ``navigator_confirmed`` records the navigator's own
-    # non-authoritative post-action heuristic for evidence only.
-    ok: bool
-    outcome: str
-    reason_code: str | None = None
-    error_message: str | None = None
-    action_posted: bool = False
-    navigator_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -341,164 +266,6 @@ def _default_destination_gate_service(
     )
 
 
-def _navigation_attempt_from_open_result(result: dict) -> NavigationAttemptResult:
-    """Map the navigator's raw open-result into a handoff navigation outcome.
-
-    The authoritative post-navigation proof is the read-only destination gate,
-    not the navigator's own confirmation heuristic (which the audit showed is
-    mismatched with ChatGPT Desktop's real accessibility tree). So navigation is
-    treated as *performed* — and the gate is allowed to run — whenever the
-    chat-open action was physically posted against the exact re-resolved target
-    (``chat_open_action_posted``), regardless of whether the navigator's own
-    secondary heuristic recognized the resulting UI. When the action could not
-    be posted (target not resolved/interactable, click failed, etc.) navigation
-    is a genuine failure and the flow stays fail-closed before the gate.
-    """
-
-    outcome = str(result.get("outcome") or "") or "navigation_incomplete"
-    navigator_confirmed = result.get("ok") is True and outcome in CHAT_OPENED_NAVIGATION_OUTCOMES
-    action_posted = result.get("chat_open_action_posted") is True
-    if action_posted:
-        return NavigationAttemptResult(
-            ok=True,
-            outcome=outcome,
-            action_posted=True,
-            navigator_confirmed=navigator_confirmed,
-        )
-    return NavigationAttemptResult(
-        ok=False,
-        outcome=outcome,
-        reason_code="destination_navigation_action_not_performed",
-        action_posted=False,
-        navigator_confirmed=False,
-    )
-
-
-def _default_destination_navigation_service(
-    run_id: str,
-    binding: RunDestinationBinding,
-    lease_context: DestinationLeaseContext | None,
-    *,
-    app_name: str,
-    ledger: Any,
-) -> NavigationAttemptResult:
-    """Invoke the existing Project/chat navigator for one bound destination.
-
-    This is the only place the autonomous loop reaches live ChatGPT Desktop
-    navigation, and it only runs when the caller has explicitly opted into
-    operator-approved navigation. It performs at most one navigation attempt.
-    Whether the resulting destination is correct is decided solely by the
-    downstream read-only gate; this service only reports whether the open action
-    was performed against the exact target.
-    """
-
-    del run_id, lease_context, ledger
-    from agent.chatgpt_navigation_diagnostic import open_chatgpt_project_chat
-
-    try:
-        result = open_chatgpt_project_chat(
-            project_title=binding.project_title,
-            chat_title=binding.chat_title,
-            confirm_open_chat=True,
-            app_name=app_name,
-        )
-    except Exception as exc:
-        return NavigationAttemptResult(
-            ok=False,
-            outcome="navigation_actor_exception",
-            reason_code="destination_navigation_actor_exception",
-            error_message=str(exc),
-        )
-
-    return _navigation_attempt_from_open_result(result)
-
-
-def _resolve_run_destination_binding(
-    run_id: str,
-    *,
-    ledger: Any,
-) -> RunDestinationBinding | None:
-    lookup = get_run_destination_binding(run_id, ledger=ledger)
-    if lookup.status == DestinationBindingLookupStatus.PRESENT and lookup.binding is not None:
-        return lookup.binding
-    return None
-
-
-def _navigation_summary(nav_result: NavigationAttemptResult) -> dict[str, Any]:
-    return {
-        "ok": bool(nav_result.ok),
-        "outcome": nav_result.outcome,
-        "reason_code": nav_result.reason_code,
-        "action_posted": bool(nav_result.action_posted),
-        "navigator_confirmed": bool(nav_result.navigator_confirmed),
-    }
-
-
-def _record_navigation_attempt_event(
-    run_id: str,
-    binding: RunDestinationBinding | None,
-    nav_result: NavigationAttemptResult,
-    *,
-    attempt_number: int | None = None,
-    max_attempts: int | None = None,
-    ledger: Any,
-) -> dict[str, Any]:
-    metadata = {
-        "run_id": run_id,
-        "binding_project_title": getattr(binding, "project_title", None),
-        "binding_chat_title": getattr(binding, "chat_title", None),
-        "operator_approved": True,
-        "navigation_ok": bool(nav_result.ok),
-        "navigation_outcome": nav_result.outcome,
-        "reason_code": nav_result.reason_code,
-        "navigation_action_posted": bool(nav_result.action_posted),
-        "navigator_confirmed": bool(nav_result.navigator_confirmed),
-        "destination_verified": False,
-    }
-    if attempt_number is not None:
-        metadata["attempt_number"] = attempt_number
-    if max_attempts is not None:
-        metadata["max_attempts"] = max_attempts
-    event_id = ledger.add_event(
-        run_id,
-        CHATGPT_DESTINATION_NAVIGATION_ATTEMPT_EVENT_TYPE,
-        CHATGPT_DESTINATION_NAVIGATION_ATTEMPT_MESSAGE,
-        metadata,
-    )
-    return {
-        "event_type": CHATGPT_DESTINATION_NAVIGATION_ATTEMPT_EVENT_TYPE,
-        "event_id": event_id if isinstance(event_id, int) else None,
-        "metadata": metadata,
-    }
-
-
-def _record_handoff_phase_event(
-    run_id: str,
-    phase: str,
-    *,
-    navigation_operator_approved: bool,
-    navigation_summary: dict[str, Any] | None,
-    ledger: Any,
-) -> dict[str, Any]:
-    metadata = {
-        "run_id": run_id,
-        "handoff_phase": phase,
-        "navigation_operator_approved": bool(navigation_operator_approved),
-        "navigation": navigation_summary,
-    }
-    event_id = ledger.add_event(
-        run_id,
-        CHATGPT_HANDOFF_PHASE_EVENT_TYPE,
-        CHATGPT_HANDOFF_PHASE_MESSAGE,
-        metadata,
-    )
-    return {
-        "event_type": CHATGPT_HANDOFF_PHASE_EVENT_TYPE,
-        "event_id": event_id if isinstance(event_id, int) else None,
-        "metadata": metadata,
-    }
-
-
 def _normalize_approval_mode(approval_mode: str) -> str:
     if approval_mode in {"human", "interactive"}:
         return "human"
@@ -583,34 +350,6 @@ def _event_from_service_result(result: Any) -> dict[str, Any] | None:
         "event_id": getattr(result, "event_id", None),
         "metadata": getattr(result, "metadata", None),
     }
-
-
-def _exception_service_result(
-    *,
-    reason_code: str,
-    error_message: str,
-) -> Any:
-    return type(
-        "_ExceptionServiceResult",
-        (),
-        {
-            "ok": False,
-            "reason_code": reason_code,
-            "error_message": error_message,
-            "event_type": None,
-            "event_id": None,
-            "metadata": {
-                "reason_code": reason_code,
-                "error": error_message,
-            },
-        },
-    )()
-
-
-def _chatgpt_submit_failure_retryable(result: Any) -> bool:
-    # Payload construction failures are deterministic; cursor/focus retries can
-    # only help once there is a valid message ready to transfer.
-    return getattr(result, "event_type", None) != "gpt_feedback_generation_failed"
 
 
 def _release_failure_event(
@@ -758,11 +497,9 @@ def _record_destination_gate_blocked_event(
     gate_result: DestinationGateResult,
     acquire_result: Any,
     *,
-    navigation_summary: dict[str, Any] | None = None,
     ledger: Any,
 ) -> dict[str, Any]:
     metadata = _destination_gate_metadata(gate_result, acquire_result)
-    metadata["navigation"] = navigation_summary
     event_id = ledger.add_event(
         gate_result.run_id,
         CHATGPT_DESTINATION_GATE_BLOCKED_EVENT_TYPE,
@@ -780,7 +517,6 @@ def _mark_destination_gate_handoff_blocked(
     run_id: str,
     run: dict | None,
     *,
-    error: str = CHATGPT_DESTINATION_GATE_BLOCKED_STATUS_ERROR,
     ledger: Any,
 ) -> str | None:
     if run is None or not hasattr(ledger, "update_run_status"):
@@ -790,7 +526,7 @@ def _mark_destination_gate_handoff_blocked(
             run_id,
             RunStatus.NEEDS_REVIEW,
             final_summary=run.get("final_summary"),
-            error=error,
+            error=CHATGPT_DESTINATION_GATE_BLOCKED_STATUS_ERROR,
         )
     except Exception:
         return None
@@ -808,7 +544,6 @@ def _destination_gate_blocked_result(
     status: str | None,
     metadata: dict[str, Any],
     events_written: list[dict[str, Any]],
-    navigation_summary: dict[str, Any] | None = None,
 ) -> SupervisionStepResult:
     gate_metadata = _destination_gate_metadata(gate_result, acquire_result)
     return SupervisionStepResult(
@@ -828,52 +563,6 @@ def _destination_gate_blocked_result(
             **metadata,
             "chatgpt_destination_gate": {
                 **gate_metadata,
-                "feedback_ui_handoff_skipped": True,
-                "navigation": navigation_summary,
-            },
-            "chatgpt_ui_lease": {
-                "acquire_ok": True,
-                "event_type": getattr(acquire_result, "event_type", None),
-                "event_id": getattr(acquire_result, "event_id", None),
-                "exclusive_ui_owner_only": True,
-                "destination_verified": False,
-            },
-        },
-    )
-
-
-def _navigation_blocked_result(
-    *,
-    run_id: str,
-    plan: SupervisePlan,
-    action_value: str,
-    plan_metadata: dict[str, Any],
-    status: str | None,
-    metadata: dict[str, Any],
-    acquire_result: Any,
-    navigation_summary: dict[str, Any],
-    reason_code: str,
-    error_message: str | None,
-    events_written: list[dict[str, Any]],
-) -> SupervisionStepResult:
-    return SupervisionStepResult(
-        ok=False,
-        run_id=run_id,
-        planner_action=action_value,
-        planner_reason_code=plan.reason,
-        planner_metadata=plan_metadata,
-        action_executed=False,
-        next_state_hint="blocked",
-        blocked=True,
-        reason_code=reason_code,
-        error_message=error_message or reason_code,
-        events_written=events_written,
-        run_status=status,
-        metadata={
-            **metadata,
-            "chatgpt_destination_navigation": {
-                **navigation_summary,
-                "operator_approved": True,
                 "feedback_ui_handoff_skipped": True,
             },
             "chatgpt_ui_lease": {
@@ -1009,8 +698,6 @@ def _run_chatgpt_handoff_transaction(
     extraction_service: Callable[..., Any],
     destination_gate_service: Callable[..., Any],
     destination_adapter_factory: Callable[[], Any],
-    destination_navigation_service: Callable[..., Any],
-    allow_destination_navigation: bool,
     before_action_callback: Callable[[SupervisePlan, dict | None, list[dict]], None] | None,
     events: list[dict],
 ) -> SupervisionStepResult:
@@ -1050,199 +737,62 @@ def _run_chatgpt_handoff_transaction(
     try:
         events_written = _result_events_written(acquire_result)
         lease_context = _lease_context_from_acquire_result(run_id, acquire_result)
-        phase = HANDOFF_PHASE_NAVIGATION_NOT_REQUESTED
-        navigation_summary: dict[str, Any] | None = None
+        try:
+            gate_result = destination_gate_service(
+                run_id,
+                lease_context,
+                adapter_factory=destination_adapter_factory,
+                ledger=ledger,
+            )
+        except Exception:
+            gate_result = destination_gate_failure(
+                run_id=run_id,
+                reason_code="destination_verification_unavailable",
+                binding=None,
+                lease_context=lease_context,
+            )
 
-        # --- Separate navigation actor (operator-approved only) -------------
-        # Runs after the UI lease is held and strictly before the read-only
-        # destination gate. A ChatGPT UI handoff is fragile when the operator is
-        # also using the pointer, so the send path retries the entire
-        # navigate -> verify -> submit sequence before giving up.
-        max_attempts = (
-            CHATGPT_HANDOFF_MAX_UI_ATTEMPTS
-            if plan.action == SuperviseAction.ASK_SEND_TO_GPT
-            else 1
-        )
-        handoff_attempts: list[dict[str, Any]] = []
+        if not _result_ok(gate_result) or getattr(gate_result, "state", None) != DESTINATION_VERIFIED_EXACT:
+            gate_event = _record_destination_gate_blocked_event(
+                gate_result,
+                acquire_result,
+                ledger=ledger,
+            )
+            events_written.append(gate_event)
+            blocked_status = _mark_destination_gate_handoff_blocked(
+                run_id,
+                run,
+                ledger=ledger,
+            )
+            final_result = _destination_gate_blocked_result(
+                gate_result=gate_result,
+                acquire_result=acquire_result,
+                run_id=run_id,
+                plan=plan,
+                action_value=action_value,
+                plan_metadata=plan_metadata,
+                status=blocked_status or status,
+                metadata=metadata,
+                events_written=events_written,
+            )
+        elif before_action_callback is not None:
+            before_action_callback(plan, run, events)
+
         current_result: Any = None
         current_stage = str(plan.action)
 
-        for attempt_number in range(1, max_attempts + 1):
-            current_stage = str(plan.action)
-            attempt_can_retry = (
-                plan.action == SuperviseAction.ASK_SEND_TO_GPT
-                and attempt_number < max_attempts
+        if final_result is None and plan.action == SuperviseAction.ASK_SEND_TO_GPT:
+            current_result = submit_service(
+                run_id,
+                run,
+                app_name,
+                approval_mode=mode,
+                ledger=ledger,
             )
-            attempt_summary: dict[str, Any] = {
-                "attempt_number": attempt_number,
-                "max_attempts": max_attempts,
-            }
-
-            if allow_destination_navigation:
-                phase = HANDOFF_PHASE_NAVIGATION_STARTED
-                binding = _resolve_run_destination_binding(run_id, ledger=ledger)
-                if binding is None:
-                    nav_result = NavigationAttemptResult(
-                        ok=False,
-                        outcome="destination_binding_unavailable",
-                        reason_code="destination_binding_unavailable",
-                    )
-                else:
-                    try:
-                        nav_result = destination_navigation_service(
-                            run_id,
-                            binding,
-                            lease_context,
-                            app_name=app_name,
-                            ledger=ledger,
-                        )
-                    except Exception as nav_exc:
-                        nav_result = NavigationAttemptResult(
-                            ok=False,
-                            outcome="navigation_actor_exception",
-                            reason_code="destination_navigation_actor_exception",
-                            error_message=str(nav_exc),
-                        )
-                navigation_summary = _navigation_summary(nav_result)
-                attempt_summary["navigation"] = navigation_summary
-                nav_event = _record_navigation_attempt_event(
-                    run_id,
-                    binding,
-                    nav_result,
-                    attempt_number=attempt_number,
-                    max_attempts=max_attempts,
-                    ledger=ledger,
-                )
-                events_written.append(nav_event)
-                if not nav_result.ok:
-                    phase = HANDOFF_PHASE_NAVIGATION_FAILED
-                    attempt_summary["stage"] = "navigation"
-                    attempt_summary["ok"] = False
-                    attempt_summary["reason_code"] = (
-                        nav_result.reason_code or "destination_navigation_incomplete"
-                    )
-                    handoff_attempts.append(attempt_summary)
-                    if attempt_can_retry:
-                        continue
-                    blocked_status = _mark_destination_gate_handoff_blocked(
-                        run_id,
-                        run,
-                        error=CHATGPT_DESTINATION_NAVIGATION_BLOCKED_STATUS_ERROR,
-                        ledger=ledger,
-                    )
-                    final_result = _navigation_blocked_result(
-                        run_id=run_id,
-                        plan=plan,
-                        action_value=action_value,
-                        plan_metadata=plan_metadata,
-                        status=blocked_status or status,
-                        metadata=metadata,
-                        acquire_result=acquire_result,
-                        navigation_summary=navigation_summary,
-                        reason_code=nav_result.reason_code or "destination_navigation_incomplete",
-                        error_message=nav_result.error_message,
-                        events_written=events_written,
-                    )
-                    break
-                phase = HANDOFF_PHASE_NAVIGATION_SUCCEEDED
-
-            # --- Read-only destination gate (fresh post-navigation evidence) ----
-            # The gate builds a fresh adapter and reads a fresh snapshot; when
-            # navigation just ran, that snapshot is the fresh post-navigation
-            # evidence. The gate remains a pure verifier and is never given
-            # navigation behavior.
-            phase = HANDOFF_PHASE_VERIFICATION_STARTED
-            try:
-                gate_result = destination_gate_service(
-                    run_id,
-                    lease_context,
-                    adapter_factory=destination_adapter_factory,
-                    ledger=ledger,
-                )
-            except Exception:
-                gate_result = destination_gate_failure(
-                    run_id=run_id,
-                    reason_code="destination_verification_unavailable",
-                    binding=None,
-                    lease_context=lease_context,
-                )
-
-            if not _result_ok(gate_result) or getattr(gate_result, "state", None) != DESTINATION_VERIFIED_EXACT:
-                phase = HANDOFF_PHASE_VERIFICATION_FAILED
-                reason_code = gate_result.reason_code or "destination_verification_unavailable"
-                attempt_summary["stage"] = "verification"
-                attempt_summary["ok"] = False
-                attempt_summary["reason_code"] = reason_code
-                attempt_summary["navigation"] = navigation_summary
-                handoff_attempts.append(attempt_summary)
-                if attempt_can_retry:
-                    continue
-                gate_event = _record_destination_gate_blocked_event(
-                    gate_result,
-                    acquire_result,
-                    navigation_summary=navigation_summary,
-                    ledger=ledger,
-                )
-                events_written.append(gate_event)
-                blocked_status = _mark_destination_gate_handoff_blocked(
-                    run_id,
-                    run,
-                    ledger=ledger,
-                )
-                final_result = _destination_gate_blocked_result(
-                    gate_result=gate_result,
-                    acquire_result=acquire_result,
-                    run_id=run_id,
-                    plan=plan,
-                    action_value=action_value,
-                    plan_metadata=plan_metadata,
-                    status=blocked_status or status,
-                    metadata=metadata,
-                    events_written=events_written,
-                    navigation_summary=navigation_summary,
-                )
-                break
-
-            phase = HANDOFF_PHASE_VERIFICATION_SUCCEEDED
-            if before_action_callback is not None:
-                before_action_callback(plan, run, events)
-
-            if plan.action != SuperviseAction.ASK_SEND_TO_GPT:
-                attempt_summary["stage"] = "verification"
-                attempt_summary["ok"] = True
-                attempt_summary["reason_code"] = "destination_verified"
-                attempt_summary["navigation"] = navigation_summary
-                handoff_attempts.append(attempt_summary)
-                break
-
-            phase = HANDOFF_PHASE_SUBMISSION_STARTED
-            try:
-                current_result = submit_service(
-                    run_id,
-                    run,
-                    app_name,
-                    approval_mode=mode,
-                    ledger=ledger,
-                )
-            except Exception as submit_exc:
-                current_result = _exception_service_result(
-                    reason_code="submit_feedback_exception",
-                    error_message=str(submit_exc),
-                )
             event = _event_from_service_result(current_result)
             if event is not None:
                 events_written.append(event)
             if not _result_ok(current_result):
-                reason_code = _result_reason_code(current_result, "submit_feedback_failed")
-                retryable_failure = _chatgpt_submit_failure_retryable(current_result)
-                attempt_summary["stage"] = "submission"
-                attempt_summary["ok"] = False
-                attempt_summary["reason_code"] = reason_code
-                attempt_summary["retryable"] = retryable_failure
-                attempt_summary["navigation"] = navigation_summary
-                handoff_attempts.append(attempt_summary)
-                if attempt_can_retry and retryable_failure:
-                    continue
                 final_result = _chatgpt_step_result(
                     ok=False,
                     run_id=run_id,
@@ -1256,21 +806,10 @@ def _run_chatgpt_handoff_transaction(
                     default_reason_code="submit_feedback_failed",
                     events_written=events_written,
                 )
-                break
-
-            attempt_summary["stage"] = "submission"
-            attempt_summary["ok"] = True
-            attempt_summary["reason_code"] = _result_reason_code(
-                current_result,
-                "chatgpt_submission_verified",
-            )
-            attempt_summary["navigation"] = navigation_summary
-            handoff_attempts.append(attempt_summary)
-            current_stage = str(SuperviseAction.CAPTURE_GPT_RESPONSE)
-            break
+            else:
+                current_stage = str(SuperviseAction.CAPTURE_GPT_RESPONSE)
 
         if final_result is None and current_stage == str(SuperviseAction.CAPTURE_GPT_RESPONSE):
-            phase = HANDOFF_PHASE_CAPTURE_STARTED
             current_result = capture_service(
                 run_id,
                 run,
@@ -1311,8 +850,6 @@ def _run_chatgpt_handoff_transaction(
             if event is not None:
                 events_written.append(event)
             ok = _result_ok(current_result)
-            if ok:
-                phase = HANDOFF_PHASE_CONTINUATION_STARTED
             final_result = _chatgpt_step_result(
                 ok=ok,
                 run_id=run_id,
@@ -1341,35 +878,7 @@ def _run_chatgpt_handoff_transaction(
                 error_message=f"Unknown ChatGPT handoff action: {plan.action}",
                 run_status=status,
                 metadata=metadata,
-                events_written=events_written,
             )
-
-        # One compact, bounded phase marker per transaction so the local read
-        # model can surface where the handoff stopped (not a prose trace).
-        phase_event = _record_handoff_phase_event(
-            run_id,
-            phase,
-            navigation_operator_approved=allow_destination_navigation,
-            navigation_summary=navigation_summary,
-            ledger=ledger,
-        )
-        events_written.append(phase_event)
-        final_result = replace(
-            final_result,
-            metadata={
-                **final_result.metadata,
-                "chatgpt_handoff_retry": {
-                    "attempt_count": len(handoff_attempts),
-                    "max_attempts": max_attempts,
-                    "attempts": handoff_attempts,
-                },
-                "chatgpt_handoff_phase": {
-                    "phase": phase,
-                    "navigation_operator_approved": bool(allow_destination_navigation),
-                    "navigation": navigation_summary,
-                },
-            },
-        )
     except BaseException as exc:
         original_exc = exc
         raise
@@ -1450,8 +959,6 @@ def run_supervision_step(
     extracted_prompt_execution_service: Callable[..., Any] = _default_run_prompt_service,
     destination_gate_service: Callable[..., Any] = _default_destination_gate_service,
     destination_adapter_factory: Callable[[], Any] = _default_destination_adapter_factory,
-    destination_navigation_service: Callable[..., Any] = _default_destination_navigation_service,
-    allow_destination_navigation: bool = False,
     send_auto_safety_evaluator: Callable[[object, list[dict]], tuple[bool, str]] = send_plan_auto_safe,
     auto_stop_recorder: Callable[..., dict[str, Any]] = record_supervise_auto_stop,
     before_action_callback: Callable[[SupervisePlan, dict | None, list[dict]], None] | None = None,
@@ -1593,8 +1100,6 @@ def run_supervision_step(
             extraction_service=extraction_service,
             destination_gate_service=destination_gate_service,
             destination_adapter_factory=destination_adapter_factory,
-            destination_navigation_service=destination_navigation_service,
-            allow_destination_navigation=allow_destination_navigation,
             before_action_callback=before_action_callback,
             events=events,
         )
@@ -1618,8 +1123,6 @@ def run_supervision_step(
             extraction_service=extraction_service,
             destination_gate_service=destination_gate_service,
             destination_adapter_factory=destination_adapter_factory,
-            destination_navigation_service=destination_navigation_service,
-            allow_destination_navigation=allow_destination_navigation,
             before_action_callback=before_action_callback,
             events=events,
         )
@@ -1643,8 +1146,6 @@ def run_supervision_step(
             extraction_service=extraction_service,
             destination_gate_service=destination_gate_service,
             destination_adapter_factory=destination_adapter_factory,
-            destination_navigation_service=destination_navigation_service,
-            allow_destination_navigation=allow_destination_navigation,
             before_action_callback=before_action_callback,
             events=events,
         )
@@ -1688,6 +1189,24 @@ def run_supervision_step(
         else:
             if before_action_callback is not None:
                 before_action_callback(plan, run, events)
+            if not bool(getattr(plan, "prompt_auto_run_safe", False)):
+                reason = getattr(plan, "prompt_auto_run_reason", "") or "prompt_not_routine_safe"
+                event = auto_stop_recorder(run_id, plan, reason, ledger=ledger)
+                return SupervisionStepResult(
+                    ok=False,
+                    run_id=run_id,
+                    planner_action=action_value,
+                    planner_reason_code=plan.reason,
+                    planner_metadata=plan_metadata,
+                    action_executed=False,
+                    next_state_hint="blocked",
+                    blocked=True,
+                    reason_code=reason,
+                    error_message="Extracted prompt requires human approval before Codex execution.",
+                    events_written=[event],
+                    run_status=status,
+                    metadata={**run_metadata, "prompt_auto_run_safe": False, "prompt_auto_run_reason": reason},
+                )
         result = extracted_prompt_execution_service(
             run_id,
             run,

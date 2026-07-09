@@ -67,7 +67,7 @@ def capture_git_snapshot(repo_path: str) -> dict:
     is_inside_result = run_command(
         GIT_COMMANDS["is_inside_work_tree"],
         cwd=repo_path_text,
-        timeout_seconds=30,
+        timeout_seconds=None,
     )
     commands["is_inside_work_tree"] = is_inside_result
     snapshot["commands"] = commands
@@ -86,7 +86,7 @@ def capture_git_snapshot(repo_path: str) -> dict:
         "diff_name_only",
         "diff_name_status",
     ):
-        commands[name] = run_command(GIT_COMMANDS[name], cwd=repo_path_text, timeout_seconds=30)
+        commands[name] = run_command(GIT_COMMANDS[name], cwd=repo_path_text, timeout_seconds=None)
 
     snapshot["head"] = _clean_optional(_command_value(commands["head"]))
     snapshot["branch"] = _clean_optional(_command_value(commands["branch"]))
@@ -131,10 +131,10 @@ def capture_git_diff_metadata(repo_path: str, paths: list[str] | None = None) ->
         metadata["validation_error"] = f"Repo path is not a directory: {repo_path_text}"
         return metadata
 
-    name_status_result = run_command(GIT_COMMANDS["diff_name_status"], cwd=repo_path_text, timeout_seconds=30)
+    name_status_result = run_command(GIT_COMMANDS["diff_name_status"], cwd=repo_path_text, timeout_seconds=None)
     metadata["commands"]["diff_name_status"] = name_status_result
     if name_status_result["exit_code"] != 0 or name_status_result["timed_out"]:
-        metadata["validation_error"] = "git diff --name-status failed or timed out"
+        metadata["validation_error"] = "git diff --name-status failed"
         return metadata
 
     name_status = name_status_result["stdout"].rstrip("\n")
@@ -145,10 +145,10 @@ def capture_git_diff_metadata(repo_path: str, paths: list[str] | None = None) ->
     diff_command = ["git", "diff", "--unified=0"]
     if changed_paths:
         diff_command = [*diff_command, "--", *changed_paths]
-    diff_result = run_command(diff_command, cwd=repo_path_text, timeout_seconds=30)
+    diff_result = run_command(diff_command, cwd=repo_path_text, timeout_seconds=None)
     metadata["commands"]["diff_unified_zero"] = diff_result
     if diff_result["exit_code"] != 0 or diff_result["timed_out"]:
-        metadata["validation_error"] = "git diff --unified=0 failed or timed out"
+        metadata["validation_error"] = "git diff --unified=0 failed"
         return metadata
     metadata["diff_unified_zero"] = diff_result["stdout"]
     return metadata
@@ -240,7 +240,7 @@ def _read_worktree_file(repo_path: Path, path: str) -> dict:
 
 
 def _read_head_file(repo_path: str, path: str) -> dict:
-    result = run_command(["git", "show", f"HEAD:{path}"], cwd=repo_path, timeout_seconds=30)
+    result = run_command(["git", "show", f"HEAD:{path}"], cwd=repo_path, timeout_seconds=None)
     if result["exit_code"] != 0 or result["timed_out"]:
         return {
             "exists": False,
@@ -277,10 +277,10 @@ def capture_invocation_git_state(repo_path: str) -> dict:
         state["validation_error"] = f"Repo path is not a directory: {repo_path_text}"
         return state
 
-    status_result = run_command(GIT_COMMANDS["status_porcelain_z"], cwd=repo_path_text, timeout_seconds=30)
+    status_result = run_command(GIT_COMMANDS["status_porcelain_z"], cwd=repo_path_text, timeout_seconds=None)
     state["commands"]["status_porcelain_z"] = status_result
     if status_result["exit_code"] != 0 or status_result["timed_out"]:
-        state["validation_error"] = "git status --porcelain failed or timed out"
+        state["validation_error"] = "git status --porcelain failed"
         return state
 
     state["status_porcelain"] = status_result["stdout"]

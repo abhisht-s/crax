@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import shlex
 import sys
@@ -20,6 +21,7 @@ from agent.chatgpt_navigation_diagnostic import (
     DEFAULT_MAX_NODES as DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
     DEEP_INSPECTOR_OUTPUT_CHAR_GUARD,
     calibrate_chatgpt_sidebar_coordinate_mapping,
+    diagnose_chatgpt_project_chat_rows,
     inspect_chatgpt_navigation_ui,
     inspect_chatgpt_project_chat_row_ax,
     inspect_chatgpt_project_visible_chats,
@@ -87,14 +89,14 @@ from agent import ledger
 
 
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
-DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS = 30
-DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS = 300
+DEFAULT_CODEX_CHECK_TIMEOUT_SECONDS: int | None = None
+DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS: int | None = None
 CHATGPT_TARGET_PASTE_MARKER = "WATCH_TO_CODEX_STAGE_5_6B_TARGET_PASTE_TEST_DO_NOT_SUBMIT"
 CHATGPT_TARGET_PASTE_DELAY_SECONDS = 0.3
-CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS = 5.0
+CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS: float | None = None
 CHATGPT_PASTE_VERIFY_POLL_SECONDS = 0.15
 CHATGPT_POST_PASTE_SETTLE_SECONDS = 0.5
-CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS = 15.0
+CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS: float | None = None
 CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS = 0.35
 CHATGPT_NAVIGATION_COMPACT_OUTPUT_CHAR_GUARD = 25_000
 
@@ -209,8 +211,8 @@ def _build_parser() -> argparse.ArgumentParser:
     capture_gpt_response_ax_parser.add_argument(
         "--timeout-seconds",
         type=float,
-        default=DEFAULT_CAPTURE_TIMEOUT_SECONDS,
-        help=f"Maximum seconds to wait for a stable response. Default: {DEFAULT_CAPTURE_TIMEOUT_SECONDS:g}.",
+        default=None,
+        help="Deprecated; ignored. ChatGPT response capture has no elapsed-time deadline.",
     )
     capture_gpt_response_ax_parser.add_argument(
         "--stable-seconds",
@@ -495,6 +497,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
     )
 
+    diagnose_chatgpt_project_chat_rows_parser = subparsers.add_parser(
+        "diagnose-chatgpt-project-chat-rows",
+        help="Read-only visual-row diagnostic for an already-open ChatGPT project Chats list.",
+        description=(
+            "Read-only AX diagnostic for every visible visual row band in the confirmed project Chats list. "
+            "No app activation, click, scroll, AXPress, keyboard, paste, cursor, screenshot, OCR, browser, or workflow action is performed."
+        ),
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--project-title",
+        required=True,
+        help="Exact title of the already-open ChatGPT project.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--contains-title",
+        default="",
+        help="Optional diagnostic output filter. Collection and matching remain unchanged.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--app-name",
+        default="ChatGPT",
+        help="macOS application name to inspect. Default: ChatGPT.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH,
+        help=f"Maximum AX tree depth to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_DEPTH}.",
+    )
+    diagnose_chatgpt_project_chat_rows_parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES,
+        help=f"Maximum AX nodes to inspect. Default: {DEFAULT_NAVIGATION_DIAGNOSTIC_MAX_NODES}.",
+    )
+
     open_chatgpt_project_chat_parser = subparsers.add_parser(
         "open-chatgpt-project-chat",
         help="Open one exact currently visible chat inside an exact ChatGPT project.",
@@ -675,6 +713,63 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     can_continue_parser.add_argument("run_id", help="Run ID to check.")
 
+    release_stale_lease_parser = subparsers.add_parser(
+        "release-stale-chatgpt-ui-lease",
+        help="Manually append a release event for an operator-confirmed stale ChatGPT UI lease.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--owning-run-id",
+        required=True,
+        help="Expected run ID that currently owns the active lease.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--owner-pid",
+        required=True,
+        type=int,
+        help="Expected owner PID recorded on the active lease.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--acquired-at",
+        required=True,
+        help="Expected acquired_at timestamp recorded on the active lease.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--active-event-id",
+        "--lease-event-id",
+        dest="active_event_id",
+        required=True,
+        type=int,
+        help="Expected event id of the active chatgpt_ui_lease_acquired event.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--expected-run-status",
+        help="Optional expected current status of the owning run, for example completed.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--expected-lease-token-sha256",
+        help="Optional expected active lease token fingerprint.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--reason",
+        required=True,
+        help="Operator-visible reason for the manual stale lease release.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--source",
+        default="manual_stale_release",
+        help="Release source metadata. Default: manual_stale_release.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--confirm-stale",
+        action="store_true",
+        help="Required. Confirms the active owner was manually verified stale.",
+    )
+    release_stale_lease_parser.add_argument(
+        "--allow-owner-pid-alive",
+        action="store_true",
+        help="Allow release even if the owner PID currently exists after separate manual PID-reuse verification.",
+    )
+
     approve_parser = subparsers.add_parser("approve", help="Approve a flagged run.")
     approve_parser.add_argument("run_id", help="Run ID to approve.")
     approve_parser.add_argument("--note", default="", help="Optional human approval note.")
@@ -717,8 +812,8 @@ def _build_parser() -> argparse.ArgumentParser:
     codex_run_parser.add_argument(
         "--timeout",
         type=int,
-        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
-        help=f"Timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+        default=None,
+        help="Deprecated; ignored. Codex execution has no elapsed-time deadline.",
     )
     codex_run_parser.add_argument(
         "--no-supervise",
@@ -766,8 +861,8 @@ def _build_parser() -> argparse.ArgumentParser:
     run_extracted_codex_prompt_parser.add_argument(
         "--timeout",
         type=int,
-        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
-        help=f"Timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+        default=None,
+        help="Deprecated; ignored. Codex execution has no elapsed-time deadline.",
     )
 
     supervise_parser = subparsers.add_parser(
@@ -793,14 +888,14 @@ def _build_parser() -> argparse.ArgumentParser:
     supervise_parser.add_argument(
         "--timeout",
         type=int,
-        default=DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS,
-        help=f"Codex timeout in seconds. Default: {DEFAULT_CODEX_EXEC_TIMEOUT_SECONDS}.",
+        default=None,
+        help="Deprecated; ignored. Codex execution has no elapsed-time deadline.",
     )
     supervise_parser.add_argument(
         "--capture-timeout-seconds",
         type=float,
-        default=DEFAULT_CAPTURE_TIMEOUT_SECONDS,
-        help=f"Maximum seconds to wait for a stable ChatGPT response. Default: {DEFAULT_CAPTURE_TIMEOUT_SECONDS:g}.",
+        default=None,
+        help="Deprecated; ignored. ChatGPT response capture has no elapsed-time deadline.",
     )
     supervise_parser.add_argument(
         "--stable-seconds",
@@ -849,6 +944,44 @@ def _print_run(run: dict, events: list[dict]) -> None:
         print(f"      message: {event['message']}")
         if event["metadata_json"]:
             print(f"      metadata: {event['metadata_json']}")
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _print_manual_stale_lease_release_result(result) -> None:
+    print("Manual ChatGPT UI lease release")
+    print(f"  status: {result.status}")
+    print(f"  event_written: {str(bool(result.event_written)).lower()}")
+    if result.event_id is not None:
+        print(f"  event_id: {result.event_id}")
+    if result.run_id:
+        print(f"  run_id: {result.run_id}")
+    if result.run_status:
+        print(f"  run_status: {result.run_status}")
+    if result.active_event_id is not None:
+        print(f"  active_event_id: {result.active_event_id}")
+    if result.owning_run_id:
+        print(f"  owning_run_id: {result.owning_run_id}")
+    if result.owner_pid is not None:
+        print(f"  owner_pid: {result.owner_pid}")
+    if result.acquired_at:
+        print(f"  acquired_at: {result.acquired_at}")
+    if result.released_at:
+        print(f"  released_at: {result.released_at}")
+    if result.reason_code:
+        print(f"  reason_code: {result.reason_code}")
+    if result.error_message:
+        print(f"  error: {result.error_message}")
 
 
 def _normalize_shell_command(raw_command: list[str]) -> list[str]:
@@ -1041,10 +1174,9 @@ def _focused_composer_from_observation(observation: dict) -> dict | None:
 
 
 def _wait_for_pasted_marker(app_name: str, marker_text: str) -> dict:
-    deadline = time.monotonic() + CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS
     polls = 0
     last_observation: dict = {}
-    while time.monotonic() <= deadline:
+    while True:
         polls += 1
         observation = inspect_chatgpt_submission_ui(app_name, marker_text=marker_text)
         last_observation = observation
@@ -1054,23 +1186,12 @@ def _wait_for_pasted_marker(app_name: str, marker_text: str) -> dict:
                 "ok": True,
                 "reason_code": "chatgpt_draft_pasted",
                 "poll_count": polls,
-                "timeout_seconds": CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS,
+                "timeout_seconds": None,
                 "poll_interval_seconds": CHATGPT_PASTE_VERIFY_POLL_SECONDS,
                 "observation": _submission_ui_observation_summary(observation, marker_text),
             }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(CHATGPT_PASTE_VERIFY_POLL_SECONDS, remaining))
-
-    return {
-        "ok": False,
-        "reason_code": "chatgpt_paste_not_visible",
-        "poll_count": polls,
-        "timeout_seconds": CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS,
-        "poll_interval_seconds": CHATGPT_PASTE_VERIFY_POLL_SECONDS,
-        "observation": _submission_ui_observation_summary(last_observation, marker_text),
-    }
+        if CHATGPT_PASTE_VERIFY_POLL_SECONDS > 0:
+            time.sleep(CHATGPT_PASTE_VERIFY_POLL_SECONDS)
 
 
 def _submission_verification_status(observation: dict, marker_text: str) -> dict:
@@ -1114,11 +1235,10 @@ def _submission_verification_status(observation: dict, marker_text: str) -> dict
 
 
 def _verify_submission_marker(app_name: str, marker_text: str) -> dict:
-    deadline = time.monotonic() + CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS
     polls = 0
     last_observation: dict = {}
     last_status: dict = {}
-    while time.monotonic() <= deadline:
+    while True:
         polls += 1
         observation = inspect_chatgpt_submission_ui(app_name, marker_text=marker_text)
         last_observation = observation
@@ -1129,25 +1249,13 @@ def _verify_submission_marker(app_name: str, marker_text: str) -> dict:
                 "ok": bool(status["verified"]),
                 "reason_code": status["reason_code"],
                 "poll_count": polls,
-                "timeout_seconds": CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
+                "timeout_seconds": None,
                 "poll_interval_seconds": CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
                 "status": status,
                 "observation": _submission_ui_observation_summary(observation, marker_text),
             }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS, remaining))
-
-    return {
-        "ok": False,
-        "reason_code": last_status.get("reason_code") or "chatgpt_submission_not_verified",
-        "poll_count": polls,
-        "timeout_seconds": CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
-        "poll_interval_seconds": CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
-        "status": last_status,
-        "observation": _submission_ui_observation_summary(last_observation, marker_text),
-    }
+        if CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS > 0:
+            time.sleep(CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS)
 
 
 def _select_send_input_method(app_name: str, marker_text: str) -> tuple[dict, dict]:
@@ -1684,6 +1792,21 @@ def _print_inspect_chatgpt_project_visible_chats_result(result: dict) -> None:
             f"{_compact_plain_frame(chat_list_frame)}"
         ),
         f"more_rows_may_exist_below: {result.get('more_rows_may_exist_below')}",
+        f"project_chat_list_identity: {result.get('project_chat_list_identity') or 'not_confirmed'}",
+        (
+            "project_chat_list_container: "
+            f"path={result.get('project_chat_list_container_path') or ''} "
+            f"role={result.get('project_chat_list_container_role') or ''} "
+            f"frame={_compact_plain_frame(result.get('project_chat_list_container_frame') or {})}"
+        ),
+        f"project_chat_row_shape_status: {result.get('project_chat_row_shape_status') or ''}",
+        f"valid_project_chat_row_count: {result.get('valid_project_chat_row_count', 0)}",
+        f"invalid_candidate_count: {result.get('invalid_candidate_count', 0)}",
+        f"row_height_median: {result.get('row_height_median', 0.0)}",
+        f"vertical_peer_list_confirmed: {str(bool(result.get('vertical_peer_list_confirmed'))).lower()}",
+        f"chats_tab_active_evidence: {result.get('chats_tab_active_evidence') or ''}",
+        f"identity_stability_samples: {result.get('identity_stability_samples', 1)}",
+        f"identity_failure_reasons: {result.get('identity_failure_reasons') or []}",
         f"excluded_candidate_count: {sum((result.get('excluded_candidate_counts') or {}).values())}",
         f"excluded_candidate_reasons: {result.get('excluded_candidate_counts') or {}}",
         f"actions_performed: {result.get('actions_performed') or []}",
@@ -1756,6 +1879,127 @@ def _print_inspect_chatgpt_project_chat_row_ax_result(result: dict) -> None:
     sys.stdout.flush()
 
 
+def _print_diagnose_chatgpt_project_chat_rows_result(result: dict) -> None:
+    summary = result.get("summary") or {}
+    lines = [
+        "ChatGPT Project Chat Row Diagnostic",
+        "Project/list identity",
+        f"requested_project_title: {result.get('requested_project_title') or ''}",
+        f"project_identity_confirmed: {str(bool(result.get('project_identity_confirmed'))).lower()}",
+        f"project_chat_list_identity: {result.get('project_chat_list_identity') or 'not_confirmed'}",
+        f"project_chat_list_container_path: {result.get('project_chat_list_container_path') or ''}",
+        f"project_chat_list_container_role: {result.get('project_chat_list_container_role') or ''}",
+        f"project_chat_list_container_frame: {_compact_plain_frame(result.get('project_chat_list_container_frame') or {})}",
+        f"identity_failure_reasons: {result.get('identity_failure_reasons') or []}",
+        "Confirmed list viewport",
+        f"frame: {_compact_plain_frame(result.get('project_chat_list_container_frame') or {})}",
+        f"ax_nodes_inspected: {summary.get('ax_nodes_inspected', 0)}",
+        f"contains_title_filter: {result.get('contains_title') or ''}",
+        f"hidden_unrelated_band_count: {result.get('hidden_unrelated_band_count', 0)}",
+        "Current resolver accepted rows",
+    ]
+    for row in result.get("current_resolver_accepted_rows") or []:
+        lines.extend(
+            [
+                f"- ordinal={row.get('ordinal')} title={row.get('title') or ''}",
+                f"  row_path: {row.get('row_path') or ''}",
+                f"  row_frame: {_compact_plain_frame(row.get('row_frame') or {})}",
+                f"  title_representation: {row.get('title_representation') or ''}",
+            ]
+        )
+    if not result.get("current_resolver_accepted_rows"):
+        lines.append("- none")
+
+    lines.append("Visual row bands")
+    for band in result.get("visual_row_bands") or []:
+        lines.extend(
+            [
+                f"band_index: {band.get('band_index')}",
+                f"band_frame: {_compact_plain_frame(band.get('band_frame') or {})}",
+                f"band_height: {band.get('band_height')}",
+                f"node_count: {band.get('node_count')}",
+                f"outermost_candidate_path: {band.get('outermost_candidate_path') or ''}",
+                f"outermost_candidate_role: {band.get('outermost_candidate_role') or ''}",
+            ]
+        )
+
+    lines.append("Band candidate evidence")
+    for band in result.get("visual_row_bands") or []:
+        lines.append(f"band_index: {band.get('band_index')}")
+        for node in band.get("nodes") or []:
+            lines.extend(
+                [
+                    f"  node_index: {node.get('node_index')}",
+                    f"    role: {node.get('role') or ''}",
+                    f"    subrole: {node.get('subrole') or ''}",
+                    f"    path: {node.get('path') or ''}",
+                    f"    parent_path: {node.get('parent_path') or ''}",
+                    f"    parent_role: {node.get('parent_role') or ''}",
+                    f"    frame: {_compact_plain_frame(node.get('frame') or {})}",
+                    f"    frame_height: {node.get('frame_height')}",
+                    f"    actions: {node.get('actions') or []}",
+                    f"    AXTitle: {node.get('AXTitle') or ''}",
+                    f"    AXDescription: {node.get('AXDescription') or ''}",
+                    f"    AXValue: {node.get('AXValue') or ''}",
+                ]
+            )
+        for candidate in band.get("title_candidates") or []:
+            lines.extend(
+                [
+                    "  title_candidate:",
+                    f"    source_path: {candidate.get('source_path') or ''}",
+                    f"    source_role: {candidate.get('source_role') or ''}",
+                    f"    source_attribute: {candidate.get('source_attribute') or ''}",
+                    f"    raw_text: {candidate.get('raw_text') or ''}",
+                    f"    candidate_kind: {candidate.get('candidate_kind') or ''}",
+                ]
+            )
+
+    lines.append("Current resolver comparison")
+    for band in result.get("visual_row_bands") or []:
+        comparison = band.get("current_resolver_comparison") or {}
+        lines.extend(
+            [
+                f"band_index: {band.get('band_index')}",
+                f"current_resolver_status: {comparison.get('current_resolver_status') or ''}",
+                f"current_resolver_title: {comparison.get('current_resolver_title') or ''}",
+                f"current_resolver_row_path: {comparison.get('current_resolver_row_path') or ''}",
+                f"current_resolver_row_frame: {_compact_plain_frame(comparison.get('current_resolver_row_frame') or {})}",
+                f"current_resolver_rejection_reasons: {comparison.get('current_resolver_rejection_reasons') or []}",
+            ]
+        )
+
+    lines.append("Experimental canonical titles")
+    for band in result.get("visual_row_bands") or []:
+        canonical = band.get("experimental_canonical") or {}
+        lines.extend(
+            [
+                f"band_index: {band.get('band_index')}",
+                f"experimental_canonical_title: {canonical.get('experimental_canonical_title') or ''}",
+                f"experimental_preview: {canonical.get('experimental_preview') or ''}",
+                f"experimental_title_confidence: {canonical.get('experimental_title_confidence') or 'none'}",
+            ]
+        )
+
+    lines.extend(
+        [
+            "Summary",
+            f"ax_nodes_inspected: {summary.get('ax_nodes_inspected', 0)}",
+            f"visual_bands_found: {summary.get('visual_bands_found', 0)}",
+            f"bands_with_high_confidence_title: {summary.get('bands_with_high_confidence_title', 0)}",
+            f"bands_accepted_by_current_resolver: {summary.get('bands_accepted_by_current_resolver', 0)}",
+            f"bands_not_seen_by_current_resolver: {summary.get('bands_not_seen_by_current_resolver', 0)}",
+            f"bands_rejected_by_current_resolver: {summary.get('bands_rejected_by_current_resolver', 0)}",
+            f"filtered_bands_printed: {summary.get('filtered_bands_printed', 0)}",
+            f"final_outcome: {result.get('final_outcome') or result.get('status') or ''}",
+            f"actions_performed: {result.get('actions_performed') or []}",
+            f"error: {result.get('error') or ''}",
+        ]
+    )
+    print("\n".join(lines))
+    sys.stdout.flush()
+
+
 def _print_open_chatgpt_project_chat_result(result: dict) -> None:
     project = result.get("project_open_result") or {}
     row = result.get("matched_chat_row") or {}
@@ -1766,6 +2010,20 @@ def _print_open_chatgpt_project_chat_result(result: dict) -> None:
         f"requested_project_title: {result.get('project_title') or ''}",
         f"requested_chat_title: {result.get('chat_title') or ''}",
         f"project_open_result: outcome={project.get('outcome') or ''} ok={project.get('ok')} visible_chat_count={project.get('visible_chat_count', 0)}",
+        f"project_chat_list_identity: {result.get('project_chat_list_identity') or 'not_confirmed'}",
+        (
+            "project_chat_list_container: "
+            f"path={result.get('project_chat_list_container_path') or ''} "
+            f"role={result.get('project_chat_list_container_role') or ''}"
+        ),
+        f"project_chat_row_shape_status: {result.get('project_chat_row_shape_status') or ''}",
+        f"valid_project_chat_row_count: {result.get('valid_project_chat_row_count', 0)}",
+        f"invalid_candidate_count: {result.get('invalid_candidate_count', 0)}",
+        f"row_height_median: {result.get('row_height_median', 0.0)}",
+        f"vertical_peer_list_confirmed: {str(bool(result.get('vertical_peer_list_confirmed'))).lower()}",
+        f"chats_tab_active_evidence: {result.get('chats_tab_active_evidence') or ''}",
+        f"identity_stability_samples: {result.get('identity_stability_samples', 1)}",
+        f"identity_failure_reasons: {result.get('identity_failure_reasons') or []}",
         f"initial_visible_chat_count: {result.get('initial_visible_chat_count', result.get('visible_chat_count', 0))}",
         f"visible_chat_count: {result.get('visible_chat_count', 0)}",
         f"targeting_visible_chat_count: {result.get('targeting_visible_chat_count', result.get('visible_chat_count', 0))}",
@@ -1773,15 +2031,39 @@ def _print_open_chatgpt_project_chat_result(result: dict) -> None:
         f"max_scroll_iterations: {result.get('max_scroll_iterations', 0)}",
         f"search_cycles_attempted: {result.get('search_cycles_attempted', 0)}",
         f"max_search_cycles: {result.get('max_search_cycles', 0)}",
+        f"configured_max_search_cycles: {result.get('configured_max_search_cycles', result.get('max_search_cycles', 0))}",
+        f"configured_max_search_elapsed_seconds: {result.get('configured_max_search_elapsed_seconds', 0.0)}",
         f"scroll_pulses_posted: {result.get('scroll_pulses_posted', 0)}",
         f"scroll_method_used: {result.get('scroll_method_used') or ''}",
+        f"computed_scroll_delta_y: {result.get('computed_scroll_delta_y', 0)}",
+        f"median_visible_row_height: {result.get('median_visible_row_height', 0.0)}",
+        f"scan_continuity: {result.get('scan_continuity') or 'confirmed'}",
+        f"recovery_scroll_pulses_posted: {result.get('recovery_scroll_pulses_posted', 0)}",
         f"initial_hydration_status: {result.get('initial_hydration_status') or ''}",
         f"hydration_events_observed: {result.get('hydration_events_observed', 0)}",
         f"reset_events_observed: {result.get('reset_events_observed', 0)}",
         f"unique_accessibility_rows_seen: {result.get('unique_accessibility_rows_seen', 0)}",
         f"unique_effective_viewports_seen: {result.get('unique_effective_viewports_seen', 0)}",
+        f"new_accessibility_rows_seen: {result.get('new_accessibility_rows_seen', 0)}",
+        f"target_match_checked_on_samples: {result.get('target_match_checked_on_samples', 0)}",
+        f"hydration_samples_taken: {result.get('hydration_samples_taken', 0)}",
+        f"settled_cycles_completed: {result.get('settled_cycles_completed', 0)}",
+        f"progressful_cycles_completed: {result.get('progressful_cycles_completed', 0)}",
         f"target_initially_visible: {result.get('target_initially_visible')}",
         f"target_found_after_scrolling: {result.get('target_found_after_scrolling')}",
+        f"unique_chat_titles_printed: {result.get('unique_chat_titles_printed', 0)}",
+        f"target_exact_match_detected: {str(bool(result.get('target_exact_match_detected'))).lower()}",
+        f"target_detected_in: {result.get('target_detected_in') or ''}",
+        f"target_detected_cycle: {result.get('target_detected_cycle', 0)}",
+        f"scroll_pulses_after_target_detection: {result.get('scroll_pulses_after_target_detection', 0)}",
+        f"target_alignment_required: {str(bool(result.get('target_alignment_required'))).lower()}",
+        f"target_alignment_method: {result.get('target_alignment_method') or 'none'}",
+        f"target_alignment_posted: {str(bool(result.get('target_alignment_posted'))).lower()}",
+        f"target_alignment_row_path: {result.get('target_alignment_row_path') or ''}",
+        f"target_alignment_pre_visibility: {result.get('target_alignment_pre_visibility') or 'not_visible'}",
+        f"target_alignment_post_visibility: {result.get('target_alignment_post_visibility') or 'not_visible'}",
+        f"target_alignment_fresh_re_resolution_confirmed: {str(bool(result.get('target_alignment_fresh_re_resolution_confirmed'))).lower()}",
+        f"total_unique_valid_chats_discovered: {result.get('total_unique_valid_chats_discovered', result.get('unique_chat_titles_printed', 0))}",
         f"search_elapsed_seconds: {result.get('search_elapsed_seconds', 0.0)}",
         f"unique_row_count_seen: {result.get('unique_row_count_seen', 0)}",
         f"matched_chat_row_path: {row.get('row_path') or row.get('path') or ''}",
@@ -1800,15 +2082,23 @@ def _print_open_chatgpt_project_chat_result(result: dict) -> None:
         "chat_list_scroll_target_not_found",
         "chat_list_scroll_failed",
         "chat_list_scroll_no_progress",
+        "chat_list_scan_continuity_not_confirmed",
         "chat_list_end_reached_without_match",
         "chat_search_budget_exhausted_without_confirmed_end",
+        "chat_search_time_budget_exhausted_while_list_progressing",
     }:
         lines.extend(
             [
                 f"visible_title_count_seen: {result.get('visible_title_count_seen', 0)}",
                 f"end_of_list_state: {result.get('end_of_list_state') or 'unknown'}",
+                f"previous_settled_viewport_signature: {result.get('previous_settled_viewport_signature') or ''}",
+                f"current_settled_viewport_signature: {result.get('current_settled_viewport_signature') or ''}",
+                f"overlap_row_count: {result.get('overlap_row_count', 0)}",
+                f"overlap_adjacency_confirmed: {result.get('overlap_adjacency_confirmed', True)}",
             ]
         )
+    if result.get("target_found_during_hydration_cycle"):
+        lines.append(f"target_found_during_hydration_cycle: {result.get('target_found_during_hydration_cycle')}")
     for summary in result.get("search_cycle_summaries") or []:
         lines.append(str(summary))
     if result.get("visible_chat_count_stage_explanation"):
@@ -1838,6 +2128,13 @@ def _print_open_chatgpt_project_chat_result(result: dict) -> None:
         ]
     )
     print("\n".join(lines))
+    sys.stdout.flush()
+
+
+def _print_live_project_chat_discovery_lines(lines: list[str]) -> None:
+    for line in lines:
+        print(line)
+    sys.stdout.flush()
     sys.stdout.flush()
 
 
@@ -2751,7 +3048,7 @@ def _run_codex_exec_flow(
     prompt: str,
     repo_path_text: str,
     sandbox: str,
-    timeout: int,
+    timeout: float | None,
     confirm_full_access: bool,
 ) -> dict:
     prompt_contract = parse_prompt_contract(prompt, sandbox).to_dict()
@@ -3023,14 +3320,15 @@ def _capture_gpt_response_from_chatgpt_ax_flow(
     run_id: str,
     run: dict,
     app_name: str,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
     stable_seconds: float,
     require_sentinel_response: bool = False,
 ) -> bool:
+    del timeout_seconds
     result = capture_chatgpt_response_service(
         run_id,
         app_name=app_name,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=None,
         stable_seconds=stable_seconds,
         require_sentinel_response=require_sentinel_response,
         ledger=ledger,
@@ -3099,7 +3397,7 @@ def _run_extracted_codex_prompt_flow(
     run: dict,
     repo_path_text: str,
     sandbox: str,
-    timeout: int,
+    timeout: float | None,
     expected_extraction_event_id: int | None = None,
     expected_prompt_sha256: str | None = None,
     expected_prompt_text: str | None = None,
@@ -3241,9 +3539,6 @@ def _send_plan_auto_safe(plan: object, events: list[dict]) -> tuple[bool, str]:
 
 
 def _run_supervise_command(args: argparse.Namespace) -> int:
-    if args.capture_timeout_seconds <= 0:
-        print("error: --capture-timeout-seconds must be greater than 0.", file=sys.stderr)
-        return 2
     if args.stable_seconds < 0:
         print("error: --stable-seconds must be greater than or equal to 0.", file=sys.stderr)
         return 2
@@ -3270,7 +3565,7 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
         run_id: str,
         run: dict,
         app_name: str,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
         stable_seconds: float,
         *,
         require_sentinel_response: bool,
@@ -3305,7 +3600,7 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
         run: dict,
         repo_path_text: str,
         sandbox: str,
-        timeout: int,
+        timeout: float | None,
         *,
         expected_extraction_event_id: int | None,
         expected_prompt_sha256: str | None,
@@ -3395,8 +3690,8 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
             expected_event_ids=expected_event_ids,
             expected_prompt_sha256=expected_prompt_sha256,
             app_name=args.app_name,
-            timeout=args.timeout,
-            capture_timeout_seconds=args.capture_timeout_seconds,
+            timeout=None,
+            capture_timeout_seconds=None,
             capture_stable_seconds=args.stable_seconds,
             ledger=ledger,
             planner=detect_next_supervise_action,
@@ -3530,8 +3825,8 @@ def _supervise_args_for_codex_run(args: argparse.Namespace, repo_path_text: str)
         repo=repo_path_text,
         sandbox=args.sandbox,
         app_name="ChatGPT",
-        timeout=args.timeout,
-        capture_timeout_seconds=DEFAULT_CAPTURE_TIMEOUT_SECONDS,
+        timeout=None,
+        capture_timeout_seconds=None,
         stable_seconds=DEFAULT_STABLE_SECONDS,
         interactive=bool(getattr(args, "interactive", False)),
     )
@@ -3874,8 +4169,6 @@ def main() -> None:
                 "No ChatGPT activation, AX inspection, ledger write, clipboard access, paste, "
                 "Enter, submit, or send action was performed.\n",
             )
-        if args.timeout_seconds <= 0:
-            parser.exit(2, "error: --timeout-seconds must be greater than 0.\n")
         if args.stable_seconds < 0:
             parser.exit(2, "error: --stable-seconds must be greater than or equal to 0.\n")
 
@@ -3887,7 +4180,7 @@ def main() -> None:
             args.run_id,
             run,
             args.app_name,
-            args.timeout_seconds,
+            None,
             args.stable_seconds,
         )
         raise SystemExit(0 if ok else 1)
@@ -4260,6 +4553,25 @@ def main() -> None:
         _print_inspect_chatgpt_project_chat_row_ax_result(result)
         raise SystemExit(0 if result.get("ok") else 1)
 
+    if args.command == "diagnose-chatgpt-project-chat-rows":
+        project_title = " ".join((args.project_title or "").split())
+        contains_title = " ".join((args.contains_title or "").split())
+        if not project_title:
+            parser.exit(2, "error: diagnose-chatgpt-project-chat-rows requires a non-empty --project-title.\n")
+        if args.max_depth < 0:
+            parser.exit(2, "error: diagnose-chatgpt-project-chat-rows requires --max-depth >= 0.\n")
+        if args.max_nodes <= 0:
+            parser.exit(2, "error: diagnose-chatgpt-project-chat-rows requires --max-nodes > 0.\n")
+        result = diagnose_chatgpt_project_chat_rows(
+            app_name=args.app_name,
+            project_title=project_title,
+            contains_title=contains_title,
+            max_depth=args.max_depth,
+            max_nodes=args.max_nodes,
+        )
+        _print_diagnose_chatgpt_project_chat_rows_result(result)
+        raise SystemExit(0 if result.get("ok") else 1)
+
     if args.command == "open-chatgpt-project-chat":
         project_title = " ".join((args.project_title or "").split())
         chat_title = " ".join((args.chat_title or "").split())
@@ -4281,6 +4593,7 @@ def main() -> None:
             max_depth=args.max_depth,
             max_nodes=args.max_nodes,
             activation_function=activate_chatgpt,
+            discovery_output_function=_print_live_project_chat_discovery_lines,
         )
         _print_open_chatgpt_project_chat_result(result)
         raise SystemExit(0 if result.get("ok") else 1)
@@ -4424,6 +4737,46 @@ def main() -> None:
         _print_continuation_check(args.run_id, result)
         raise SystemExit(0 if result["can_continue"] else 2)
 
+    if args.command == "release-stale-chatgpt-ui-lease":
+        if not args.confirm_stale:
+            parser.exit(
+                2,
+                "error: release-stale-chatgpt-ui-lease requires --confirm-stale. "
+                "No lease release event was written.\n",
+            )
+        if args.owner_pid <= 0:
+            parser.exit(2, "error: --owner-pid must be a positive integer.\n")
+        if args.active_event_id <= 0:
+            parser.exit(2, "error: --active-event-id must be a positive integer.\n")
+        if _pid_exists(args.owner_pid) and not args.allow_owner_pid_alive:
+            parser.exit(
+                2,
+                (
+                    f"error: owner PID {args.owner_pid} currently exists. "
+                    "No lease release event was written. Verify whether this is the original "
+                    "owner process or PID reuse; rerun with --allow-owner-pid-alive only after "
+                    "that separate verification.\n"
+                ),
+            )
+
+        result = ledger.manual_release_stale_chatgpt_ui_lease(
+            owning_run_id=args.owning_run_id,
+            owner_pid=args.owner_pid,
+            acquired_at=args.acquired_at,
+            active_event_id=args.active_event_id,
+            expected_run_status=args.expected_run_status,
+            expected_lease_token_sha256=args.expected_lease_token_sha256,
+            reason=args.reason,
+            source=args.source,
+            confirm_stale=True,
+        )
+        _print_manual_stale_lease_release_result(result)
+        raise SystemExit(
+            0
+            if result.status == ledger.AtomicChatGPTUILeaseStatus.RELEASED
+            else 1
+        )
+
     if args.command == "approve":
         _handle_human_decision_result(
             parser,
@@ -4513,7 +4866,7 @@ def main() -> None:
                 run,
                 args.repo,
                 args.sandbox,
-                args.timeout,
+                None,
                 expected_prompt_sha256=args.expect_prompt_sha256,
                 allow_full_access=True,
                 confirm_full_access=args.confirm_full_access,
@@ -4539,7 +4892,7 @@ def main() -> None:
             args.prompt,
             repo_path_text,
             sandbox,
-            args.timeout,
+            None,
             args.confirm_full_access,
         )
         result = flow["result"]

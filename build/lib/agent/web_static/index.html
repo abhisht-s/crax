@@ -38,19 +38,10 @@
           <span></span>
           <p class="form-note">Later ChatGPT handoff proceeds only when the currently open ChatGPT Desktop destination verifies against these exact titles.</p>
 
-          <label for="allow-destination-navigation">Autonomous navigation</label>
-          <span class="checkbox-cell">
-            <input id="allow-destination-navigation" name="allow_destination_navigation" type="checkbox">
-            <span class="form-note">Operator-approved: before each handoff, open the bound Project and chat, then verify. Disabled by default; the read-only gate still decides.</span>
-          </span>
-
-          <label for="sandbox-select">Codex Permission Preset</label>
-          <div class="field-stack">
-            <select id="sandbox-select" name="sandbox" aria-describedby="permission-preset-description">
-              <option value="">Loading...</option>
-            </select>
-            <p id="permission-preset-description" class="form-note">Codex can inspect the workspace. Edits are not allowed for this dashboard run.</p>
-          </div>
+          <label for="sandbox-select">Sandbox</label>
+          <select id="sandbox-select" name="sandbox">
+            <option value="">Loading...</option>
+          </select>
 
           <label for="model-select">Codex model</label>
           <select id="model-select" name="model">
@@ -58,10 +49,10 @@
           </select>
 
           <span>Reasoning</span>
-          <span id="reasoning-lock" class="locked-value">Codex default</span>
+          <span id="reasoning-lock">Codex default</span>
 
           <span>Approval</span>
-          <span id="approval-lock" class="locked-value">Codex default — not dashboard-controlled yet</span>
+          <span id="approval-lock">Codex default</span>
         </div>
         <div class="action-row">
           <button id="start-button" type="button">Start run</button>
@@ -77,9 +68,7 @@
           <div><dt>Bound Project</dt><dd id="run-project-title">None</dd></div>
           <div><dt>Bound Chat</dt><dd id="run-chat-title">None</dd></div>
           <div><dt>Destination binding</dt><dd id="run-destination-state">No autonomous destination binding</dd></div>
-          <div><dt>Navigation approved</dt><dd id="run-navigation-approved">Disabled</dd></div>
-          <div><dt>Handoff phase</dt><dd id="run-handoff-phase">None</dd></div>
-          <div><dt>Permission preset / sandbox</dt><dd id="run-sandbox">None</dd></div>
+          <div><dt>Sandbox</dt><dd id="run-sandbox">None</dd></div>
           <div><dt>Model</dt><dd id="run-model">None</dd></div>
           <div><dt>Reasoning</dt><dd id="run-reasoning">None</dd></div>
           <div><dt>Approval</dt><dd id="run-approval">None</dd></div>
@@ -92,38 +81,6 @@
           <div><dt>Planner reason</dt><dd id="planner-reason">None</dd></div>
           <div><dt>Actionable error</dt><dd id="actionable-error">None</dd></div>
         </dl>
-      </section>
-
-      <section id="chatgpt-ui-lease-panel" class="panel" aria-labelledby="chatgpt-ui-lease-heading">
-        <h2 id="chatgpt-ui-lease-heading">ChatGPT UI lease</h2>
-        <p id="lease-state" class="status-badge status-muted" aria-live="polite">Loading</p>
-        <dl class="summary-grid lease-grid">
-          <div><dt>Owner run</dt><dd id="lease-owner-run">None</dd></div>
-          <div><dt>Owner PID</dt><dd id="lease-owner-pid">None</dd></div>
-          <div><dt>Acquired at</dt><dd id="lease-acquired-at">None</dd></div>
-          <div><dt>Acquire event</dt><dd id="lease-active-event-id">None</dd></div>
-          <div><dt>Token SHA-256</dt><dd id="lease-token-sha256">None</dd></div>
-          <div><dt>Owner run status</dt><dd id="lease-owner-run-status">None</dd></div>
-          <div><dt>PID state</dt><dd id="lease-owner-pid-state">Unknown</dd></div>
-          <div><dt>Release allowed</dt><dd id="lease-release-allowed">No</dd></div>
-          <div><dt>Latest denial</dt><dd id="lease-latest-denial">None</dd></div>
-        </dl>
-        <div class="lease-controls">
-          <label class="checkbox-cell" for="lease-confirm-stale">
-            <input id="lease-confirm-stale" name="lease_confirm_stale" type="checkbox">
-            <span>Confirm this lease is stale</span>
-          </label>
-          <label for="lease-release-reason">Reason</label>
-          <input id="lease-release-reason" name="lease_release_reason" type="text" autocomplete="off">
-          <label class="checkbox-cell" for="lease-allow-owner-pid-alive">
-            <input id="lease-allow-owner-pid-alive" name="lease_allow_owner_pid_alive" type="checkbox">
-            <span>PID-reuse override for an owner PID that appears alive</span>
-          </label>
-        </div>
-        <div class="action-row">
-          <button id="lease-release-button" type="button">Release stale ChatGPT UI lease</button>
-          <span id="lease-release-status" class="inline-status" aria-live="polite"></span>
-        </div>
       </section>
 
       <section id="latest-summaries-panel" class="panel" aria-labelledby="summaries-heading">
@@ -150,16 +107,6 @@
             <pre id="latest-governance-summary"></pre>
           </section>
         </div>
-      </section>
-
-      <section id="codex-live-panel" class="panel" aria-labelledby="codex-live-heading">
-        <h2 id="codex-live-heading">Codex Live Progress</h2>
-        <p id="codex-live-state" class="status-badge status-muted" aria-live="polite">No active run</p>
-        <dl class="summary-grid codex-live-grid">
-          <div><dt>Final message</dt><dd id="codex-live-final">Not available yet</dd></div>
-          <div><dt>Latest issue</dt><dd id="codex-live-error">None</dd></div>
-        </dl>
-        <ol id="codex-live-events" class="progress-events"></ol>
       </section>
 
       <section id="approval-panel" class="panel hidden" aria-labelledby="approval-heading">

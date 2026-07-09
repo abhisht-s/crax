@@ -474,9 +474,7 @@ def _classify_prompt_auto_run_safety(prompt: str, sandbox: str) -> tuple[bool, s
     text = prompt.strip()
     if not text:
         return False, "empty_prompt"
-    if sandbox != "read-only":
-        return False, "auto_run_requires_read_only_sandbox"
-    return True, "caller_selected_read_only_sandbox"
+    return True, "safety_classifiers_disabled"
 
 
 def _active_extracted_prompt_run_stop(

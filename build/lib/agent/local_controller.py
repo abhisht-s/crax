@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import secrets
 import threading
 import uuid
@@ -15,7 +14,7 @@ from agent import ledger as default_ledger
 from agent.initial_codex_run_services import execute_initial_direct_codex_run_service
 from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
-    CHATGPT_UI_LEASE_ACQUIRE_DENIED_EVENT_TYPE,
+    ALLOWED_EXECUTION_PROFILE_SANDBOXES,
     CODEX_DEFAULT_SELECTION,
     DestinationBindingLookupStatus,
     ExecutionProfileLookupStatus,
@@ -27,13 +26,16 @@ from agent.run_services import (
     get_run_execution_profile,
     select_run_execution_profile,
 )
-from agent.run_state import RunStatus
 from agent.supervise import SuperviseAction, SupervisePlan, detect_next_supervise_action
 from agent.supervision_services import run_supervision_step as run_supervision_step_service
 from agent.supervision_services import send_plan_auto_safe
 
 
-LOCAL_CONTROLLER_ALLOWED_SANDBOXES = ("read-only", "workspace-write")
+LOCAL_CONTROLLER_ALLOWED_SANDBOXES = tuple(
+    sandbox
+    for sandbox in ALLOWED_EXECUTION_PROFILE_SANDBOXES
+    if sandbox != "danger-full-access"
+)
 LOCAL_CONTROLLER_DEFAULT_SANDBOX = "read-only"
 LOCAL_CONTROLLER_RUN_STARTED_EVENT_TYPE = "local_controller_run_started"
 LOCAL_CONTROLLER_RUN_STARTED_MESSAGE = "Local controller run initialized."
@@ -61,14 +63,6 @@ EVENT_METADATA_PREVIEW_LIMIT = 1200
 TEXT_METADATA_PREVIEW_LIMIT = 240
 TOKEN_ENTROPY_BYTES = 32
 EXCEPTION_MESSAGE_PREVIEW_LIMIT = 500
-STALE_LEASE_TERMINAL_RUN_STATUSES = frozenset(
-    {
-        RunStatus.COMPLETED.value,
-        RunStatus.FAILED.value,
-        RunStatus.REJECTED.value,
-        RunStatus.NEEDS_REVIEW.value,
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -81,7 +75,6 @@ class StartRequestValidationResult:
     profile_source: str | None = None
     project_title: str | None = None
     chat_title: str | None = None
-    allow_destination_navigation: bool = False
     reason_code: str | None = None
     error_message: str | None = None
 
@@ -144,8 +137,6 @@ class LocalControllerReadModel:
     sandbox: str | None
     execution_profile: dict[str, Any] | None
     destination_binding: dict[str, Any] | None
-    allow_destination_navigation: bool
-    latest_handoff_phase: dict[str, Any] | None
     latest_event_id: int
     planner_action: str | None
     planner_reason_code: str | None
@@ -258,7 +249,6 @@ class LocalController:
         chat_title: str,
         sandbox: str | None = None,
         model: str | None = None,
-        allow_destination_navigation: bool = False,
         timeout_seconds: float | None = None,
     ) -> LocalControllerOperationResult:
         del timeout_seconds
@@ -269,7 +259,6 @@ class LocalController:
             model=model,
             project_title=project_title,
             chat_title=chat_title,
-            allow_destination_navigation=allow_destination_navigation,
         )
         if not validation.ok:
             return LocalControllerOperationResult(
@@ -470,131 +459,6 @@ class LocalController:
             read_model=self.get_current_state(run_id).read_model,
         )
 
-    def get_chatgpt_ui_lease_status(self) -> LocalControllerOperationResult:
-        lease = _chatgpt_ui_lease_status(ledger=self.ledger)
-        return LocalControllerOperationResult(
-            ok=True,
-            reason_code="chatgpt_ui_lease_status_loaded",
-            controller_state=self.session.controller_state,
-            metadata={"chatgpt_ui_lease": lease},
-        )
-
-    def release_stale_chatgpt_ui_lease(
-        self,
-        *,
-        owning_run_id: str,
-        owner_pid: int,
-        acquired_at: str,
-        active_event_id: int,
-        expected_lease_token_sha256: str,
-        expected_run_status: str | None,
-        confirm_stale: bool,
-        reason: str,
-        allow_owner_pid_alive: bool = False,
-    ) -> LocalControllerOperationResult:
-        if not confirm_stale:
-            return LocalControllerOperationResult(
-                ok=False,
-                reason_code="manual_stale_lease_confirmation_required",
-                error_message="Manual stale ChatGPT UI lease release requires operator confirmation.",
-                controller_state=self.session.controller_state,
-                metadata={"chatgpt_ui_lease": _chatgpt_ui_lease_status(ledger=self.ledger)},
-            )
-
-        reason_text = str(reason or "").strip()
-        if not reason_text:
-            return LocalControllerOperationResult(
-                ok=False,
-                reason_code="manual_stale_lease_reason_required",
-                error_message="Manual stale ChatGPT UI lease release requires a human-readable reason.",
-                controller_state=self.session.controller_state,
-                metadata={"chatgpt_ui_lease": _chatgpt_ui_lease_status(ledger=self.ledger)},
-            )
-
-        lease = _chatgpt_ui_lease_status(ledger=self.ledger)
-        mismatch = _lease_release_request_mismatch(
-            lease,
-            owning_run_id=owning_run_id,
-            owner_pid=owner_pid,
-            acquired_at=acquired_at,
-            active_event_id=active_event_id,
-            expected_lease_token_sha256=expected_lease_token_sha256,
-            expected_run_status=expected_run_status,
-        )
-        if mismatch is not None:
-            return LocalControllerOperationResult(
-                ok=False,
-                reason_code=mismatch,
-                error_message="Active ChatGPT UI lease no longer matches the displayed lease.",
-                controller_state=self.session.controller_state,
-                metadata={"chatgpt_ui_lease": lease},
-            )
-
-        owner_pid_state = lease.get("owner_pid_state")
-        if owner_pid_state == "alive" and not allow_owner_pid_alive:
-            return LocalControllerOperationResult(
-                ok=False,
-                reason_code="chatgpt_ui_lease_owner_pid_alive",
-                error_message="Owner PID currently appears alive; manual release requires explicit PID-reuse override.",
-                controller_state=self.session.controller_state,
-                metadata={"chatgpt_ui_lease": lease},
-            )
-        if owner_pid_state == "unknown":
-            return LocalControllerOperationResult(
-                ok=False,
-                reason_code="chatgpt_ui_lease_owner_pid_unknown",
-                error_message="Owner PID liveness is unknown; manual release is not available from the dashboard.",
-                controller_state=self.session.controller_state,
-                metadata={"chatgpt_ui_lease": lease},
-            )
-
-        if lease.get("owning_run_status") not in STALE_LEASE_TERMINAL_RUN_STATUSES:
-            return LocalControllerOperationResult(
-                ok=False,
-                reason_code="chatgpt_ui_lease_owner_run_not_terminal",
-                error_message="Owner run is not in a terminal or review state.",
-                controller_state=self.session.controller_state,
-                metadata={"chatgpt_ui_lease": lease},
-            )
-
-        result = self.ledger.manual_release_stale_chatgpt_ui_lease(
-            owning_run_id=owning_run_id,
-            owner_pid=owner_pid,
-            acquired_at=acquired_at,
-            active_event_id=active_event_id,
-            expected_run_status=expected_run_status,
-            expected_lease_token_sha256=expected_lease_token_sha256,
-            reason=reason_text,
-            source="local_dashboard_stale_release",
-            confirm_stale=True,
-        )
-        ok = getattr(result, "status", None) == default_ledger.AtomicChatGPTUILeaseStatus.RELEASED
-        refreshed = _chatgpt_ui_lease_status(ledger=self.ledger)
-        return LocalControllerOperationResult(
-            ok=ok,
-            reason_code=None if ok else getattr(result, "reason_code", None) or "manual_stale_lease_release_failed",
-            error_message=None if ok else getattr(result, "error_message", None),
-            run_id=getattr(result, "run_id", None),
-            controller_state=self.session.controller_state,
-            metadata={
-                "chatgpt_ui_lease": refreshed,
-                "release": {
-                    "status": str(getattr(result, "status", "")),
-                    "event_written": bool(getattr(result, "event_written", False)),
-                    "event_id": getattr(result, "event_id", None),
-                    "run_id": getattr(result, "run_id", None),
-                    "owning_run_id": getattr(result, "owning_run_id", None),
-                    "owner_pid": getattr(result, "owner_pid", None),
-                    "acquired_at": getattr(result, "acquired_at", None),
-                    "released_at": getattr(result, "released_at", None),
-                    "active_event_id": getattr(result, "active_event_id", None),
-                    "run_status": getattr(result, "run_status", None),
-                    "reason_code": getattr(result, "reason_code", None),
-                    "error_message": getattr(result, "error_message", None),
-                },
-            },
-        )
-
     def get_current_state(self, run_id: str | None = None) -> LocalControllerOperationResult:
         with self._lock:
             active_run_id = self.session.active_run_id
@@ -625,63 +489,6 @@ class LocalController:
             run_id=target_run_id,
             controller_state=runtime["controller_state"],
             read_model=read_model,
-        )
-
-    def get_current_progress(
-        self,
-        *,
-        after_sequence: int = 0,
-        limit: int = default_ledger.CODEX_PROGRESS_DEFAULT_LIMIT,
-    ) -> LocalControllerOperationResult:
-        with self._lock:
-            run_id = self.session.active_run_id
-            controller_state = self.session.controller_state
-        if run_id is None:
-            return LocalControllerOperationResult(
-                ok=True,
-                reason_code="no_active_run",
-                controller_state=controller_state,
-                metadata={
-                    "progress": _codex_progress_payload(
-                        None,
-                        [],
-                        after_sequence=after_sequence,
-                    )
-                },
-            )
-        return self.get_run_progress(
-            run_id,
-            after_sequence=after_sequence,
-            limit=limit,
-        )
-
-    def get_run_progress(
-        self,
-        run_id: str,
-        *,
-        after_sequence: int = 0,
-        limit: int = default_ledger.CODEX_PROGRESS_DEFAULT_LIMIT,
-    ) -> LocalControllerOperationResult:
-        try:
-            events = self.ledger.list_codex_progress_events(
-                run_id,
-                after_sequence=after_sequence,
-                limit=limit,
-            )
-        except AttributeError:
-            events = []
-        return LocalControllerOperationResult(
-            ok=True,
-            reason_code="progress_loaded",
-            run_id=run_id,
-            controller_state=self.session.controller_state,
-            metadata={
-                "progress": _codex_progress_payload(
-                    run_id,
-                    events,
-                    after_sequence=after_sequence,
-                )
-            },
         )
 
     def _initial_worker(
@@ -748,7 +555,6 @@ class LocalController:
                 expected_planner_action=snapshot.planner_action,
                 expected_event_ids=event_ids,
                 expected_prompt_sha256=snapshot.expected_prompt_sha256,
-                allow_destination_navigation=read_model.allow_destination_navigation,
                 ledger=self.ledger,
             )
             with self._lock:
@@ -791,7 +597,6 @@ class LocalController:
                 read_model.repository_path,
                 read_model.sandbox,
                 approval_mode="auto",
-                allow_destination_navigation=read_model.allow_destination_navigation,
                 ledger=self.ledger,
             )
             burst_count += 1
@@ -904,9 +709,7 @@ def validate_local_controller_start_request(
     model: str | None = None,
     project_title: str | None = None,
     chat_title: str | None = None,
-    allow_destination_navigation: bool = False,
 ) -> StartRequestValidationResult:
-    navigation_enabled = allow_destination_navigation is True
     path_text = str(repository_path or "").strip()
     if not path_text:
         return StartRequestValidationResult(
@@ -1002,7 +805,6 @@ def validate_local_controller_start_request(
         ),
         project_title=destination_result.project_title,
         chat_title=destination_result.chat_title,
-        allow_destination_navigation=navigation_enabled,
     )
 
 
@@ -1172,7 +974,6 @@ def start_local_controller_run(
         "source": LOCAL_CONTROLLER_SOURCE,
         "controller_mode": LOCAL_CONTROLLER_MODE,
         "browser_safe_sandbox": True,
-        "allow_destination_navigation": bool(start_request.allow_destination_navigation),
     }
     ledger.add_event(
         run_id,
@@ -1231,8 +1032,6 @@ def build_local_controller_read_model(
     repository_path, sandbox, configuration_reason = _recover_run_configuration(events)
     execution_profile = _execution_profile_summary(run_id, ledger=ledger) if run is not None else None
     destination_binding = _destination_binding_summary(run_id, ledger=ledger) if run is not None else None
-    allow_destination_navigation = _recover_navigation_setting(events)
-    latest_handoff_phase = _latest_handoff_phase(events)
     configuration_complete = configuration_reason is None
 
     plan = None
@@ -1273,8 +1072,6 @@ def build_local_controller_read_model(
         sandbox=sandbox,
         execution_profile=execution_profile,
         destination_binding=destination_binding,
-        allow_destination_navigation=allow_destination_navigation,
-        latest_handoff_phase=latest_handoff_phase,
         latest_event_id=latest_event_id,
         planner_action=planner_action,
         planner_reason_code=planner_reason,
@@ -1402,209 +1199,6 @@ def _destination_binding_summary(run_id: str, *, ledger: Any) -> dict[str, Any]:
         "error_message": lookup.error_message or "Run destination binding is invalid.",
         "event_ids": list(lookup.event_ids),
     }
-
-
-def _recover_navigation_setting(events: list[dict]) -> bool:
-    """Read the durable operator navigation approval flag.
-
-    Fail-closed: navigation is only enabled when a valid controller-started
-    event explicitly recorded ``allow_destination_navigation: true``. Runs that
-    predate this setting (or whose start event lacks it) stay disabled.
-    """
-
-    controller_event = _latest_valid_controller_started_event(events)
-    if controller_event is None:
-        return False
-    metadata = _event_metadata(controller_event)
-    return metadata.get("allow_destination_navigation") is True
-
-
-def _latest_handoff_phase(events: list[dict]) -> dict[str, Any] | None:
-    event = _latest_event(events, "chatgpt_handoff_phase")
-    if event is None:
-        return None
-    metadata = _event_metadata(event)
-    navigation = metadata.get("navigation")
-    return {
-        "event_id": _event_id(event),
-        "phase": metadata.get("handoff_phase"),
-        "navigation_operator_approved": bool(metadata.get("navigation_operator_approved")),
-        "navigation_outcome": navigation.get("outcome") if isinstance(navigation, dict) else None,
-        "navigation_ok": navigation.get("ok") if isinstance(navigation, dict) else None,
-    }
-
-
-def _chatgpt_ui_lease_status(*, ledger: Any) -> dict[str, Any]:
-    try:
-        events = ledger.list_chatgpt_ui_lease_events()
-        state = default_ledger._reconstruct_chatgpt_ui_lease_state(events)  # noqa: SLF001 - shared ledger reconstruction.
-        latest_denial = _latest_chatgpt_ui_lease_denial(events)
-    except Exception as exc:
-        return {
-            "status": "invalid",
-            "active": False,
-            "stale_status": "invalid",
-            "release_allowed": False,
-            "release_block_reason": "chatgpt_ui_lease_status_unavailable",
-            "reason_code": "chatgpt_ui_lease_status_unavailable",
-            "error_message": _bounded_string(str(exc)),
-        }
-
-    if state.status == default_ledger.AtomicChatGPTUILeaseStatus.MISSING:
-        return {
-            "status": "missing",
-            "active": False,
-            "stale_status": "not_active",
-            "release_allowed": False,
-            "release_block_reason": "chatgpt_ui_lease_not_active",
-            "event_ids": list(state.event_ids),
-            "latest_denial": latest_denial,
-        }
-
-    if state.status == default_ledger.AtomicChatGPTUILeaseStatus.INVALID:
-        return {
-            "status": "invalid",
-            "active": False,
-            "stale_status": "invalid",
-            "release_allowed": False,
-            "release_block_reason": state.reason_code or "chatgpt_ui_lease_invalid",
-            "reason_code": state.reason_code,
-            "error_message": state.error_message,
-            "event_ids": list(state.event_ids),
-            "latest_denial": latest_denial,
-        }
-
-    run_status = None
-    if state.owning_run_id:
-        try:
-            run = ledger.get_run(state.owning_run_id)
-        except Exception:
-            run = None
-        if isinstance(run, dict) and isinstance(run.get("status"), str):
-            run_status = run["status"]
-
-    pid_state = _owner_pid_state(state.owner_pid)
-    release_allowed, block_reason = _stale_lease_release_availability(
-        owner_pid_state=pid_state,
-        run_status=run_status,
-    )
-    return {
-        "status": "active",
-        "active": True,
-        "owning_run_id": state.owning_run_id,
-        "owner_pid": state.owner_pid,
-        "acquired_at": state.acquired_at,
-        "active_event_id": state.active_event_id,
-        "lease_token_sha256": state.lease_token,
-        "owning_run_status": run_status,
-        "owner_pid_state": pid_state,
-        "owner_pid_alive": True if pid_state == "alive" else False if pid_state == "dead" else None,
-        "stale_status": "recoverable" if release_allowed else "not_recoverable",
-        "release_allowed": release_allowed,
-        "release_block_reason": block_reason,
-        "event_ids": list(state.event_ids),
-        "latest_denial": latest_denial,
-    }
-
-
-def _codex_progress_payload(
-    run_id: str | None,
-    events: list[dict[str, Any]],
-    *,
-    after_sequence: int,
-) -> dict[str, Any]:
-    latest_sequence = max(
-        [after_sequence]
-        + [
-            int(event["sequence"])
-            for event in events
-            if isinstance(event.get("sequence"), int)
-        ]
-    )
-    return {
-        "run_id": run_id,
-        "after_sequence": after_sequence,
-        "latest_sequence": latest_sequence,
-        "events": events,
-    }
-
-
-def _latest_chatgpt_ui_lease_denial(events: list[dict]) -> dict[str, Any] | None:
-    event = _latest_event(events, CHATGPT_UI_LEASE_ACQUIRE_DENIED_EVENT_TYPE)
-    if event is None:
-        return None
-    metadata = _event_metadata(event)
-    return {
-        "event_id": _event_id(event),
-        "run_id": event.get("run_id"),
-        "created_at": event.get("created_at"),
-        "requested_owning_run_id": metadata.get("requested_owning_run_id"),
-        "request_owner_pid": metadata.get("request_owner_pid"),
-        "denied_at": metadata.get("denied_at"),
-        "active_owning_run_id": metadata.get("active_owning_run_id"),
-        "active_owner_pid": metadata.get("active_owner_pid"),
-        "active_acquired_at": metadata.get("active_acquired_at"),
-    }
-
-
-def _owner_pid_state(pid: int | None) -> str:
-    if not isinstance(pid, int) or pid <= 0:
-        return "unknown"
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return "dead"
-    except PermissionError:
-        return "alive"
-    except OSError:
-        return "unknown"
-    return "alive"
-
-
-def _stale_lease_release_availability(
-    *,
-    owner_pid_state: str,
-    run_status: str | None,
-) -> tuple[bool, str | None]:
-    if owner_pid_state == "alive":
-        return False, "owner_pid_alive"
-    if owner_pid_state != "dead":
-        return False, "owner_pid_unknown"
-    if run_status is None:
-        return False, "owner_run_status_unknown"
-    if run_status not in STALE_LEASE_TERMINAL_RUN_STATUSES:
-        return False, "owner_run_not_terminal"
-    return True, None
-
-
-def _lease_release_request_mismatch(
-    lease: dict[str, Any],
-    *,
-    owning_run_id: str,
-    owner_pid: int,
-    acquired_at: str,
-    active_event_id: int,
-    expected_lease_token_sha256: str,
-    expected_run_status: str | None,
-) -> str | None:
-    if lease.get("status") != "active" or not lease.get("active"):
-        return "chatgpt_ui_lease_not_active"
-    if lease.get("owning_run_id") != owning_run_id:
-        return "active_chatgpt_ui_lease_mismatch"
-    if lease.get("owner_pid") != owner_pid:
-        return "active_chatgpt_ui_lease_mismatch"
-    if lease.get("acquired_at") != acquired_at:
-        return "active_chatgpt_ui_lease_mismatch"
-    if lease.get("active_event_id") != active_event_id:
-        return "active_chatgpt_ui_lease_mismatch"
-    if lease.get("lease_token_sha256") != expected_lease_token_sha256:
-        return "active_chatgpt_ui_lease_mismatch"
-    current_status = lease.get("owning_run_status")
-    if current_status is not None and expected_run_status is None:
-        return "active_chatgpt_ui_lease_mismatch"
-    if current_status != expected_run_status:
-        return "active_chatgpt_ui_lease_mismatch"
-    return None
 
 
 def _profile_summary(

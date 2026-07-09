@@ -4,16 +4,16 @@ import argparse
 import hmac
 import json
 import threading
-import time
 from dataclasses import asdict, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from agent.local_controller import LocalController, LocalControllerSession
 from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
+    ALLOWED_EXECUTION_PROFILE_SANDBOXES,
     CODEX_DEFAULT_SELECTION,
     RunDestinationBinding,
     execution_profile_options,
@@ -26,12 +26,8 @@ LOCAL_SERVER_TOKEN_HEADER = "X-Controller-Token"
 LOCAL_SERVER_START_BODY_LIMIT = 64 * 1024
 LOCAL_SERVER_APPROVAL_BODY_LIMIT = 4 * 1024
 LOCAL_SERVER_GENERIC_BODY_LIMIT = 8 * 1024
-LOCAL_SERVER_PROGRESS_LIMIT = 100
-LOCAL_SERVER_SSE_HEARTBEAT_SECONDS = 2.0
-LOCAL_SERVER_PERMISSION_PRESET_VALUES = ("read-only", "workspace-write")
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
-SSE_CONTENT_TYPE = "text/event-stream; charset=utf-8"
 WEB_STATIC_DIR = Path(__file__).with_name("web_static")
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -139,8 +135,7 @@ def _make_handler(server_runtime: LocalControllerServer):
 
         def _handle_request(self, method: str) -> None:
             try:
-                parsed_url = urlsplit(self.path)
-                path = parsed_url.path
+                path = urlsplit(self.path).path
                 if not path.startswith("/api/"):
                     self._validate_host()
                     self._handle_static(method, path)
@@ -148,7 +143,7 @@ def _make_handler(server_runtime: LocalControllerServer):
                 self._validate_host()
                 self._authenticate()
                 if method == "GET":
-                    self._handle_get(path, parsed_url.query)
+                    self._handle_get(path)
                 elif method == "POST":
                     self._handle_post(path)
                 else:
@@ -175,7 +170,7 @@ def _make_handler(server_runtime: LocalControllerServer):
                 return
             self._write_bytes(200, data, content_type)
 
-        def _handle_get(self, path: str, query: str = "") -> None:
+        def _handle_get(self, path: str) -> None:
             if path == "/api/health":
                 self._write_json(200, _health_payload(server_runtime))
                 return
@@ -187,24 +182,6 @@ def _make_handler(server_runtime: LocalControllerServer):
                 return
             if path == "/api/runs/current":
                 self._write_json(200, _state_payload(server_runtime.controller.get_current_state()))
-                return
-            if path == "/api/runs/current/progress":
-                after_sequence, limit = _progress_query(query)
-                self._write_json(
-                    200,
-                    _progress_payload(
-                        server_runtime,
-                        after_sequence=after_sequence,
-                        limit=limit,
-                    ),
-                )
-                return
-            if path == "/api/runs/current/events":
-                after_sequence, limit = _progress_query(query)
-                self._handle_progress_sse(after_sequence=after_sequence, limit=limit)
-                return
-            if path == "/api/chatgpt-ui-lease":
-                self._write_json(200, _operation_payload(server_runtime.controller.get_chatgpt_ui_lease_status()))
                 return
             self._write_error(404, "route_not_found", "API route was not found.")
 
@@ -235,71 +212,7 @@ def _make_handler(server_runtime: LocalControllerServer):
                 status = 202 if result.ok else 200
                 self._write_operation_result(result, success_status=status, default_failure_status=200)
                 return
-            if path == "/api/chatgpt-ui-lease/release-stale":
-                payload = self._read_json_body(LOCAL_SERVER_GENERIC_BODY_LIMIT, require_object=True, allow_empty=False)
-                result = server_runtime.controller.release_stale_chatgpt_ui_lease(
-                    **_stale_lease_release_kwargs(payload)
-                )
-                self._write_operation_result(result, success_status=200)
-                return
             self._write_error(404, "route_not_found", "API route was not found.")
-
-        def _handle_progress_sse(self, *, after_sequence: int, limit: int) -> None:
-            self.send_response(200)
-            self.send_header("Content-Type", SSE_CONTENT_TYPE)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-
-            latest_sequence = after_sequence
-            while True:
-                payload = _progress_payload(
-                    server_runtime,
-                    after_sequence=latest_sequence,
-                    limit=limit,
-                )
-                progress = payload.get("metadata", {}).get("progress", {})
-                events = progress.get("events") if isinstance(progress, dict) else []
-                if not isinstance(events, list):
-                    events = []
-                for event in events:
-                    if not self._write_sse_event("progress", event):
-                        return
-                    sequence = event.get("sequence") if isinstance(event, dict) else None
-                    if isinstance(sequence, int):
-                        latest_sequence = max(latest_sequence, sequence)
-
-                if not isinstance(progress, dict) or not progress.get("run_id"):
-                    self._write_sse_event("progress_state", payload)
-                    return
-                if not self._write_sse_comment("heartbeat"):
-                    return
-                time.sleep(LOCAL_SERVER_SSE_HEARTBEAT_SECONDS)
-
-        def _write_sse_event(self, event_name: str, payload: dict[str, Any]) -> bool:
-            event_id = payload.get("sequence") if isinstance(payload, dict) else None
-            lines = []
-            if isinstance(event_id, int):
-                lines.append(f"id: {event_id}")
-            lines.append(f"event: {event_name}")
-            data = json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":"))
-            for line in data.splitlines() or [""]:
-                lines.append(f"data: {line}")
-            lines.append("")
-            lines.append("")
-            return self._write_sse_chunk("\n".join(lines))
-
-        def _write_sse_comment(self, comment: str) -> bool:
-            return self._write_sse_chunk(f": {comment}\n\n")
-
-        def _write_sse_chunk(self, chunk: str) -> bool:
-            try:
-                self.wfile.write(chunk.encode("utf-8"))
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                return False
-            return True
 
         def _write_operation_result(
             self,
@@ -431,7 +344,7 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "project_title",
         "chat_title",
     }
-    optional = {"model", "allow_destination_navigation"}
+    optional = {"model"}
     keys = set(payload)
     if missing := required - keys:
         raise LocalServerError(
@@ -463,8 +376,8 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
             "danger_full_access_not_available_in_local_controller",
             "danger-full-access is not available through the local controller.",
         )
-    if not isinstance(sandbox, str) or sandbox not in LOCAL_SERVER_PERMISSION_PRESET_VALUES:
-        allowed_text = ", ".join(LOCAL_SERVER_PERMISSION_PRESET_VALUES)
+    if not isinstance(sandbox, str) or sandbox not in ALLOWED_EXECUTION_PROFILE_SANDBOXES:
+        allowed_text = ", ".join(ALLOWED_EXECUTION_PROFILE_SANDBOXES)
         raise LocalServerError(
             400,
             "invalid_browser_sandbox",
@@ -481,161 +394,7 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
                 f"Invalid Codex model. Allowed values: {allowed_text}.",
             )
         kwargs["model"] = model
-    if "allow_destination_navigation" in payload:
-        allow_navigation = payload["allow_destination_navigation"]
-        if not isinstance(allow_navigation, bool):
-            raise LocalServerError(
-                400,
-                "invalid_request_shape",
-                "allow_destination_navigation must be a boolean.",
-            )
-        kwargs["allow_destination_navigation"] = allow_navigation
     return kwargs
-
-
-def _stale_lease_release_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
-    expected = {
-        "owning_run_id",
-        "owner_pid",
-        "acquired_at",
-        "active_event_id",
-        "expected_lease_token_sha256",
-        "expected_run_status",
-        "confirm_stale",
-        "reason",
-        "allow_owner_pid_alive",
-    }
-    _require_exact_fields(payload, expected)
-
-    owning_run_id = payload["owning_run_id"]
-    acquired_at = payload["acquired_at"]
-    expected_fingerprint = payload["expected_lease_token_sha256"]
-    reason = payload["reason"]
-    expected_run_status = payload["expected_run_status"]
-    if not isinstance(owning_run_id, str) or owning_run_id.strip() == "":
-        raise LocalServerError(400, "invalid_request_shape", "owning_run_id must be a non-empty string.")
-    if not isinstance(payload["owner_pid"], int) or isinstance(payload["owner_pid"], bool) or payload["owner_pid"] <= 0:
-        raise LocalServerError(400, "invalid_request_shape", "owner_pid must be a positive integer.")
-    if not isinstance(acquired_at, str) or acquired_at.strip() == "":
-        raise LocalServerError(400, "invalid_request_shape", "acquired_at must be a non-empty string.")
-    if (
-        not isinstance(payload["active_event_id"], int)
-        or isinstance(payload["active_event_id"], bool)
-        or payload["active_event_id"] <= 0
-    ):
-        raise LocalServerError(400, "invalid_request_shape", "active_event_id must be a positive integer.")
-    if not isinstance(expected_fingerprint, str) or not _valid_sha256(expected_fingerprint):
-        raise LocalServerError(
-            400,
-            "invalid_request_shape",
-            "expected_lease_token_sha256 must be a lowercase SHA-256 hex digest.",
-        )
-    if expected_run_status is not None and (
-        not isinstance(expected_run_status, str) or expected_run_status.strip() == ""
-    ):
-        raise LocalServerError(400, "invalid_request_shape", "expected_run_status must be a string or null.")
-    if payload["confirm_stale"] is not True:
-        raise LocalServerError(
-            400,
-            "manual_stale_lease_confirmation_required",
-            "Manual stale ChatGPT UI lease release requires operator confirmation.",
-        )
-    if not isinstance(reason, str) or reason.strip() == "":
-        raise LocalServerError(
-            400,
-            "manual_stale_lease_reason_required",
-            "Manual stale ChatGPT UI lease release requires a human-readable reason.",
-        )
-    if not isinstance(payload["allow_owner_pid_alive"], bool):
-        raise LocalServerError(400, "invalid_request_shape", "allow_owner_pid_alive must be a boolean.")
-
-    return {
-        "owning_run_id": owning_run_id.strip(),
-        "owner_pid": payload["owner_pid"],
-        "acquired_at": acquired_at.strip(),
-        "active_event_id": payload["active_event_id"],
-        "expected_lease_token_sha256": expected_fingerprint,
-        "expected_run_status": expected_run_status.strip() if isinstance(expected_run_status, str) else None,
-        "confirm_stale": True,
-        "reason": reason.strip(),
-        "allow_owner_pid_alive": payload["allow_owner_pid_alive"],
-    }
-
-
-def _progress_query(query: str) -> tuple[int, int]:
-    params = parse_qs(query, keep_blank_values=True)
-    after_sequence = _single_nonnegative_int_query_value(
-        params,
-        "after_sequence",
-        default=0,
-        reason_code="invalid_progress_cursor",
-    )
-    limit = _single_nonnegative_int_query_value(
-        params,
-        "limit",
-        default=LOCAL_SERVER_PROGRESS_LIMIT,
-        reason_code="invalid_progress_limit",
-    )
-    limit = max(1, min(limit, LOCAL_SERVER_PROGRESS_LIMIT))
-    return after_sequence, limit
-
-
-def _single_nonnegative_int_query_value(
-    params: dict[str, list[str]],
-    name: str,
-    *,
-    default: int,
-    reason_code: str,
-) -> int:
-    values = params.get(name)
-    if not values:
-        return default
-    if len(values) != 1:
-        raise LocalServerError(400, reason_code, "Invalid progress query parameter.")
-    try:
-        value = int(values[0])
-    except ValueError:
-        raise LocalServerError(400, reason_code, "Invalid progress query parameter.")
-    if value < 0:
-        raise LocalServerError(400, reason_code, "Invalid progress query parameter.")
-    return value
-
-
-def _progress_payload(
-    server_runtime: LocalControllerServer,
-    *,
-    after_sequence: int,
-    limit: int,
-) -> dict[str, Any]:
-    progress_reader = getattr(server_runtime.controller, "get_current_progress", None)
-    if callable(progress_reader):
-        return _operation_payload(
-            progress_reader(after_sequence=after_sequence, limit=limit)
-        )
-
-    active_run_id = server_runtime.session.active_run_id
-    return {
-        "ok": True,
-        "reason_code": "progress_loaded" if active_run_id else "no_active_run",
-        "error_message": None,
-        "run_id": active_run_id,
-        "controller_state": server_runtime.session.controller_state,
-        "metadata": {
-            "progress": {
-                "run_id": active_run_id,
-                "after_sequence": after_sequence,
-                "latest_sequence": after_sequence,
-                "events": [],
-            }
-        },
-        "state": None,
-    }
-
-
-def _valid_sha256(value: str) -> bool:
-    if len(value) != 64:
-        return False
-    return all(char in "0123456789abcdef" for char in value)
 
 
 def _status_for_reason(reason: str, *, default_failure_status: int | None = None) -> int:
@@ -646,12 +405,6 @@ def _status_for_reason(reason: str, *, default_failure_status: int | None = None
         "pending_approval_exists",
         "controller_state_terminal",
         "human_approval_required",
-        "chatgpt_ui_lease_owner_pid_alive",
-        "chatgpt_ui_lease_owner_pid_unknown",
-        "chatgpt_ui_lease_owner_run_not_terminal",
-        "active_chatgpt_ui_lease_mismatch",
-        "chatgpt_ui_lease_not_active",
-        "manual_stale_lease_run_status_mismatch",
     }:
         return 409 if default_failure_status is None else default_failure_status
     if reason in {
@@ -667,10 +420,6 @@ def _status_for_reason(reason: str, *, default_failure_status: int | None = None
         "invalid_destination",
         "no_active_run",
         "no_routine_action_available",
-        "manual_stale_lease_confirmation_required",
-        "manual_stale_lease_reason_required",
-        "invalid_manual_stale_lease_release_request",
-        "invalid_expected_lease_token_sha256",
     }:
         return 400 if default_failure_status is None else default_failure_status
     return default_failure_status or 500
@@ -703,9 +452,9 @@ def _session_payload(server_runtime: LocalControllerServer) -> dict[str, Any]:
 def _execution_profile_options_payload() -> dict[str, Any]:
     options = execution_profile_options()
     sandbox_options = [
-        _option_payload(value, _sandbox_label(value), _sandbox_description(value))
+        _option_payload(value, _sandbox_label(value))
         for value in options["sandbox_options"]
-        if value in LOCAL_SERVER_PERMISSION_PRESET_VALUES
+        if value != "danger-full-access"
     ]
     model_options = [
         _option_payload(value, "Codex default" if value == CODEX_DEFAULT_SELECTION else value)
@@ -717,38 +466,20 @@ def _execution_profile_options_payload() -> dict[str, Any]:
         "model_options": model_options,
         "locked": {
             "reasoning_effort": _option_payload(options["reasoning_effort"], "Codex default"),
-            "approval_policy": _option_payload(
-                options["approval_policy"],
-                "Codex default — not dashboard-controlled yet",
-            ),
+            "approval_policy": _option_payload(options["approval_policy"], "Codex default"),
         },
     }
 
 
-def _option_payload(value: str, label: str, description: str | None = None) -> dict[str, str]:
-    payload = {"value": value, "label": label}
-    if description is not None:
-        payload["description"] = description
-    return payload
+def _option_payload(value: str, label: str) -> dict[str, str]:
+    return {"value": value, "label": label}
 
 
 def _sandbox_label(value: str) -> str:
     return {
-        "read-only": "Read Only",
-        "workspace-write": "Workspace Write",
+        "read-only": "Read-only",
+        "workspace-write": "Workspace write",
     }.get(value, value)
-
-
-def _sandbox_description(value: str) -> str:
-    return {
-        "read-only": (
-            "Codex can inspect the workspace. Edits are not allowed for this dashboard run."
-        ),
-        "workspace-write": (
-            "Codex can edit files in this repository. Outside-workspace and dangerous "
-            "access remain blocked by this dashboard run."
-        ),
-    }.get(value, "")
 
 
 def _runtime(controller: LocalController) -> dict[str, Any]:
@@ -768,7 +499,6 @@ def _operation_payload(result: Any) -> dict[str, Any]:
         "error_message": getattr(result, "error_message", None),
         "run_id": getattr(result, "run_id", None),
         "controller_state": getattr(result, "controller_state", None),
-        "metadata": _json_safe(getattr(result, "metadata", {})),
         "state": _json_safe(read_model) if read_model is not None else None,
     }
     return payload
@@ -778,11 +508,7 @@ def _json_safe(value: Any) -> Any:
     if is_dataclass(value):
         return _json_safe(asdict(value))
     if isinstance(value, dict):
-        return {
-            str(key): _json_safe(item)
-            for key, item in value.items()
-            if str(key) not in {"token", "lease_token"}
-        }
+        return {str(key): _json_safe(item) for key, item in value.items() if str(key) != "token"}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
     if isinstance(value, (str, int, float, bool)) or value is None:

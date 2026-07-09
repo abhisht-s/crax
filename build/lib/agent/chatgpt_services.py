@@ -48,13 +48,6 @@ CHATGPT_PASTE_VERIFY_POLL_SECONDS = 0.15
 CHATGPT_POST_PASTE_SETTLE_SECONDS = 0.5
 CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS: float | None = None
 CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS = 0.35
-# A submit is a near-instant UI change (the marker moves from the composer into
-# the transcript). Submission confirmation is therefore bounded by a finite poll
-# budget so that a submit which never registers fails closed (falls back, then
-# releases the UI lease) instead of blocking the handoff forever. This bounds a
-# discrete UI confirmation only; it does NOT cut off Codex execution or ChatGPT
-# response generation, which remain deadline-free.
-CHATGPT_SUBMISSION_VERIFY_MAX_POLLS = 40
 
 
 class PromptExtractionLedger(Protocol):
@@ -1424,9 +1417,8 @@ def _verify_submission_marker(
     sleep_function: Callable[[float], None] = time.sleep,
     timeout_seconds: float | None = CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
     poll_interval_seconds: float = CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
-    max_polls: int = CHATGPT_SUBMISSION_VERIFY_MAX_POLLS,
 ) -> dict[str, Any]:
-    start = monotonic_function()
+    del timeout_seconds
     polls = 0
     last_observation: dict[str, Any] = {}
     last_status: dict[str, Any] = {}
@@ -1441,61 +1433,13 @@ def _verify_submission_marker(
                 "ok": bool(status["verified"]),
                 "reason_code": status["reason_code"],
                 "poll_count": polls,
-                "timeout_seconds": timeout_seconds,
+                "timeout_seconds": None,
                 "poll_interval_seconds": poll_interval_seconds,
                 "status": status,
                 "observation": _submission_ui_observation_summary(observation, marker_text),
             }
-        timed_out = (
-            timeout_seconds is not None
-            and (monotonic_function() - start) >= timeout_seconds
-        )
-        exhausted = max_polls is not None and polls >= max_polls
-        if timed_out or exhausted:
-            return {
-                "ok": False,
-                "reason_code": "chatgpt_submission_not_verified",
-                "poll_count": polls,
-                "timeout_seconds": timeout_seconds,
-                "poll_interval_seconds": poll_interval_seconds,
-                "status": last_status,
-                "observation": _submission_ui_observation_summary(last_observation, marker_text),
-            }
         if poll_interval_seconds > 0:
             sleep_function(poll_interval_seconds)
-
-
-# Accessibility markers that identify transcript message-action / feedback
-# controls (e.g. the reply toolbar with "Good response" / "Bad response" /
-# "Read Aloud" / "Memory updated"). A composer Send control never carries these,
-# so a candidate bearing any of them is not a send button and must not be
-# pressed — we fall back to Return, which reliably submits the composer.
-_NON_SEND_BUTTON_MARKERS = (
-    "good response",
-    "bad response",
-    "read aloud",
-    "memory",
-    "regenerate",
-    "copy",
-    "share",
-    "thumbs",
-    "more actions",
-    "edit message",
-    "dictate",
-    "voice mode",
-)
-
-
-def _is_send_button_safe_to_press(send_button: Any) -> bool:
-    if not isinstance(send_button, dict) or not send_button.get("path"):
-        return False
-    blob = " ".join(
-        str(send_button.get(key) or "")
-        for key in ("title", "description", "identifier", "role", "subrole")
-    )
-    blob += " " + " ".join(str(action) for action in (send_button.get("actions") or []))
-    blob = blob.casefold()
-    return not any(marker in blob for marker in _NON_SEND_BUTTON_MARKERS)
 
 
 def _select_send_input_method(
@@ -1508,7 +1452,7 @@ def _select_send_input_method(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     observation = inspection_function(app_name, marker_text=marker_text)
     send_button = observation.get("send_button") if isinstance(observation, dict) else None
-    if _is_send_button_safe_to_press(send_button):
+    if isinstance(send_button, dict) and send_button.get("path"):
         result = ax_send_button_function(app_name, str(send_button["path"]))
         return result, _submission_ui_observation_summary(observation, marker_text)
     return enter_function(), _submission_ui_observation_summary(observation, marker_text)

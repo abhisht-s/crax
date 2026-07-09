@@ -9,7 +9,12 @@ import tempfile
 import unittest
 from unittest import mock
 
-from agent import cli
+from agent import cli, ledger as default_ledger
+from agent import supervision_services as supervision_services_module
+from agent.chatgpt_destination_gate import (
+    ChatGPTDestinationSnapshot,
+    DestinationEvidenceCandidate,
+)
 from agent.codex_terminal import run_command
 from agent.file_classifier import classify_changed_files
 from agent.git_snapshot import (
@@ -584,8 +589,15 @@ class CodexRunAutoSuperviseTests(unittest.TestCase):
         self.repo_path = self._tmp.name
         self.run = {"id": "run-1", "status": "completed"}
         self.events: list[dict] = []
+        self._destination_adapter_patcher = mock.patch.object(
+            supervision_services_module,
+            "ChatGPTAXDestinationSnapshotAdapter",
+            _FakeDestinationAdapter,
+        )
+        self._destination_adapter_patcher.start()
 
     def tearDown(self) -> None:
+        self._destination_adapter_patcher.stop()
         self._tmp.cleanup()
 
     def args(
@@ -602,7 +614,7 @@ class CodexRunAutoSuperviseTests(unittest.TestCase):
             cwd=None,
             sandbox=sandbox,
             confirm_full_access=False,
-            timeout=300,
+            timeout=None,
             no_supervise=no_supervise,
             interactive=interactive,
         )
@@ -1580,9 +1592,10 @@ class FeedbackPayloadTests(unittest.TestCase):
             "metadata_json": json.dumps(metadata, sort_keys=True),
         }
 
-    def test_feedback_payload_preserves_raw_stdout_and_stderr(self) -> None:
-        stdout = "line 1\nmodel/provider/session text stays\nstdout-without-final-newline"
-        stderr = "stderr line 1\nprovider stderr text stays\n"
+    def test_feedback_payload_uses_clean_final_message_not_raw_stdout_or_stderr(self) -> None:
+        stdout = "line 1\nraw stdout must not be submitted\nstdout-without-final-newline"
+        stderr = "stderr line 1\nraw stderr must not be submitted\n"
+        final_message = "Clean final assistant completion report."
         events = [
             self.event(
                 "codex_exec_finished",
@@ -1591,6 +1604,11 @@ class FeedbackPayloadTests(unittest.TestCase):
                     "stderr": stderr,
                     "exit_code": 0,
                     "timed_out": False,
+                    "final_message": final_message,
+                    "final_message_path": "/tmp/run-1/final-message.md",
+                    "final_message_status": "valid",
+                    "final_message_error": None,
+                    "final_message_length": len(final_message),
                 },
                 1,
             ),
@@ -1615,13 +1633,13 @@ class FeedbackPayloadTests(unittest.TestCase):
         feedback = cli.build_gpt_feedback_message({"id": "run-1", "status": "completed"}, events)
         message = feedback["message"]
 
-        self.assertIn(
-            "Codex finished. Here is the complete output:\n"
-            + stdout
-            + "\nCodex stderr:\n"
-            + stderr,
-            message,
-        )
+        self.assertTrue(feedback["submittable"])
+        self.assertIn("Codex completion report", message)
+        self.assertIn("Final assistant message:\n" + final_message, message)
+        self.assertNotIn(stdout, message)
+        self.assertNotIn(stderr, message)
+        self.assertNotIn("raw stdout must not be submitted", message)
+        self.assertNotIn("raw stderr must not be submitted", message)
         self.assertIn("- changed_files: [\"agent/cli.py\"]", message)
         self.assertIn("- run_id: run-1", message)
         self.assertIn("- exit_code: 0", message)
@@ -1630,8 +1648,7 @@ class FeedbackPayloadTests(unittest.TestCase):
         self.assertNotIn("diagnostics_flags", message)
         self.assertNotIn("continuation_allowed", message)
         self.assertNotIn("policy_version", message)
-        self.assertEqual(feedback["codex_stdout"], stdout)
-        self.assertEqual(feedback["codex_stderr"], stderr)
+        self.assertEqual(feedback["final_message_length"], len(final_message))
         self.assertEqual(feedback["feedback_payload_version"], "compact_wrapper_v2_submission_marker")
         self.assertEqual(feedback["feedback_payload_length"], len(message))
         self.assertEqual(feedback["feedback_payload_sha256"], _sha(message))
@@ -1649,6 +1666,11 @@ class FeedbackPayloadTests(unittest.TestCase):
                     "stderr": "",
                     "exit_code": 0,
                     "timed_out": False,
+                    "final_message": "Needs review summary.",
+                    "final_message_path": "/tmp/run-1/final-message.md",
+                    "final_message_status": "valid",
+                    "final_message_error": None,
+                    "final_message_length": len("Needs review summary."),
                 },
                 1,
             ),
@@ -1669,6 +1691,103 @@ class FeedbackPayloadTests(unittest.TestCase):
         self.assertIn("- review_signal: needs_review", feedback["message"])
         self.assertIn("- stop_reason: needs_review", feedback["message"])
         self.assertNotIn("diagnostics_flags", feedback["message"])
+
+    def test_feedback_payload_missing_or_empty_final_message_is_not_submittable(self) -> None:
+        for name, metadata in [
+            (
+                "missing",
+                {
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "final_message": "",
+                    "final_message_path": "/tmp/run-1/final-message.md",
+                    "final_message_status": "missing",
+                    "final_message_error": "Codex final-message artifact was not written.",
+                    "final_message_length": 0,
+                },
+            ),
+            (
+                "empty",
+                {
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "final_message": "",
+                    "final_message_path": "/tmp/run-1/final-message.md",
+                    "final_message_status": "empty",
+                    "final_message_error": "Codex final-message artifact was empty.",
+                    "final_message_length": 0,
+                },
+            ),
+        ]:
+            with self.subTest(name=name):
+                feedback = cli.build_gpt_feedback_message(
+                    {"id": "run-1", "status": "completed"},
+                    [self.event("codex_exec_finished", metadata, 1)],
+                )
+
+                self.assertFalse(feedback["submittable"])
+                self.assertIsNone(feedback["message"])
+                self.assertEqual(feedback["reason_code"], "codex_final_message_unavailable")
+                self.assertEqual(feedback["feedback_payload_length"], 0)
+
+    def test_feedback_payload_oversized_final_message_is_not_submittable(self) -> None:
+        final_message = "x" * 12_001
+        events = [
+            self.event(
+                "codex_exec_finished",
+                {
+                    "stdout": "raw stdout must not be submitted",
+                    "stderr": "raw stderr must not be submitted",
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "final_message": final_message,
+                    "final_message_path": "/tmp/run-1/final-message.md",
+                    "final_message_status": "valid",
+                    "final_message_error": None,
+                    "final_message_length": len(final_message),
+                },
+                1,
+            )
+        ]
+
+        feedback = cli.build_gpt_feedback_message({"id": "run-1", "status": "completed"}, events)
+
+        self.assertFalse(feedback["submittable"])
+        self.assertIsNone(feedback["message"])
+        self.assertEqual(feedback["reason_code"], "codex_final_message_oversize")
+        self.assertEqual(feedback["feedback_payload_length"], 0)
+        self.assertEqual(
+            feedback["transport_guard"]["final_message_sha256"],
+            _sha(final_message),
+        )
+        self.assertNotIn(final_message, json.dumps(feedback))
+
+    def test_feedback_payload_absolute_transport_limit_is_not_submittable(self) -> None:
+        changed_files = [{"path": f"src/generated_{index:04d}.py"} for index in range(900)]
+        final_message = "Clean final message under the final-message limit."
+        events = [
+            self.event(
+                "codex_exec_finished",
+                {
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "final_message": final_message,
+                    "final_message_path": "/tmp/run-1/final-message.md",
+                    "final_message_status": "valid",
+                    "final_message_error": None,
+                    "final_message_length": len(final_message),
+                },
+                1,
+            ),
+            self.event("changed_file_classification", {"files": changed_files}, 2),
+        ]
+
+        feedback = cli.build_gpt_feedback_message({"id": "run-1", "status": "completed"}, events)
+
+        self.assertFalse(feedback["submittable"])
+        self.assertIsNone(feedback["message"])
+        self.assertEqual(feedback["reason_code"], "chatgpt_feedback_payload_oversize")
+        self.assertGreater(feedback["transport_guard"]["attempted_payload_length"], 16_000)
 
 
 class WorkspaceWritePolicyTests(unittest.TestCase):
@@ -1700,14 +1819,15 @@ class WorkspaceWritePolicyTests(unittest.TestCase):
         data = self.assertAllowed("Fix the empty-state layout in ProfileView.swift and preserve behavior.")
         self.assertEqual(data["reason_code"], "workspace_write_scoped_auto")
 
-    def test_workspace_write_prompt_denials(self) -> None:
+    def test_workspace_write_prompt_denials_are_disabled_observations(self) -> None:
         cases = [
-            ("Only edit ../README.md.", "workspace_write_scope_not_inferred"),
-            ("Run rm -rf /tmp/example from the app.", "workspace_write_prompt_dangerous_command"),
+            "Only edit ../README.md.",
+            "Run rm -rf /tmp/example from the app.",
         ]
-        for prompt, reason in cases:
-            with self.subTest(reason=reason):
-                self.assertDenied(prompt, reason)
+        for prompt in cases:
+            with self.subTest(prompt=prompt):
+                data = self.assertAllowed(prompt)
+                self.assertIn("safety_classifiers_disabled", data["matched_rules"])
 
     def test_workspace_write_generic_and_category_terms_are_observation_only(self) -> None:
         cases = [
@@ -1767,7 +1887,7 @@ class WorkspaceWritePolicyTests(unittest.TestCase):
         self.assertTrue(delete_result.allowed, delete_result.to_dict())
         self.assertTrue(rename_result.allowed, rename_result.to_dict())
 
-    def test_post_run_blocks_only_high_confidence_secret_literals(self) -> None:
+    def test_post_run_secret_literals_are_observation_only(self) -> None:
         scope = ExpectedScope(explicit_files=["agent/foo.py"], allowed_categories=["python_source"])
         low_confidence_secret_result = verify_workspace_write_post_run(
             scope,
@@ -1794,8 +1914,8 @@ class WorkspaceWritePolicyTests(unittest.TestCase):
         self.assertIn("secret_like_content", low_confidence_secret_result.diff_content_flags)
         self.assertTrue(destructive_result.allowed, destructive_result.to_dict())
         self.assertIn("external_or_destructive_command", destructive_result.diff_content_flags)
-        self.assertFalse(high_confidence_secret_result.allowed)
-        self.assertEqual(high_confidence_secret_result.reason_code, "post_run_high_confidence_secret_literal")
+        self.assertTrue(high_confidence_secret_result.allowed, high_confidence_secret_result.to_dict())
+        self.assertEqual(high_confidence_secret_result.reason_code, "post_run_observations_recorded")
         self.assertIn("high_confidence_secret_literal", high_confidence_secret_result.diff_content_flags)
 
     def test_post_run_accepts_expected_scoped_source_test_docs_edits(self) -> None:
@@ -1822,10 +1942,13 @@ class _FakeLedger:
         self._run = run
         self._events = events
         self.added_events: list[tuple] = []
+        self._lease_counter = 0
+        self._active_lease: dict | None = None
         self._next_id = max(
             [int(event.get("id") or 0) for event in events if str(event.get("id") or "").isdigit()],
             default=0,
         ) + 1
+        self._ensure_destination_binding()
 
     def get_run(self, run_id: str) -> dict:
         return self._run
@@ -1841,6 +1964,105 @@ class _FakeLedger:
     def update_run_status(self, run_id: str, status: object) -> None:
         self._run = {**self._run, "status": getattr(status, "value", str(status))}
 
+    def acquire_chatgpt_ui_lease(
+        self,
+        run_id: str,
+        *,
+        reason: str | None = None,
+        source: str | None = None,
+    ):
+        self._lease_counter += 1
+        lease_token = f"fake-chatgpt-ui-lease-{self._lease_counter}"
+        owner_pid = 222
+        acquired_at = f"2026-01-01T00:00:{self._lease_counter:02d}+00:00"
+        metadata = {
+            "schema_version": default_ledger.CHATGPT_UI_LEASE_SCHEMA_VERSION,
+            "lease_token_sha256": default_ledger.chatgpt_ui_lease_token_fingerprint(
+                lease_token
+            ),
+            "owner_pid": owner_pid,
+            "owning_run_id": run_id,
+            "acquired_at": acquired_at,
+            "reason": reason,
+            "source": source,
+        }
+        event = self.append_event(
+            default_ledger.CHATGPT_UI_LEASE_ACQUIRED_EVENT_TYPE,
+            metadata,
+        )
+        event["run_id"] = run_id
+        self._active_lease = {
+            "run_id": run_id,
+            "lease_token": lease_token,
+            "owner_pid": owner_pid,
+            "acquired_at": acquired_at,
+        }
+        return default_ledger.AtomicChatGPTUILeaseResult(
+            status=default_ledger.AtomicChatGPTUILeaseStatus.ACQUIRED,
+            run_id=run_id,
+            lease_token=lease_token,
+            owner_pid=owner_pid,
+            owning_run_id=run_id,
+            acquired_at=acquired_at,
+            event_id=event["id"],
+            event_written=True,
+            event_ids=(event["id"],),
+        )
+
+    def release_chatgpt_ui_lease(
+        self,
+        lease_token: str,
+        *,
+        reason: str | None = None,
+        source: str | None = None,
+    ):
+        active = self._active_lease or {
+            "run_id": self._run.get("id", "run-1"),
+            "lease_token": lease_token,
+            "owner_pid": 222,
+            "acquired_at": "2026-01-01T00:00:00+00:00",
+        }
+        metadata = {
+            "schema_version": default_ledger.CHATGPT_UI_LEASE_SCHEMA_VERSION,
+            "lease_token_sha256": default_ledger.chatgpt_ui_lease_token_fingerprint(
+                lease_token
+            ),
+            "owner_pid": active["owner_pid"],
+            "owning_run_id": active["run_id"],
+            "acquired_at": active["acquired_at"],
+            "released_at": "2026-01-01T00:01:00+00:00",
+            "reason": reason,
+            "source": source,
+        }
+        event = self.append_event(
+            default_ledger.CHATGPT_UI_LEASE_RELEASED_EVENT_TYPE,
+            metadata,
+        )
+        event["run_id"] = active["run_id"]
+        self._active_lease = None
+        return default_ledger.AtomicChatGPTUILeaseResult(
+            status=default_ledger.AtomicChatGPTUILeaseStatus.RELEASED,
+            lease_token=lease_token,
+            owner_pid=active["owner_pid"],
+            owning_run_id=active["run_id"],
+            acquired_at=active["acquired_at"],
+            released_at="2026-01-01T00:01:00+00:00",
+            event_id=event["id"],
+            event_written=True,
+            event_ids=(event["id"],),
+        )
+
+    def list_chatgpt_ui_lease_events(self) -> list[dict]:
+        return [
+            event
+            for event in self._events
+            if event.get("event_type")
+            in {
+                default_ledger.CHATGPT_UI_LEASE_ACQUIRED_EVENT_TYPE,
+                default_ledger.CHATGPT_UI_LEASE_RELEASED_EVENT_TYPE,
+            }
+        ]
+
     def append_event(self, event_type: str, metadata: dict | None = None) -> dict:
         event = {
             "id": self._next_id,
@@ -1850,6 +2072,71 @@ class _FakeLedger:
         self._next_id += 1
         self._events.append(event)
         return event
+
+    def _ensure_destination_binding(self) -> None:
+        if any(
+            event.get("event_type") == default_ledger.RUN_DESTINATION_BOUND_EVENT_TYPE
+            for event in self._events
+        ):
+            return
+        self._events.append(
+            {
+                "id": 0,
+                "run_id": self._run.get("id", "run-1"),
+                "event_type": default_ledger.RUN_DESTINATION_BOUND_EVENT_TYPE,
+                "metadata_json": json.dumps(
+                    {
+                        "schema_version": default_ledger.RUN_DESTINATION_BOUND_SCHEMA_VERSION,
+                        "project_title": "Project Alpha",
+                        "chat_title": "Main Chat",
+                    },
+                    sort_keys=True,
+                ),
+            }
+        )
+
+
+class _FakeDestinationAdapter:
+    def read_destination_snapshot(self) -> ChatGPTDestinationSnapshot:
+        return ChatGPTDestinationSnapshot(
+            process_running=True,
+            window_available=True,
+            accessibility_available=True,
+            snapshot_stable=True,
+            snapshot_complete=True,
+            active_project_candidates=(
+                DestinationEvidenceCandidate(
+                    "Project Alpha",
+                    active=True,
+                    identity_confirmed=True,
+                    actionable_destination_evidence=True,
+                    project_chats_list_confirmed=True,
+                ),
+            ),
+            selected_chat_row_candidates=(
+                DestinationEvidenceCandidate(
+                    "Main Chat",
+                    selected=True,
+                    identity_confirmed=True,
+                    actionable_destination_evidence=True,
+                ),
+            ),
+            conversation_header_candidates=(
+                DestinationEvidenceCandidate(
+                    "Main Chat",
+                    active=True,
+                    identity_confirmed=True,
+                    actionable_destination_evidence=True,
+                ),
+            ),
+            composer_available=True,
+            transcript_available=True,
+            conversation_surface_available=True,
+            composer_candidate_count=1,
+            conversation_surface_candidate_count=1,
+            active_conversation_chat_title="Main Chat",
+            active_conversation_project_title="Project Alpha",
+        )
 
 
 if __name__ == "__main__":

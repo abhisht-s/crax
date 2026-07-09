@@ -4,13 +4,23 @@ import contextlib
 import hashlib
 import io
 import json
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
 from agent import cli
+from agent import codex_terminal
+from agent import ledger as ledger_module
 from agent.codex_services import (
     CodexDirectExecutionResult,
     execute_codex_direct_service,
+)
+from agent.run_services import (
+    CODEX_DEFAULT_SELECTION,
+    RUN_EXECUTION_PROFILE_SCHEMA_VERSION,
+    RUN_EXECUTION_PROFILE_SELECTED_EVENT_TYPE,
 )
 
 
@@ -30,7 +40,12 @@ def _raw_result(
     found: bool = True,
     codex_path: str | None = "/usr/local/bin/codex",
     validation_error: str | None = None,
+    final_message: str = "Final assistant summary.\n",
+    final_message_status: str = "valid",
+    final_message_path: str | None = None,
+    final_message_error: str | None = None,
 ) -> dict:
+    final_path = final_message_path or f"{repo_path}/.codex-final-message.md"
     return {
         "mode": "exec",
         "found": found,
@@ -39,7 +54,17 @@ def _raw_result(
         "repo_path": repo_path,
         "sandbox": sandbox,
         "validation_error": validation_error,
-        "command": ["codex", "exec", "-C", repo_path, "-s", sandbox, prompt],
+        "command": [
+            "codex",
+            "exec",
+            "-C",
+            repo_path,
+            "-s",
+            sandbox,
+            "--output-last-message",
+            final_path,
+            prompt,
+        ],
         "cwd": repo_path,
         "exit_code": exit_code,
         "stdout": stdout,
@@ -47,14 +72,65 @@ def _raw_result(
         "timed_out": timed_out,
         "started_at": "2026-01-01T00:00:00+00:00",
         "finished_at": "2026-01-01T00:00:01+00:00",
+        "final_message_path": final_path,
+        "final_message": final_message,
+        "final_message_length": len(final_message),
+        "final_message_status": final_message_status,
+        "final_message_error": final_message_error,
+    }
+
+
+def _execution_profile_event(
+    *,
+    sandbox: str = "read-only",
+    model: str = CODEX_DEFAULT_SELECTION,
+    event_id: int = 1,
+) -> dict:
+    metadata = {
+        "schema_version": RUN_EXECUTION_PROFILE_SCHEMA_VERSION,
+        "sandbox": sandbox,
+        "model": model,
+        "reasoning_effort": CODEX_DEFAULT_SELECTION,
+        "approval_policy": CODEX_DEFAULT_SELECTION,
+        "profile_source": "explicit_user_selection",
+    }
+    return {
+        "id": event_id,
+        "run_id": "run-1",
+        "event_type": RUN_EXECUTION_PROFILE_SELECTED_EVENT_TYPE,
+        "message": "Run execution profile selected.",
+        "metadata": metadata,
+        "metadata_json": json.dumps(metadata, sort_keys=True),
+    }
+
+
+def _controller_started_event(*, event_id: int = 2, sandbox: str = "read-only") -> dict:
+    metadata = {
+        "metadata_version": "local_controller_v1",
+        "repository_path": "/tmp/repo",
+        "sandbox": sandbox,
+        "source": "local_controller",
+        "controller_mode": "browser_v1",
+        "browser_safe_sandbox": True,
+    }
+    return {
+        "id": event_id,
+        "run_id": "run-1",
+        "event_type": "local_controller_run_started",
+        "message": "Local controller run initialized.",
+        "metadata": metadata,
+        "metadata_json": json.dumps(metadata, sort_keys=True),
     }
 
 
 class FakeLedger:
-    def __init__(self) -> None:
-        self.events: list[dict] = []
+    def __init__(self, events: list[dict] | None = None) -> None:
+        self.events: list[dict] = list(events or [])
         self.status_updates: list[tuple[str, object]] = []
-        self._next_id = 1
+        self._next_id = max(
+            [int(event.get("id") or 0) for event in self.events if str(event.get("id") or "").isdigit()],
+            default=0,
+        ) + 1
         self.run = {"id": "run-1", "status": "created"}
 
     def add_event(self, run_id: str, event_type: str, message: str, metadata: dict | None = None) -> dict:
@@ -103,6 +179,296 @@ class RecordingRunner:
         return self.result
 
 
+class FakeStreamingStdout:
+    def __init__(self, lines: list[str], checkpoints: list[int], progress_events: list[dict]) -> None:
+        self.lines = lines
+        self.checkpoints = checkpoints
+        self.progress_events = progress_events
+
+    def __iter__(self):
+        for index, line in enumerate(self.lines):
+            yield line
+            if index == 0:
+                self.checkpoints.append(len(self.progress_events))
+
+
+class FakeStreamingPopen:
+    instances: list["FakeStreamingPopen"] = []
+    lines: list[str] = []
+    checkpoints: list[int] = []
+    progress_events: list[dict] = []
+    returncode: int = 0
+
+    def __init__(self, command, **kwargs) -> None:
+        self.command = command
+        self.kwargs = kwargs
+        self.pid = 4242
+        self.stdout = FakeStreamingStdout(
+            self.lines,
+            self.checkpoints,
+            self.progress_events,
+        )
+        stderr_file = kwargs["stderr"]
+        stderr_file.write("raw stderr body that must not appear in progress")
+        self.instances.append(self)
+
+    def wait(self) -> int:
+        final_path = Path(self.command[self.command.index("--output-last-message") + 1])
+        final_path.write_text("Authoritative final message from file.\n", encoding="utf-8")
+        return self.returncode
+
+
+def _temporary_real_ledger():
+    tmpdir = tempfile.TemporaryDirectory()
+    db_path = Path(tmpdir.name) / "ledger.db"
+    patcher = mock.patch.object(ledger_module, "DB_PATH", db_path)
+
+    class _Context:
+        def __enter__(self):
+            patcher.__enter__()
+            return db_path
+
+        def __exit__(self, exc_type, exc, tb):
+            patcher.__exit__(exc_type, exc, tb)
+            tmpdir.cleanup()
+
+    return _Context()
+
+
+class CodexTerminalTimeoutTests(unittest.TestCase):
+    def test_run_codex_exec_requests_run_scoped_final_message_artifact(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codex"],
+            returncode=0,
+            stdout="raw stdout that must not be submitted\n",
+            stderr="raw stderr that must not be submitted\n",
+        )
+
+        def run_side_effect(command, **_kwargs):
+            final_path = Path(command[command.index("--output-last-message") + 1])
+            final_path.write_text("Clean final assistant message.\n", encoding="utf-8")
+            return completed
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "run", side_effect=run_side_effect) as run,
+        ):
+            result = codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                timeout_seconds=None,
+                sandbox="read-only",
+                run_id="run-abc/123",
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--output-last-message", command)
+        final_message_path = Path(command[command.index("--output-last-message") + 1])
+        self.assertIn("run-abc_123", str(final_message_path))
+        self.assertEqual(result["final_message_status"], "valid")
+        self.assertEqual(result["final_message"], "Clean final assistant message.")
+        self.assertEqual(result["stdout"], "raw stdout that must not be submitted\n")
+        self.assertEqual(result["stderr"], "raw stderr that must not be submitted\n")
+
+    def test_run_codex_exec_omits_subprocess_timeout_when_timeout_is_none(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codex"],
+            returncode=0,
+            stdout="done\n",
+            stderr="",
+        )
+
+        def run_side_effect(command, **_kwargs):
+            final_path = Path(command[command.index("--output-last-message") + 1])
+            final_path.write_text("done", encoding="utf-8")
+            return completed
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "run", side_effect=run_side_effect) as run,
+        ):
+            result = codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                timeout_seconds=None,
+                sandbox="read-only",
+            )
+
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["exit_code"], 0)
+        _args, kwargs = run.call_args
+        self.assertNotIn("timeout", kwargs)
+        self.assertEqual(kwargs["cwd"], str(Path(repo).resolve(strict=False)))
+
+    def test_run_codex_exec_ignores_numeric_timeout_for_subprocess(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codex"],
+            returncode=0,
+            stdout="done\n",
+            stderr="",
+        )
+
+        def run_side_effect(command, **_kwargs):
+            final_path = Path(command[command.index("--output-last-message") + 1])
+            final_path.write_text("done", encoding="utf-8")
+            return completed
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "run", side_effect=run_side_effect) as run,
+        ):
+            result = codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                timeout_seconds=123,
+                sandbox="workspace-write",
+            )
+
+        self.assertFalse(result["timed_out"])
+        _args, kwargs = run.call_args
+        self.assertNotIn("timeout", kwargs)
+
+    def test_run_codex_exec_includes_optional_model_and_no_reasoning_or_approval_args(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codex"],
+            returncode=0,
+            stdout="done\n",
+            stderr="",
+        )
+
+        def run_side_effect(command, **_kwargs):
+            final_path = Path(command[command.index("--output-last-message") + 1])
+            final_path.write_text("done", encoding="utf-8")
+            return completed
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "run", side_effect=run_side_effect) as run,
+        ):
+            result = codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                timeout_seconds=123,
+                sandbox="workspace-write",
+                model="gpt-5-codex",
+            )
+
+        self.assertTrue(result["found"])
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-m") + 1], "gpt-5-codex")
+        self.assertIn("--output-last-message", command)
+        self.assertNotIn("--reasoning-effort", command)
+        self.assertNotIn("--approval-policy", command)
+
+    def test_run_codex_exec_json_stream_parses_incrementally_and_uses_final_file(self) -> None:
+        progress_events: list[dict] = []
+        checkpoints: list[int] = []
+        FakeStreamingPopen.instances = []
+        FakeStreamingPopen.lines = [
+            json.dumps(
+                {
+                    "type": "command_started",
+                    "command": ["npm", "test", "--token", "secret-value"],
+                    "stdout": "raw stdout body that must not appear in progress",
+                }
+            )
+            + "\n",
+            "{malformed json line with secret output\n",
+            json.dumps(
+                {
+                    "type": "command_finished",
+                    "command": ["npm", "test"],
+                    "exit_code": 0,
+                    "stderr": "raw stderr body that must not appear in progress",
+                }
+            )
+            + "\n",
+        ]
+        FakeStreamingPopen.checkpoints = checkpoints
+        FakeStreamingPopen.progress_events = progress_events
+        FakeStreamingPopen.returncode = 0
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "Popen", FakeStreamingPopen),
+        ):
+            result = codex_terminal.run_codex_exec(
+                "Prompt text must stay out of progress",
+                repo_path=repo,
+                sandbox="read-only",
+                run_id="run-stream",
+                json_stream=True,
+                codex_invocation_id="inv-1",
+                progress_callback=progress_events.append,
+            )
+
+        command = FakeStreamingPopen.instances[0].command
+        self.assertIn("--json", command)
+        self.assertEqual(result["final_message"], "Authoritative final message from file.")
+        self.assertIn("command_started", result["stdout"])
+        self.assertGreaterEqual(checkpoints[0], 2)
+        progress_text = json.dumps(progress_events, sort_keys=True)
+        self.assertIn("Malformed Codex JSONL event", progress_text)
+        self.assertIn("final_message_available", progress_text)
+        self.assertIn("process_exited", progress_text)
+        self.assertNotIn("raw stdout body", progress_text)
+        self.assertNotIn("raw stderr body", progress_text)
+        self.assertNotIn("secret-value", progress_text)
+        self.assertNotIn("Prompt text must stay out of progress", progress_text)
+
+    def test_run_codex_exec_non_streaming_keeps_existing_command_shape(self) -> None:
+        completed = subprocess.CompletedProcess(args=["codex"], returncode=0, stdout="done\n", stderr="")
+
+        def run_side_effect(command, **_kwargs):
+            final_path = Path(command[command.index("--output-last-message") + 1])
+            final_path.write_text("done", encoding="utf-8")
+            return completed
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "run", side_effect=run_side_effect) as run,
+        ):
+            result = codex_terminal.run_codex_exec("Prompt", repo_path=repo, sandbox="read-only")
+
+        self.assertEqual(result["final_message"], "done")
+        self.assertNotIn("--json", run.call_args.args[0])
+
+    def test_subprocess_timeout_exception_keeps_historical_timed_out_result_shape(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(
+                codex_terminal.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(
+                    cmd=["codex"],
+                    timeout=123,
+                    output="partial stdout",
+                    stderr="partial stderr",
+                ),
+            ) as run,
+        ):
+            result = codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                timeout_seconds=123,
+                sandbox="read-only",
+            )
+
+        self.assertTrue(result["timed_out"])
+        self.assertIsNone(result["exit_code"])
+        self.assertEqual(result["stdout"], "partial stdout")
+        self.assertEqual(result["stderr"], "partial stderr")
+        _args, kwargs = run.call_args
+        self.assertNotIn("timeout", kwargs)
+
+
 class CodexDirectExecutionServiceTests(unittest.TestCase):
     def test_success_writes_only_raw_events_and_preserves_output(self) -> None:
         ledger = FakeLedger()
@@ -132,6 +498,9 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         self.assertEqual(result.duration_seconds, 2.5)
         self.assertEqual(result.stdout, stdout)
         self.assertEqual(result.stderr, stderr)
+        self.assertEqual(result.final_message, "Final assistant summary.\n")
+        self.assertEqual(result.final_message_status, "valid")
+        self.assertEqual(result.final_message_length, len("Final assistant summary.\n"))
         self.assertEqual(result.stdout_sha256, _sha(stdout))
         self.assertEqual(result.stderr_sha256, _sha(stderr))
         self.assertEqual(result.stdout_length, len(stdout))
@@ -147,7 +516,7 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         self.assertEqual(ledger.events[0]["metadata"], {
             "prompt": prompt,
             "repo_path": repo_path,
-            "timeout": 300,
+            "timeout": None,
             "sandbox": "read-only",
             "prompt_contract": {"confidence": "low"},
         })
@@ -179,14 +548,231 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         self.assertEqual(runner.calls, [
             (
                 (prompt,),
-                {"repo_path": repo_path, "timeout_seconds": 123, "sandbox": "workspace-write"},
+                {
+                    "repo_path": repo_path,
+                    "timeout_seconds": None,
+                    "sandbox": "workspace-write",
+                    "run_id": "run-1",
+                },
             )
         ])
         self.assertEqual(
             result.command,
-            ["codex", "exec", "-C", repo_path, "-s", "workspace-write", prompt],
+            [
+                "codex",
+                "exec",
+                "-C",
+                repo_path,
+                "-s",
+                "workspace-write",
+                "--output-last-message",
+                "/tmp/focused-repo/.codex-final-message.md",
+                prompt,
+            ],
         )
         self.assertEqual(ledger.events[1]["metadata"]["command"], result.command)
+
+    def test_real_ledger_progress_events_get_run_invocation_and_sequence(self) -> None:
+        def runner(prompt: str, **kwargs) -> dict:
+            kwargs["progress_callback"](
+                {
+                    "source": "test",
+                    "kind": "command_started",
+                    "status": "running",
+                    "title": "Command started",
+                    "summary": "bounded summary",
+                    "metadata": {
+                        "stdout": "raw body must be summarized",
+                        "command": ["npm", "test"],
+                    },
+                }
+            )
+            return _raw_result(
+                prompt=prompt,
+                repo_path="/tmp/repo",
+                stdout="raw process output remains on legacy result",
+            )
+
+        with _temporary_real_ledger():
+            run_id = ledger_module.create_run("Task")
+            result = execute_codex_direct_service(
+                run_id,
+                "Task prompt",
+                "/tmp/repo",
+                "read-only",
+                None,
+                {},
+                ledger=ledger_module,
+                codex_runner=runner,
+                monotonic_clock=StepClock([1.0, 2.0]),
+            )
+            events = ledger_module.list_codex_progress_events(run_id)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertEqual(event["run_id"], run_id)
+        self.assertEqual(event["codex_invocation_id"], result.raw_process_result["codex_invocation_id"])
+        self.assertIsInstance(event["sequence"], int)
+        self.assertEqual(event["kind"], "command_started")
+        encoded = json.dumps(event, sort_keys=True)
+        self.assertIn("stdout_length", encoded)
+        self.assertNotIn("raw body must be summarized", encoded)
+
+    def test_controller_profile_default_model_launches_without_model_arg(self) -> None:
+        ledger = FakeLedger(
+            [
+                _execution_profile_event(sandbox="workspace-write"),
+                _controller_started_event(sandbox="workspace-write"),
+            ]
+        )
+        prompt = "Fix the focused test"
+        repo_path = "/tmp/focused-repo"
+        raw = _raw_result(prompt=prompt, repo_path=repo_path, sandbox="workspace-write")
+        runner = RecordingRunner(raw)
+
+        result = execute_codex_direct_service(
+            "run-1",
+            prompt,
+            repo_path,
+            "workspace-write",
+            123,
+            {},
+            ledger=ledger,
+            codex_runner=runner,
+            monotonic_clock=StepClock([1.0, 1.25]),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(runner.calls[0][1]["sandbox"], "workspace-write")
+        self.assertNotIn("model", runner.calls[0][1])
+        self.assertNotIn("-m", result.command)
+
+    def test_controller_profile_explicit_model_launches_with_model_arg(self) -> None:
+        ledger = FakeLedger(
+            [
+                _execution_profile_event(model="gpt-5-codex"),
+                _controller_started_event(),
+            ]
+        )
+        prompt = "Fix the focused test"
+        repo_path = "/tmp/focused-repo"
+        raw = _raw_result(prompt=prompt, repo_path=repo_path)
+        raw["command"] = [
+            "codex",
+            "exec",
+            "-C",
+            repo_path,
+            "-s",
+            "read-only",
+            "-m",
+            "gpt-5-codex",
+            "--output-last-message",
+            "/tmp/focused-repo/.codex-final-message.md",
+            prompt,
+        ]
+        runner = RecordingRunner(raw)
+
+        result = execute_codex_direct_service(
+            "run-1",
+            prompt,
+            repo_path,
+            "read-only",
+            123,
+            {},
+            ledger=ledger,
+            codex_runner=runner,
+            monotonic_clock=StepClock([1.0, 1.25]),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(runner.calls[0][1]["model"], "gpt-5-codex")
+        self.assertNotIn("reasoning_effort", runner.calls[0][1])
+        self.assertNotIn("approval_policy", runner.calls[0][1])
+        self.assertEqual(result.command[result.command.index("-m") + 1], "gpt-5-codex")
+
+    def test_controller_profile_missing_or_mismatched_fails_before_codex_started(self) -> None:
+        cases = [
+            (
+                "missing",
+                [_controller_started_event()],
+                "read-only",
+                "execution_profile_missing",
+            ),
+            (
+                "mismatch",
+                [
+                    _execution_profile_event(sandbox="read-only"),
+                    _controller_started_event(sandbox="workspace-write"),
+                ],
+                "workspace-write",
+                "execution_profile_sandbox_mismatch",
+            ),
+            (
+                "malformed",
+                [
+                    {
+                        **_execution_profile_event(),
+                        "metadata": {"schema_version": RUN_EXECUTION_PROFILE_SCHEMA_VERSION},
+                        "metadata_json": json.dumps({"schema_version": RUN_EXECUTION_PROFILE_SCHEMA_VERSION}),
+                    },
+                    _controller_started_event(),
+                ],
+                "read-only",
+                "malformed_execution_profile_event",
+            ),
+        ]
+
+        for name, events, sandbox, reason in cases:
+            with self.subTest(name=name):
+                ledger = FakeLedger(events)
+                runner = RecordingRunner(_raw_result(sandbox=sandbox))
+
+                result = execute_codex_direct_service(
+                    "run-1",
+                    "Prompt",
+                    "/tmp/repo",
+                    sandbox,
+                    123,
+                    {},
+                    ledger=ledger,
+                    codex_runner=runner,
+                    monotonic_clock=StepClock([1.0, 1.25]),
+                )
+
+                self.assertFalse(result.ok)
+                self.assertEqual(result.reason_code, reason)
+                self.assertEqual(runner.calls, [])
+                self.assertNotIn(
+                    "codex_exec_started",
+                    [event["event_type"] for event in ledger.events],
+                )
+
+    def test_no_timeout_execution_records_none_and_completes_without_timed_out_result(self) -> None:
+        ledger = FakeLedger()
+        prompt = "Let Codex run naturally"
+        repo_path = "/tmp/repo"
+        raw = _raw_result(prompt=prompt, repo_path=repo_path, timed_out=False)
+        runner = RecordingRunner(raw)
+
+        result = execute_codex_direct_service(
+            "run-1",
+            prompt,
+            repo_path,
+            "read-only",
+            None,
+            {"confidence": "low"},
+            ledger=ledger,
+            codex_runner=runner,
+            monotonic_clock=StepClock([10.0, 11.0]),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(result.reason_code, "codex_exec_completed")
+        self.assertEqual(runner.calls[0][1]["timeout_seconds"], None)
+        self.assertIsNone(ledger.events[0]["metadata"]["timeout"])
+        self.assertFalse(ledger.events[1]["metadata"]["timed_out"])
 
     def test_result_shaped_failures_write_started_then_finished(self) -> None:
         cases = [

@@ -109,7 +109,7 @@ def _successful_capture_result(response: str = "Thinking") -> dict:
         "stable_seconds": 2.0,
         "successful_polls": 3,
         "poll_interval_seconds": 1.0,
-        "timeout_seconds": 60.0,
+        "timeout_seconds": None,
         "match_score": 1.0,
         "ax_stats": {"candidate_count": 2},
         "format_warning": "Captured text is rendered macOS Accessibility text; Markdown and code formatting may be lossy.",
@@ -147,7 +147,7 @@ def _failed_capture_result(reason_code: str, sentinel_state: str, error: str = "
         "stable_seconds": 2.0,
         "successful_polls": 0,
         "poll_interval_seconds": 1.0,
-        "timeout_seconds": 60.0,
+        "timeout_seconds": None,
         "ax_stats": {"candidate_count": 2},
         "post_feedback_candidate_summaries": [
             {
@@ -231,6 +231,11 @@ def _submission_base_events(stdout: str = "stdout\n", stderr: str = "stderr\n") 
                 "exit_code": 0,
                 "timed_out": False,
                 "validation_error": None,
+                "final_message": "Clean final assistant message.\n",
+                "final_message_path": "/tmp/run-1/final-message.md",
+                "final_message_status": "valid",
+                "final_message_error": None,
+                "final_message_length": len("Clean final assistant message.\n"),
             },
         ),
         _event(2, "changed_file_classification", {"total_files": 0, "files": []}),
@@ -390,8 +395,8 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
             artifact_writer=artifact_writer,
             monotonic_function=monotonic,
             sleep_function=lambda seconds: None,
-            paste_verify_timeout_seconds=1.0,
-            submission_verify_timeout_seconds=1.0,
+            paste_verify_timeout_seconds=None,
+            submission_verify_timeout_seconds=None,
             submission_verification_function=verification_function,
             **kwargs,
         )
@@ -415,7 +420,8 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         self.assertNotIn("gpt_feedback_submission_ambiguous", [event["event_type"] for event in ledger.added_events])
         self.assertEqual(copied_texts, [result.feedback_message])
         self.assertTrue(str(result.feedback_message).startswith("AGENT_SUBMISSION\n"))
-        self.assertIn("stdout\n", str(result.feedback_message))
+        self.assertIn("Clean final assistant message.", str(result.feedback_message))
+        self.assertNotIn("stdout\n", str(result.feedback_message))
         self.assertEqual(send_calls, ["FW.2"])
         self.assertEqual(enter_calls, [])
         verified = ledger.added_events[-1]
@@ -430,6 +436,35 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         self.assertEqual(result.feedback_payload_sha256, metadata["feedback_payload_sha256"])
         self.assertEqual(result.feedback_payload_length, metadata["feedback_payload_length"])
         self.assertEqual(ledger.status_updates, [])
+
+    def test_non_submittable_feedback_fails_before_copy_paste_or_submit(self) -> None:
+        oversized = "x" * 12_001
+        ledger = FakeLedger(
+            _submission_base_events(stdout="raw stdout must stay local\n", stderr="raw stderr must stay local\n")
+        )
+        metadata = json.loads(ledger.events[0]["metadata_json"])
+        metadata.update(
+            {
+                "final_message": oversized,
+                "final_message_length": len(oversized),
+                "final_message_status": "valid",
+            }
+        )
+        ledger.events[0]["metadata_json"] = json.dumps(metadata, sort_keys=True)
+
+        result, ledger, copied_texts, send_calls, enter_calls = self._service(ledger=ledger)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "codex_final_message_oversize")
+        self.assertIsNone(result.feedback_message)
+        self.assertEqual(copied_texts, [])
+        self.assertEqual(send_calls, [])
+        self.assertEqual(enter_calls, [])
+        self.assertEqual([event["event_type"] for event in ledger.added_events], ["gpt_feedback_generation_failed"])
+        failure_metadata = ledger.added_events[0]["metadata"]
+        self.assertTrue(failure_metadata["clipboard_copy_skipped"])
+        self.assertEqual(failure_metadata["feedback_payload_length"], 0)
+        self.assertNotIn(oversized, json.dumps(failure_metadata))
 
     def test_output_artifact_write_happens_before_generated_event_and_errors_before_events(self) -> None:
         operations: list[str] = []
@@ -508,16 +543,6 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
                 {"paste_result": {"pasted": False, "method": "paste", "error": "paste failed"}},
                 ["gpt_feedback_generated", "gpt_feedback_copied", "gpt_feedback_pasted", "gpt_feedback_submission_failed"],
                 "chatgpt_paste_input_failed",
-            ),
-            (
-                "draft_marker_missing",
-                {
-                    "inspection_function": lambda app_name, marker_text=None: _submission_observation(
-                        str(marker_text), composer_text=""
-                    )
-                },
-                ["gpt_feedback_generated", "gpt_feedback_copied", "gpt_feedback_pasted", "gpt_feedback_submission_failed"],
-                "chatgpt_paste_not_visible",
             ),
         ]
 
@@ -668,18 +693,132 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         self.assertEqual(ledger.added_events[-1]["event_type"], "gpt_feedback_submission_failed")
         self.assertEqual(ledger.added_events[-1]["metadata"]["fallback_attempt_count"], 1)
 
-    def test_no_send_occurs_before_draft_marker_verification(self) -> None:
+    def test_default_submission_verifier_is_bounded_when_never_submitted(self) -> None:
+        # Regression: previously the verifier ignored its timeout and looped
+        # forever when a paste never actually submitted, hanging the handoff and
+        # holding the UI lease. It must now return not-verified after a bounded
+        # poll budget.
+        from agent.chatgpt_services import _verify_submission_marker
+
+        marker = "AGENT_SUBMISSION\nrun_id=r\nnonce=n"
+        calls = {"count": 0}
+
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            calls["count"] += 1
+            return _submission_observation(str(marker_text), composer_text=str(marker_text))
+
+        result = _verify_submission_marker(
+            "ChatGPT",
+            marker,
+            inspection_function=inspect,
+            monotonic_function=lambda: 0.0,
+            sleep_function=lambda _seconds: None,
+            timeout_seconds=None,
+            poll_interval_seconds=0.0,
+            max_polls=3,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason_code"], "chatgpt_submission_not_verified")
+        self.assertEqual(result["poll_count"], 3)
+        self.assertEqual(calls["count"], 3)
+        self.assertTrue(result["status"]["composer_contains_marker"])
+
+    def test_send_selection_skips_message_action_button_and_uses_enter(self) -> None:
+        # Regression: the run pressed a transcript reply control ("Memory
+        # updated" with Good/Bad response actions) instead of the composer Send
+        # button, so nothing submitted. Such controls must be rejected in favor
+        # of Return.
+        from agent.chatgpt_services import _select_send_input_method
+
+        observation = _submission_observation("m", composer_text="m")
+        observation["send_button"] = {
+            "path": "FW.9",
+            "role": "AXButton",
+            "description": "Memory updated",
+            "actions": ["AXShowMenu", "AXPress", "Name:Good response", "Name:Read Aloud"],
+        }
+        send_calls: list[str] = []
+        enter_calls: list[str] = []
+
+        result, _summary = _select_send_input_method(
+            "ChatGPT",
+            "m",
+            inspection_function=lambda app, marker_text=None: observation,
+            ax_send_button_function=lambda app, path: send_calls.append(path)
+            or {"pressed": True, "method": "macos_accessibility_axpress_send_button", "path": path},
+            enter_function=lambda: enter_calls.append("enter")
+            or {"submitted": True, "method": "enter", "error": None},
+        )
+
+        self.assertEqual(send_calls, [])
+        self.assertEqual(enter_calls, ["enter"])
+        self.assertEqual(result["method"], "enter")
+
+    def test_send_selection_uses_valid_send_button(self) -> None:
+        from agent.chatgpt_services import _select_send_input_method
+
+        observation = _submission_observation("m", composer_text="m", send_button=True)
+        send_calls: list[str] = []
+
+        result, _summary = _select_send_input_method(
+            "ChatGPT",
+            "m",
+            inspection_function=lambda app, marker_text=None: observation,
+            ax_send_button_function=lambda app, path: send_calls.append(path)
+            or {"pressed": True, "method": "macos_accessibility_axpress_send_button", "path": path},
+            enter_function=lambda: {"submitted": True, "method": "enter", "error": None},
+        )
+
+        self.assertEqual(send_calls, ["FW.2"])
+        self.assertEqual(result["method"], "macos_accessibility_axpress_send_button")
+
+    def test_default_verifier_fails_closed_when_submission_never_registers(self) -> None:
+        # End-to-end: paste succeeds, the marker sits in the composer, but the
+        # submit never registers. The service must fall back to Enter once and
+        # then fail closed with a terminal event (not hang).
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            marker = str(marker_text)
+            if inspect.calls == 0:
+                inspect.calls += 1
+                return _submission_observation(marker, composer_text="", send_button=True)
+            inspect.calls += 1
+            return _submission_observation(marker, composer_text=marker, send_button=True)
+
+        inspect.calls = 0
+
         result, ledger, _copied, send_calls, enter_calls = self._service(
-            inspection_function=lambda app_name, marker_text=None: _submission_observation(
-                str(marker_text), composer_text=""
-            )
+            inspection_function=inspect,
+            use_default_submission_verifier=True,
+            ax_send_result={"pressed": True, "method": "macos_accessibility_axpress_send_button", "error": None},
+            enter_result={"submitted": True, "method": "enter", "error": None},
         )
 
         self.assertFalse(result.ok)
-        self.assertEqual(result.reason_code, "chatgpt_paste_not_visible")
-        self.assertEqual(send_calls, [])
+        self.assertEqual(result.reason_code, "chatgpt_submission_not_verified")
+        self.assertEqual(ledger.added_events[-1]["event_type"], "gpt_feedback_submission_failed")
+        self.assertEqual(send_calls, ["FW.2"])
+        self.assertEqual(enter_calls, ["enter"])
+
+    def test_send_waits_until_draft_marker_verification(self) -> None:
+        calls = {"count": 0}
+
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            marker = str(marker_text)
+            calls["count"] += 1
+            if calls["count"] <= 3:
+                return _submission_observation(marker, composer_text="")
+            return _submission_observation(marker, composer_text=marker, send_button=True)
+
+        result, ledger, _copied, send_calls, enter_calls = self._service(
+            inspection_function=inspect,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.reason_code, "chatgpt_submission_verified")
+        self.assertEqual(send_calls, ["FW.2"])
         self.assertEqual(enter_calls, [])
-        self.assertNotIn("gpt_feedback_submit_input_sent", [event["event_type"] for event in ledger.added_events])
+        self.assertIn("gpt_feedback_submit_input_sent", [event["event_type"] for event in ledger.added_events])
 
     def test_no_verified_event_without_submitted_marker_verification(self) -> None:
         result, ledger, _copied, _send_calls, _enter_calls = self._service(
@@ -758,7 +897,7 @@ class CaptureChatGPTResponseServiceTests(unittest.TestCase):
 
         result = capture_chatgpt_response_service(
             "run-1",
-            timeout_seconds=60.0,
+            timeout_seconds=None,
             stable_seconds=2.0,
             require_sentinel_response=True,
             ledger=ledger,
@@ -787,6 +926,7 @@ class CaptureChatGPTResponseServiceTests(unittest.TestCase):
         self.assertEqual(ledger.added_events[0]["message"], "Assistant response capture started after verified ChatGPT submission.")
         self.assertEqual(ledger.added_events[1]["message"], "Captured GPT response from ChatGPT desktop accessibility tree.")
         self.assertEqual(capture_calls[0]["args"], ("",))
+        self.assertIsNone(capture_calls[0]["kwargs"]["timeout_seconds"])
         self.assertEqual(capture_calls[0]["kwargs"]["submission_marker_text"], CAPTURE_MARKER)
         self.assertTrue(capture_calls[0]["kwargs"]["require_sentinel_response"])
         started_metadata = ledger.added_events[0]["metadata"]
@@ -854,11 +994,8 @@ class CaptureChatGPTResponseServiceTests(unittest.TestCase):
 
     def test_post_start_failures_write_started_then_one_failure(self) -> None:
         cases = [
-            ("no sentinel timeout", "sentinel_not_found_timeout", "sentinel_pending"),
-            ("incomplete sentinel timeout", "sentinel_incomplete_timeout", "streaming_incomplete_sentinel"),
             ("stable malformed sentinel", "sentinel_malformed_stable", "stable_malformed_sentinel"),
             ("multiple complete sentinels", "multiple_complete_sentinels", "multiple_complete_sentinels"),
-            ("anchor timeout", "sentinel_not_found_timeout", "anchor_pending"),
         ]
         for _name, reason_code, sentinel_state in cases:
             with self.subTest(_name):
