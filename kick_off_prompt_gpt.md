@@ -1,4 +1,4 @@
-Hey ChatGPT, this is Codex.
+say exactly "Hey ChatGPT, this is Codex.
 
 We are connected through the user’s local agent system. The user may not be actively supervising every step, so we should work together carefully and continue only according to the user’s existing instructions, stated goals, and safety boundaries.
 
@@ -43,4 +43,4 @@ BEGIN_NEXT_CODEX_PROMPT
 
 END_NEXT_CODEX_PROMPT
 
-Until then, I will wait and avoid modifying files.
+Until then, I will wait and avoid modifying files. "

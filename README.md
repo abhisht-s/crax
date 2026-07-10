@@ -44,7 +44,7 @@ python -m unittest discover -s tests
 Start the local dashboard:
 
 ```sh
-agent-loop-local --port 0
+python -m agent.local_server --port 0
 ```
 
 Open the `Bootstrap URL` printed by the command. It will look like:
