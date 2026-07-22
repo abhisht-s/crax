@@ -436,6 +436,15 @@ def submit_feedback_to_chatgpt_service(
         initial_observation,
         feedback["submission_marker_text"],
     )
+    composer_text_before_paste = str(
+        (focused_composer or {}).get("text") or (focused_composer or {}).get("value") or ""
+    )
+    composer_result["focused_composer_was_empty_before_paste"] = not bool(
+        composer_text_before_paste.strip()
+    )
+    composer_result["composer_clear_before_paste_required"] = bool(
+        composer_text_before_paste.strip()
+    )
     if not initial_observation.get("ok") or focused_composer is None:
         reason_code = (
             "chatgpt_composer_not_focused"
@@ -504,6 +513,7 @@ def submit_feedback_to_chatgpt_service(
                 "run_id": feedback["run_id"],
                 "activation_result": activation_result,
                 "paste_result": paste_result,
+                "composer_observation": composer_result,
                 "message_length": len(feedback["message"]),
                 "feedback_payload_version": feedback["feedback_payload_version"],
                 "feedback_payload_sha256": feedback["feedback_payload_sha256"],

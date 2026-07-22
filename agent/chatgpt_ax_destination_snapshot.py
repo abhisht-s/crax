@@ -788,9 +788,11 @@ def _window_title_item(node: AXDestinationNode) -> bool:
     if node.role not in {"AXButton", "AXStaticText", "AXHeading"}:
         return False
     action_text = " ".join(node.actions).casefold()
-    toolbar_action = _has_any(action_text, ("toolbar", "move next", "move previous"))
-    band = _frame_band(node.frame)
-    return bool(toolbar_action or band.startswith("top"))
+    # ChatGPT keeps old transcript nodes in the AX tree with large negative Y
+    # coordinates.  Frame-band classification alone can label those historical
+    # nodes as "top", so only toolbar-management actions identify the current
+    # window title item.
+    return _has_any(action_text, ("toolbar", "move next", "move previous"))
 
 
 def _active_conversation_identity(
@@ -864,7 +866,7 @@ class _MacOSAXDestinationSnapshotQuery:
 def _pid_for_app(app_name: str) -> int | None:
     bundle_id = CHATGPT_BUNDLE_ID if app_name == DEFAULT_APP_NAME else ""
     if bundle_id:
-        pid = _pid_for_bundle_id(bundle_id)
+        pid = resolve_classic_chatgpt_pid()
         if pid is not None:
             return pid
     names = [app_name]
@@ -887,6 +889,18 @@ def _pid_for_app(app_name: str) -> int | None:
                     if not bundle_id or _pid_bundle_id(pid) == bundle_id:
                         return pid
     return None
+
+
+def resolve_classic_chatgpt_pid() -> int | None:
+    """Return only the Classic ChatGPT process, never the Work/Codex app.
+
+    Both desktop applications can present the localized name ``ChatGPT``.  AX
+    readers that act on or capture from the user-facing ChatGPT conversation
+    must therefore resolve the Classic bundle explicitly rather than selecting
+    the first name match returned by System Events.
+    """
+
+    return _pid_for_bundle_id(CHATGPT_BUNDLE_ID)
 
 
 def _pid_for_bundle_id(bundle_id: str) -> int | None:

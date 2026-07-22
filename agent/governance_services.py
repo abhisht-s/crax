@@ -287,12 +287,13 @@ def _build_governance_observation(
     content_flags = diff_content_flags(diff_text)
     objective_failures = []
     path_safety = contract.get("path_safety") if isinstance(contract.get("path_safety"), dict) else {}
-    if path_safety.get("valid") is False:
-        objective_failures.append("invalid_contract_path")
-    if sandbox == "read-only" and paths:
-        objective_failures.append("read_only_sandbox_attributable_write")
-    if "high_confidence_secret_literal" in content_flags:
-        objective_failures.append("high_confidence_secret_literal")
+    if sandbox != "danger-full-access":
+        if path_safety.get("valid") is False:
+            objective_failures.append("invalid_contract_path")
+        if sandbox == "read-only" and paths:
+            objective_failures.append("read_only_sandbox_attributable_write")
+        if "high_confidence_secret_literal" in content_flags:
+            objective_failures.append("high_confidence_secret_literal")
 
     scope_observation = "matched"
     if contract_mismatches:
@@ -301,6 +302,8 @@ def _build_governance_observation(
         scope_observation = "not_evaluable" if delta and delta.get("validation_error") else "matched"
 
     observation_flags = []
+    if sandbox == "danger-full-access":
+        observation_flags.append("autonomous_full_access_policy_bypass")
     if before_snapshot and _working_tree_dirty(before_snapshot):
         observation_flags.append("repo_dirty_before_codex")
     observation_flags.extend(flag for flag in content_flags if flag != "high_confidence_secret_literal")
@@ -488,8 +491,6 @@ def _auto_supervision_allowed(
     if bool(supervision_decision.get("needs_review")):
         return False
     if bool(supervision_decision.get("approval_required")):
-        return False
-    if sandbox == "danger-full-access":
         return False
     return True
 

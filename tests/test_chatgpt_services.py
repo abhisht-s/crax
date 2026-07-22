@@ -22,6 +22,7 @@ from agent.chatgpt_services import (
     extract_next_codex_prompt_service,
     submit_feedback_to_chatgpt_service,
 )
+from agent.gpt_feedback import MAX_CLEAN_FINAL_MESSAGE_CHARS
 
 
 def _sha(text: str) -> str:
@@ -438,7 +439,7 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         self.assertEqual(ledger.status_updates, [])
 
     def test_non_submittable_feedback_fails_before_copy_paste_or_submit(self) -> None:
-        oversized = "x" * 12_001
+        oversized = "x" * (MAX_CLEAN_FINAL_MESSAGE_CHARS + 1)
         ledger = FakeLedger(
             _submission_base_events(stdout="raw stdout must stay local\n", stderr="raw stderr must stay local\n")
         )

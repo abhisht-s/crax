@@ -17,6 +17,10 @@ from agent.chatgpt_destination_gate import (
 )
 from agent.codex_terminal import run_command
 from agent.file_classifier import classify_changed_files
+from agent.gpt_feedback import (
+    MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS,
+    MAX_CLEAN_FINAL_MESSAGE_CHARS,
+)
 from agent.git_snapshot import (
     attributable_paths,
     capture_invocation_git_state,
@@ -475,15 +479,15 @@ class SupervisePlannerTests(unittest.TestCase):
         plan = detect_next_supervise_action(self.run_record(), events, self.repo_path)
         self.assertEqual(plan.action, SuperviseAction.EXTRACT_NEXT_PROMPT)
 
-    def test_danger_full_access_is_blocked(self) -> None:
+    def test_danger_full_access_continues_when_explicit(self) -> None:
         plan = detect_next_supervise_action(
             self.run_record(),
             self.base_completed_events(),
             self.repo_path,
             sandbox="danger-full-access",
         )
-        self.assertEqual(plan.action, SuperviseAction.STOP)
-        self.assertEqual(plan.reason, "danger_full_access_blocked")
+        self.assertEqual(plan.action, SuperviseAction.ASK_SEND_TO_GPT)
+        self.assertEqual(plan.sandbox, "danger-full-access")
 
     def test_workspace_write_is_allowed_when_explicit(self) -> None:
         plan = detect_next_supervise_action(
@@ -1731,7 +1735,8 @@ class FeedbackPayloadTests(unittest.TestCase):
                 self.assertEqual(feedback["feedback_payload_length"], 0)
 
     def test_feedback_payload_oversized_final_message_is_not_submittable(self) -> None:
-        final_message = "x" * 12_001
+        self.assertEqual(MAX_CLEAN_FINAL_MESSAGE_CHARS, 50_000)
+        final_message = "x" * (MAX_CLEAN_FINAL_MESSAGE_CHARS + 1)
         events = [
             self.event(
                 "codex_exec_finished",
@@ -1763,7 +1768,8 @@ class FeedbackPayloadTests(unittest.TestCase):
         self.assertNotIn(final_message, json.dumps(feedback))
 
     def test_feedback_payload_absolute_transport_limit_is_not_submittable(self) -> None:
-        changed_files = [{"path": f"src/generated_{index:04d}.py"} for index in range(900)]
+        self.assertEqual(MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS, 50_000)
+        changed_files = [{"path": f"src/generated_{index:04d}.py"} for index in range(3_000)]
         final_message = "Clean final message under the final-message limit."
         events = [
             self.event(
@@ -1787,7 +1793,10 @@ class FeedbackPayloadTests(unittest.TestCase):
         self.assertFalse(feedback["submittable"])
         self.assertIsNone(feedback["message"])
         self.assertEqual(feedback["reason_code"], "chatgpt_feedback_payload_oversize")
-        self.assertGreater(feedback["transport_guard"]["attempted_payload_length"], 16_000)
+        self.assertGreater(
+            feedback["transport_guard"]["attempted_payload_length"],
+            MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS,
+        )
 
 
 class WorkspaceWritePolicyTests(unittest.TestCase):

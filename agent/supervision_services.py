@@ -107,17 +107,18 @@ CHAT_OPENED_NAVIGATION_OUTCOMES = frozenset(
 
 @dataclass(frozen=True)
 class NavigationAttemptResult:
-    # ``ok`` means the navigation *action* was performed against the exact
-    # re-resolved target, so the authoritative read-only destination gate may
-    # now run. It does NOT mean the destination is proven — only the gate
-    # decides that. ``navigator_confirmed`` records the navigator's own
-    # non-authoritative post-action heuristic for evidence only.
+    # ``ok`` means an Accessibility or validated-click action path reported
+    # success against the re-resolved target, so the authoritative read-only
+    # destination gate may now run. It does NOT prove a physical UI change or
+    # destination open; only the gate decides that. ``navigator_confirmed``
+    # records the navigator's own non-authoritative observation.
     ok: bool
     outcome: str
     reason_code: str | None = None
     error_message: str | None = None
     action_posted: bool = False
     navigator_confirmed: bool = False
+    navigation_action_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -184,6 +185,8 @@ def _latest_matching_workspace_write_post_run_policy(events: list[dict], codex_e
 
 def send_plan_auto_safe(plan: object, events: list[dict]) -> tuple[bool, str]:
     sandbox = getattr(plan, "sandbox", "")
+    if sandbox == "danger-full-access":
+        return True, "danger_full_access_auto_submit"
     if sandbox == "workspace-write":
         codex_event_id = _event_id_from_value(getattr(plan, "event_ids", {}).get("codex_exec_finished"))
         post_run_policy = _latest_matching_workspace_write_post_run_policy(events, codex_event_id)
@@ -309,8 +312,8 @@ def _default_run_prompt_service(
         repo_path_text,
         sandbox,
         timeout,
-        confirm_full_access=False,
-        allow_full_access=False,
+        confirm_full_access=sandbox == "danger-full-access",
+        allow_full_access=sandbox == "danger-full-access",
         approval_mode=approval_mode,
         expected_extraction_event_id=expected_extraction_event_id,
         expected_prompt_sha256=expected_prompt_sha256,
@@ -348,22 +351,25 @@ def _navigation_attempt_from_open_result(result: dict) -> NavigationAttemptResul
     not the navigator's own confirmation heuristic (which the audit showed is
     mismatched with ChatGPT Desktop's real accessibility tree). So navigation is
     treated as *performed* — and the gate is allowed to run — whenever the
-    chat-open action was physically posted against the exact re-resolved target
-    (``chat_open_action_posted``), regardless of whether the navigator's own
-    secondary heuristic recognized the resulting UI. When the action could not
-    be posted (target not resolved/interactable, click failed, etc.) navigation
-    is a genuine failure and the flow stays fail-closed before the gate.
+    Accessibility or validated-click action path reported success against the
+    exact re-resolved target (``chat_open_action_posted``), regardless of
+    whether the navigator's own secondary heuristic recognized a resulting UI
+    change. When the action path could not report success (target not
+    resolved/interactable, action failed, click failed, etc.) navigation is a
+    genuine failure and the flow stays fail-closed before the gate.
     """
 
     outcome = str(result.get("outcome") or "") or "navigation_incomplete"
     navigator_confirmed = result.get("ok") is True and outcome in CHAT_OPENED_NAVIGATION_OUTCOMES
     action_posted = result.get("chat_open_action_posted") is True
+    diagnostics = _navigation_action_diagnostics_from_open_result(result)
     if action_posted:
         return NavigationAttemptResult(
             ok=True,
             outcome=outcome,
             action_posted=True,
             navigator_confirmed=navigator_confirmed,
+            navigation_action_diagnostics=diagnostics,
         )
     return NavigationAttemptResult(
         ok=False,
@@ -371,7 +377,51 @@ def _navigation_attempt_from_open_result(result: dict) -> NavigationAttemptResul
         reason_code="destination_navigation_action_not_performed",
         action_posted=False,
         navigator_confirmed=False,
+        navigation_action_diagnostics=diagnostics,
     )
+
+
+_NAVIGATION_ACTION_DIAGNOSTIC_DEFAULTS = {
+    "target_detected": False,
+    "target_candidate_count": 0,
+    "actionable_element_resolved": False,
+    "selected_element_role": "",
+    "selected_relation": "",
+    "available_ax_actions": [],
+    "chosen_method": "",
+    "axpress_attempted": False,
+    "axpress_result": "not_attempted",
+    "ax_error_code": None,
+    "ui_changed_after_action": False,
+    "destination_confirmed": False,
+    "final_reresolution_status": "not_attempted",
+}
+
+
+def _navigation_action_diagnostics_from_open_result(result: dict) -> dict[str, Any]:
+    """Return bounded structural action evidence without retaining AX text."""
+
+    diagnostics = dict(_NAVIGATION_ACTION_DIAGNOSTIC_DEFAULTS)
+    diagnostics["target_detected"] = result.get("target_detected") is True
+    diagnostics["target_candidate_count"] = max(0, int(result.get("target_candidate_count") or 0))
+    diagnostics["actionable_element_resolved"] = result.get("actionable_element_resolved") is True
+    diagnostics["selected_element_role"] = str(result.get("selected_element_role") or "")[:80]
+    relation = str(result.get("selected_relation") or "")
+    diagnostics["selected_relation"] = relation if relation in {"", "row_node", "title_node"} else ""
+    diagnostics["available_ax_actions"] = [
+        str(action)[:80]
+        for action in (result.get("available_ax_actions") or [])[:12]
+        if isinstance(action, str)
+    ]
+    diagnostics["chosen_method"] = str(result.get("chosen_method") or "")[:80]
+    diagnostics["axpress_attempted"] = result.get("axpress_attempted") is True
+    diagnostics["axpress_result"] = str(result.get("axpress_result") or "not_attempted")[:40]
+    error_code = result.get("ax_error_code")
+    diagnostics["ax_error_code"] = error_code if isinstance(error_code, int) else None
+    diagnostics["ui_changed_after_action"] = result.get("ui_changed_after_action") is True
+    diagnostics["destination_confirmed"] = result.get("destination_confirmed") is True
+    diagnostics["final_reresolution_status"] = str(result.get("final_reresolution_status") or "not_attempted")[:80]
+    return diagnostics
 
 
 def _default_destination_navigation_service(
@@ -443,6 +493,7 @@ def _record_navigation_attempt_event(
     max_attempts: int | None = None,
     ledger: Any,
 ) -> dict[str, Any]:
+    diagnostics = _navigation_action_diagnostics_from_open_result(nav_result.navigation_action_diagnostics)
     metadata = {
         "run_id": run_id,
         "binding_project_title": getattr(binding, "project_title", None),
@@ -454,6 +505,7 @@ def _record_navigation_attempt_event(
         "navigation_action_posted": bool(nav_result.action_posted),
         "navigator_confirmed": bool(nav_result.navigator_confirmed),
         "destination_verified": False,
+        "navigation_action_diagnostics": diagnostics,
     }
     if attempt_number is not None:
         metadata["attempt_number"] = attempt_number

@@ -24,14 +24,18 @@ RUN_EXECUTION_PROFILE_SELECTED_EVENT_TYPE = "run_execution_profile_selected"
 RUN_EXECUTION_PROFILE_SELECTED_MESSAGE = "Run execution profile selected."
 RUN_EXECUTION_PROFILE_SCHEMA_VERSION = 1
 CODEX_DEFAULT_SELECTION = "codex_default"
-ALLOWED_EXECUTION_PROFILE_SANDBOXES = ("read-only", "workspace-write")
+ALLOWED_EXECUTION_PROFILE_SANDBOXES = (
+    "read-only",
+    "workspace-write",
+    "danger-full-access",
+)
 ALLOWED_CODEX_MODEL_SELECTIONS = (
     CODEX_DEFAULT_SELECTION,
     "gpt-5",
     "gpt-5-codex",
 )
 ALLOWED_REASONING_EFFORT_SELECTIONS = (CODEX_DEFAULT_SELECTION,)
-ALLOWED_APPROVAL_POLICY_SELECTIONS = (CODEX_DEFAULT_SELECTION,)
+ALLOWED_APPROVAL_POLICY_SELECTIONS = (CODEX_DEFAULT_SELECTION, "never")
 ALLOWED_EXECUTION_PROFILE_SOURCES = (
     "explicit_user_selection",
     "system_default",
@@ -44,6 +48,7 @@ CODEX_PROGRESS_SCHEMA_VERSION = 1
 CODEX_PROGRESS_ALLOWED_KINDS = (
     "process_started",
     "codex_json_event",
+    "assistant_commentary",
     "command_started",
     "command_finished",
     "tool_event",

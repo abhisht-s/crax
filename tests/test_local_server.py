@@ -18,6 +18,7 @@ from agent.local_server import (
     _execution_profile_options_payload,
     _start_run_kwargs,
 )
+from agent.repository_picker import RepositoryPickerResult
 from agent.run_services import CODEX_DEFAULT_SELECTION
 from tests.local_socket_test_support import LocalSocketBindingTestCase, requires_localhost_ephemeral_bind
 
@@ -250,11 +251,13 @@ class LocalServerAuthHostAndHeaderTests(LocalServerHTTPTestCase):
         for method, path in (
             ("GET", "/api/health"),
             ("GET", "/api/session"),
+            ("GET", "/api/default-greeting"),
             ("GET", "/api/runs/current"),
             ("GET", "/api/runs/current/progress"),
             ("GET", "/api/runs/current/events"),
             ("GET", "/api/chatgpt-ui-lease"),
             ("POST", "/api/runs/start"),
+            ("POST", "/api/repository/pick"),
             ("POST", "/api/approval"),
             ("POST", "/api/tick"),
             ("POST", "/api/chatgpt-ui-lease/release-stale"),
@@ -317,6 +320,86 @@ class LocalServerAuthHostAndHeaderTests(LocalServerHTTPTestCase):
 
 
 class LocalServerEndpointTests(LocalServerHTTPTestCase):
+    def test_default_greeting_route_returns_exact_kickoff_prompt(self) -> None:
+        import agent.local_server as local_server
+
+        status, _headers, payload = self.request(
+            "GET",
+            "/api/default-greeting",
+            token=self.token,
+        )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["source"], "kick_off_prompt_gpt.md")
+        self.assertEqual(
+            payload["initial_instruction"],
+            local_server.DEFAULT_GREETING_PATH.read_text(encoding="utf-8"),
+        )
+
+    def test_default_greeting_route_fails_safely_when_prompt_is_missing(self) -> None:
+        import agent.local_server as local_server
+
+        missing_prompt = local_server.DEFAULT_GREETING_PATH.parent / "__missing_default_greeting__.md"
+        with mock.patch.object(local_server, "DEFAULT_GREETING_PATH", missing_prompt):
+            status, _headers, payload = self.request(
+                "GET",
+                "/api/default-greeting",
+                token=self.token,
+            )
+
+        self.assertEqual(status, 500)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["reason_code"], "default_greeting_unavailable")
+        self.assertNotIn("/missing/greeting.md", json.dumps(payload))
+
+    def test_repository_picker_route_returns_selected_absolute_path(self) -> None:
+        picker_result = RepositoryPickerResult(
+            ok=True,
+            selected=True,
+            repository_path="/tmp/selected-repo",
+            reason_code="repository_picker_selected",
+        )
+        with mock.patch("agent.local_server.choose_repository_directory", return_value=picker_result) as picker:
+            status, _headers, payload = self.request(
+                "POST",
+                "/api/repository/pick",
+                body={},
+                token=self.token,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["selected"])
+        self.assertEqual(payload["repository_path"], "/tmp/selected-repo")
+        picker.assert_called_once_with()
+
+    def test_repository_picker_route_rejects_fields_and_maps_unavailable_picker(self) -> None:
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/repository/pick",
+            body={"path": "/tmp"},
+            token=self.token,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["reason_code"], "unexpected_request_fields")
+
+        picker_result = RepositoryPickerResult(
+            ok=False,
+            reason_code="repository_picker_unavailable",
+            error_message="The native macOS folder picker is unavailable.",
+        )
+        with mock.patch("agent.local_server.choose_repository_directory", return_value=picker_result):
+            status, _headers, payload = self.request(
+                "POST",
+                "/api/repository/pick",
+                body={},
+                token=self.token,
+            )
+        self.assertEqual(status, 501)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["reason_code"], "repository_picker_unavailable")
+
     def test_health_session_and_current_state_are_safe_and_read_only(self) -> None:
         status, _headers, health = self.request("GET", "/api/health", token=self.token)
         self.assertEqual(status, 200)
@@ -740,7 +823,7 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
 
 
 class LocalServerExecutionProfileContractTests(unittest.TestCase):
-    def test_profile_options_exclude_full_access_and_come_from_backend_contract(self) -> None:
+    def test_profile_options_include_explicit_autonomous_full_access(self) -> None:
         import agent.local_server as local_server
 
         with mock.patch.object(
@@ -758,23 +841,27 @@ class LocalServerExecutionProfileContractTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(
             [option["value"] for option in payload["sandbox_options"]],
-            ["read-only", "workspace-write"],
+            ["read-only", "danger-full-access", "workspace-write"],
         )
         self.assertEqual(
             [option["label"] for option in payload["sandbox_options"]],
-            ["Read Only", "Workspace Write"],
+            ["Read Only", "Full Access (Autonomous)", "Workspace Write"],
         )
         self.assertEqual(
             [option["description"] for option in payload["sandbox_options"]],
             [
                 "Codex can inspect the workspace. Edits are not allowed for this dashboard run.",
                 (
+                    "Codex runs autonomously without filesystem, network, or prompt-policy "
+                    "limits. The loop does not request per-run approval."
+                ),
+                (
                     "Codex can edit files in this repository. Outside-workspace and dangerous "
                     "access remain blocked by this dashboard run."
                 ),
             ],
         )
-        self.assertNotIn("danger-full-access", json.dumps(payload))
+        self.assertIn("danger-full-access", json.dumps(payload))
         self.assertEqual(
             [option["value"] for option in payload["model_options"]],
             [CODEX_DEFAULT_SELECTION, "test-central-model"],
@@ -783,7 +870,7 @@ class LocalServerExecutionProfileContractTests(unittest.TestCase):
         self.assertEqual(payload["locked"]["approval_policy"]["value"], CODEX_DEFAULT_SELECTION)
         self.assertEqual(
             payload["locked"]["approval_policy"]["label"],
-            "Codex default — not dashboard-controlled yet",
+            "Codex default — Full Access bypasses approvals",
         )
 
     def test_start_kwargs_preserve_explicit_model_and_reject_bad_profile_before_controller(self) -> None:
@@ -814,10 +901,6 @@ class LocalServerExecutionProfileContractTests(unittest.TestCase):
             (
                 _start_body(sandbox="bad", model=CODEX_DEFAULT_SELECTION),
                 "invalid_browser_sandbox",
-            ),
-            (
-                _start_body(sandbox="danger-full-access", model=CODEX_DEFAULT_SELECTION),
-                "danger_full_access_not_available_in_local_controller",
             ),
             (
                 _start_body(model="not-a-model"),

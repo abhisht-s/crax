@@ -7,6 +7,7 @@ import sys
 from ctypes import POINTER, byref, c_bool, c_char_p, c_int, c_long, c_ulong, c_void_p, create_string_buffer
 from dataclasses import dataclass
 
+from agent.chatgpt_ax_destination_snapshot import resolve_classic_chatgpt_pid
 from agent.mac_app_control import activate_chatgpt
 
 
@@ -316,6 +317,14 @@ class _AXSubmissionReader:
         return []
 
     def _get_pid(self) -> int:
+        if self.app_name.casefold() in {"chatgpt", "chatgpt desktop"}:
+            pid = resolve_classic_chatgpt_pid()
+            if pid is None:
+                raise AXInspectError(
+                    "Classic ChatGPT (bundle com.openai.chat) was not running; "
+                    "refusing to inspect another app named ChatGPT."
+                )
+            return pid
         result = subprocess.run(
             [
                 "osascript",

@@ -87,7 +87,11 @@ class StaticSourceContractTests(unittest.TestCase):
         for required in (
             'id="startup-panel"',
             'id="repository-path"',
+            'id="repository-browse-button"',
+            'id="repository-picker-status"',
             'id="initial-task"',
+            'id="default-greeting-button"',
+            'id="default-greeting-status"',
             'id="project-title"',
             'id="chat-title"',
             'id="sandbox-select"',
@@ -124,6 +128,7 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="codex-live-final"',
             'id="codex-live-error"',
             'id="codex-live-events"',
+            'id="event-timeline-details"',
             'id="approval-panel"',
             'id="approve-button"',
             'id="reject-button"',
@@ -144,7 +149,7 @@ class StaticSourceContractTests(unittest.TestCase):
             self.js,
         )
         self.assertIn("Permission preset / sandbox", self.html)
-        self.assertIn("Codex default — not dashboard-controlled yet", self.all_static)
+        self.assertIn("Codex default — Full Access bypasses approvals", self.all_static)
         options = re.findall(r'<option value="([^"]*)">', self.html)
         self.assertEqual(options, ["", ""])
         self.assertIn("Loading...", self.html)
@@ -158,7 +163,7 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn('!elements["chat-title"].value.trim()', self.js)
         self.assertIn("sandbox,", self.js)
         self.assertIn("model,", self.js)
-        self.assertIn('ALLOWED_PERMISSION_PRESET_VALUES = new Set(["read-only", "workspace-write"])', self.js)
+        self.assertIn('ALLOWED_PERMISSION_PRESET_VALUES = new Set(["read-only", "workspace-write", "danger-full-access"])', self.js)
         self.assertIn("safePermissionPresetOptions(profileOptions.sandbox_options)", self.js)
         self.assertNotIn("gpt-5-codex", self.all_static)
         self.assertNotIn("gpt-5", self.all_static)
@@ -267,7 +272,7 @@ class StaticSourceContractTests(unittest.TestCase):
 
     def test_no_unsafe_rendering_external_assets_or_frameworks(self) -> None:
         self.assertNotIn("innerHTML", self.js)
-        self.assertNotIn("danger-full-access", self.all_static)
+        self.assertIn("danger-full-access", self.all_static)
         self.assertNotIn("WebSocket", self.js)
         self.assertNotIn("EventSource", self.js)
         self.assertNotIn("clipboard", self.all_static.lower())
@@ -293,6 +298,8 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn("POLL_FAILURE_MAX_MS = 10000", self.js)
         self.assertIn('requestJson("GET", "/api/runs/current")', self.js)
         self.assertIn('requestJson("POST", "/api/runs/start", payload)', self.js)
+        self.assertIn('requestJson("POST", "/api/repository/pick", {})', self.js)
+        self.assertIn('requestJson("GET", "/api/default-greeting")', self.js)
         self.assertIn('requestJson("POST", "/api/approval", { decision })', self.js)
         self.assertIn('requestJson("POST", "/api/tick", {})', self.js)
         self.assertIn('requestJson("GET", "/api/chatgpt-ui-lease")', self.js)
@@ -300,7 +307,11 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn('requestJson("GET", `/api/runs/current/progress?after_sequence=${cursor}`)', self.js)
         self.assertIn('fetch(`/api/runs/current/events?after_sequence=${cursor}`', self.js)
         self.assertIn("renderCodexLiveProgress(runtime)", self.js)
-        self.assertIn("progressEvents.slice(-PROGRESS_EVENT_RENDER_LIMIT)", self.js)
+        self.assertIn('event.kind === "assistant_commentary"', self.js)
+        self.assertIn(".slice(-PROGRESS_EVENT_RENDER_LIMIT)", self.js)
+        self.assertIn("Codex Working Notes", self.html)
+        self.assertIn("Raw event timeline", self.html)
+        self.assertNotIn('<details id="event-timeline-details" open>', self.html)
         self.assertIn("final_message_available", self.js)
         self.assertIn("pollingStopped = true", self.js)
         self.assertNotRegex(self.js, r"set(?:Timeout|Interval)\([^)]*requestTick")

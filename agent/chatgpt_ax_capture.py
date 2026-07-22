@@ -11,6 +11,8 @@ from collections import Counter
 from ctypes import POINTER, byref, c_bool, c_char_p, c_int, c_long, c_ulong, c_void_p, create_string_buffer
 from dataclasses import dataclass
 
+from agent.chatgpt_ax_destination_snapshot import resolve_classic_chatgpt_pid
+
 
 AX_CAPTURE_SOURCE = "chatgpt_desktop_ax"
 AX_CAPTURE_FORMAT = "rendered_ax_text"
@@ -162,6 +164,14 @@ class _AXReader:
         return []
 
     def _get_pid(self) -> int:
+        if self.app_name.casefold() in {"chatgpt", "chatgpt desktop"}:
+            pid = resolve_classic_chatgpt_pid()
+            if pid is None:
+                raise AXCaptureError(
+                    "Classic ChatGPT (bundle com.openai.chat) was not running; "
+                    "refusing to capture from another app named ChatGPT."
+                )
+            return pid
         result = subprocess.run(
             [
                 "osascript",

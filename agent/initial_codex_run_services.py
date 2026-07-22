@@ -99,7 +99,11 @@ def _preflight_validation_error(
     confirm_full_access: bool,
 ) -> str | None:
     path_safety = prompt_contract.get("path_safety")
-    if isinstance(path_safety, dict) and not path_safety.get("valid"):
+    if (
+        sandbox != "danger-full-access"
+        and isinstance(path_safety, dict)
+        and not path_safety.get("valid")
+    ):
         invalid_paths = ", ".join(str(path) for path in path_safety.get("invalid_paths", []))
         return f"Prompt contract contains invalid path references: {invalid_paths}"
     if sandbox == "danger-full-access" and not confirm_full_access:

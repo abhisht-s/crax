@@ -345,13 +345,6 @@ def _validate_sandbox(sandbox: str, repo_path: str) -> SupervisePlan | None:
             repo_path,
             sandbox,
         )
-    if sandbox == "danger-full-access":
-        return _stop(
-            "danger_full_access_blocked",
-            "The supervise command does not support danger-full-access in v0.1.",
-            repo_path,
-            sandbox,
-        )
     return None
 
 

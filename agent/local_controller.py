@@ -33,7 +33,11 @@ from agent.supervision_services import run_supervision_step as run_supervision_s
 from agent.supervision_services import send_plan_auto_safe
 
 
-LOCAL_CONTROLLER_ALLOWED_SANDBOXES = ("read-only", "workspace-write")
+LOCAL_CONTROLLER_ALLOWED_SANDBOXES = (
+    "read-only",
+    "workspace-write",
+    "danger-full-access",
+)
 LOCAL_CONTROLLER_DEFAULT_SANDBOX = "read-only"
 LOCAL_CONTROLLER_RUN_STARTED_EVENT_TYPE = "local_controller_run_started"
 LOCAL_CONTROLLER_RUN_STARTED_MESSAGE = "Local controller run initialized."
@@ -213,7 +217,7 @@ def default_initial_run_executor(
         repository_path,
         sandbox,
         LOCAL_CONTROLLER_INITIAL_CODEX_TIMEOUT_SECONDS,
-        confirm_full_access=False,
+        confirm_full_access=sandbox == "danger-full-access",
         ledger=ledger,
     )
 
@@ -945,15 +949,6 @@ def validate_local_controller_start_request(
     sandbox_was_omitted = sandbox is None
     model_was_omitted = model is None
     sandbox_text = LOCAL_CONTROLLER_DEFAULT_SANDBOX if sandbox_was_omitted else str(sandbox or "").strip()
-    if sandbox_text == "danger-full-access":
-        return StartRequestValidationResult(
-            ok=False,
-            repository_path=str(resolved_path),
-            initial_instruction=instruction_text,
-            sandbox=sandbox_text,
-            reason_code="danger_full_access_not_available_in_local_controller",
-            error_message="danger-full-access is not available through the local controller.",
-        )
     if sandbox_text not in LOCAL_CONTROLLER_ALLOWED_SANDBOXES:
         return StartRequestValidationResult(
             ok=False,
@@ -961,7 +956,10 @@ def validate_local_controller_start_request(
             initial_instruction=instruction_text,
             sandbox=sandbox_text,
             reason_code="invalid_browser_sandbox",
-            error_message="Invalid browser sandbox. Allowed values: read-only, workspace-write.",
+            error_message=(
+                "Invalid browser sandbox. Allowed values: "
+                f"{', '.join(LOCAL_CONTROLLER_ALLOWED_SANDBOXES)}."
+            ),
         )
 
     model_text = CODEX_DEFAULT_SELECTION if model_was_omitted else str(model or "").strip()
@@ -1055,15 +1053,6 @@ def start_local_controller_run(
         or start_request.chat_title is None
     ):
         raise ValueError("validated start request is missing required fields")
-    if start_request.sandbox == "danger-full-access":
-        return LocalControllerRunStartResult(
-            ok=False,
-            repository_path=start_request.repository_path,
-            sandbox=start_request.sandbox,
-            initial_instruction=start_request.initial_instruction,
-            reason_code="danger_full_access_not_available_in_local_controller",
-            error_message="danger-full-access is not available through the local controller.",
-        )
     if start_request.sandbox not in LOCAL_CONTROLLER_ALLOWED_SANDBOXES:
         return LocalControllerRunStartResult(
             ok=False,
@@ -1071,7 +1060,10 @@ def start_local_controller_run(
             sandbox=start_request.sandbox,
             initial_instruction=start_request.initial_instruction,
             reason_code="invalid_browser_sandbox",
-            error_message="Invalid browser sandbox. Allowed values: read-only, workspace-write.",
+            error_message=(
+                "Invalid browser sandbox. Allowed values: "
+                f"{', '.join(LOCAL_CONTROLLER_ALLOWED_SANDBOXES)}."
+            ),
         )
 
     model = start_request.model or CODEX_DEFAULT_SELECTION
@@ -1096,7 +1088,11 @@ def start_local_controller_run(
             sandbox=start_request.sandbox,
             model=model,
             reasoning_effort=CODEX_DEFAULT_SELECTION,
-            approval_policy=CODEX_DEFAULT_SELECTION,
+            approval_policy=(
+                "never"
+                if start_request.sandbox == "danger-full-access"
+                else CODEX_DEFAULT_SELECTION
+            ),
             profile_source=profile_source,
         )
     except (TypeError, ValueError) as exc:
@@ -1171,7 +1167,8 @@ def start_local_controller_run(
         "model": model,
         "source": LOCAL_CONTROLLER_SOURCE,
         "controller_mode": LOCAL_CONTROLLER_MODE,
-        "browser_safe_sandbox": True,
+        "browser_safe_sandbox": start_request.sandbox != "danger-full-access",
+        "autonomous_full_access": start_request.sandbox == "danger-full-access",
         "allow_destination_navigation": bool(start_request.allow_destination_navigation),
     }
     ledger.add_event(
@@ -1633,7 +1630,12 @@ def _latest_valid_controller_started_event(events: list[dict]) -> dict | None:
             continue
         if metadata.get("source") != LOCAL_CONTROLLER_SOURCE:
             continue
-        if metadata.get("browser_safe_sandbox") is not True:
+        browser_authorized = metadata.get("browser_safe_sandbox") is True
+        autonomous_full_access = (
+            metadata.get("autonomous_full_access") is True
+            and metadata.get("sandbox") == "danger-full-access"
+        )
+        if not browser_authorized and not autonomous_full_access:
             continue
         repository_path = metadata.get("repository_path")
         sandbox = metadata.get("sandbox")

@@ -138,6 +138,19 @@ dd {
   gap: 0.35rem;
 }
 
+.repository-picker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.5rem;
+}
+
+.field-action-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 .locked-value {
   display: block;
   width: 100%;
@@ -307,6 +320,23 @@ pre {
 
 .progress-event p {
   margin-bottom: 0;
+}
+
+.progress-commentary {
+  border: 0;
+  border-left: 3px solid var(--accent);
+  border-radius: 0;
+  padding: 0.2rem 0.75rem;
+  background: transparent;
+}
+
+#event-timeline-details > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+#event-timeline-details[open] > .timeline {
+  margin-top: 0.75rem;
 }
 
 .hidden {

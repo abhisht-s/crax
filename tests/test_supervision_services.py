@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from dataclasses import dataclass, field
+from unittest import mock
 
 from agent import ledger as default_ledger
 from agent.chatgpt_destination_gate import (
@@ -13,13 +14,55 @@ from agent.supervise import SuperviseAction, SupervisePlan
 from agent.supervision_services import (
     CHATGPT_HANDOFF_MAX_UI_ATTEMPTS,
     HANDOFF_PHASES,
+    _default_run_prompt_service,
     run_supervision_step,
+    send_plan_auto_safe,
 )
 from agent.run_services import verify_chatgpt_destination_for_run
 
 
 def _raw_token(label: str) -> str:
     return f"unit-{default_ledger.chatgpt_ui_lease_token_fingerprint(label)}"
+
+
+class AutonomousFullAccessWiringTests(unittest.TestCase):
+    def test_full_access_handoff_never_requires_human_approval(self) -> None:
+        for changed_files_count in (None, 0, 1, 500):
+            with self.subTest(changed_files_count=changed_files_count):
+                allowed, reason = send_plan_auto_safe(
+                    _send_plan(
+                        changed_files_count=changed_files_count,
+                        sandbox="danger-full-access",
+                    ),
+                    [],
+                )
+
+                self.assertTrue(allowed)
+                self.assertEqual(reason, "danger_full_access_auto_submit")
+
+    def test_default_prompt_runner_authorizes_full_access_without_per_run_approval(self) -> None:
+        with mock.patch(
+            "agent.supervision_services.execute_extracted_codex_prompt_service",
+            return_value=ServiceResult(ok=True),
+        ) as execute:
+            _default_run_prompt_service(
+                "run-1",
+                {"id": "run-1"},
+                "/tmp/repo",
+                "danger-full-access",
+                None,
+                expected_extraction_event_id=1,
+                expected_prompt_sha256="abc",
+                expected_prompt_text="Task",
+                expected_extraction_method="sentinel",
+                approval_mode="auto",
+                pre_run_policy={},
+                expected_scope={},
+                ledger=object(),
+            )
+
+        self.assertTrue(execute.call_args.kwargs["confirm_full_access"])
+        self.assertTrue(execute.call_args.kwargs["allow_full_access"])
 
 
 @dataclass
@@ -441,6 +484,27 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertEqual(
             [op for op in ledger.operations if op in {"acquire_lease", "release_lease"}],
             ["acquire_lease", "release_lease"],
+        )
+
+    def test_full_access_send_with_changes_runs_without_human_approval(self) -> None:
+        result, _planner, ledger, submit, capture, extract, run_prompt = self._run_step(
+            _send_plan(
+                changed_files_count=500,
+                sandbox="danger-full-access",
+            )
+        )
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.action_executed)
+        self.assertFalse(result.requires_human_approval)
+        self.assertEqual(len(submit.calls), 1)
+        self.assertEqual(submit.calls[0][1]["approval_mode"], "auto")
+        self.assertEqual(len(capture.calls), 1)
+        self.assertEqual(len(extract.calls), 1)
+        self.assertEqual(len(run_prompt.calls), 0)
+        self.assertNotIn(
+            "supervise_auto_stopped",
+            [event["event_type"] for event in ledger.added_events],
         )
 
     def test_automatic_unsafe_send_records_auto_stop_and_calls_no_action(self) -> None:
@@ -1419,6 +1483,26 @@ class NavigationBeforeGateTests(unittest.TestCase):
             list(range(1, CHATGPT_HANDOFF_MAX_UI_ATTEMPTS + 1)),
         )
         self.assertFalse(attempt[-1]["metadata"]["navigation_ok"])
+        diagnostics = attempt[-1]["metadata"]["navigation_action_diagnostics"]
+        self.assertEqual(
+            set(diagnostics),
+            {
+                "target_detected",
+                "target_candidate_count",
+                "actionable_element_resolved",
+                "selected_element_role",
+                "selected_relation",
+                "available_ax_actions",
+                "chosen_method",
+                "axpress_attempted",
+                "axpress_result",
+                "ax_error_code",
+                "ui_changed_after_action",
+                "destination_confirmed",
+                "final_reresolution_status",
+            },
+        )
+        self.assertFalse(diagnostics["destination_confirmed"])
         self.assertEqual(self._phase_event(ledger)["metadata"]["handoff_phase"], "navigation_failed")
 
     def test_navigation_success_but_gate_failure_blocks_and_releases_lease(self) -> None:
@@ -1645,6 +1729,33 @@ class NavigationBeforeGateTests(unittest.TestCase):
         self.assertTrue(deferred.ok)
         self.assertTrue(deferred.action_posted)
         self.assertFalse(deferred.navigator_confirmed)
+        self.assertFalse(deferred.navigation_action_diagnostics["destination_confirmed"])
+        self.assertEqual(deferred.navigation_action_diagnostics["axpress_result"], "not_attempted")
+
+        instrumented = _navigation_attempt_from_open_result(
+            {
+                "ok": False,
+                "outcome": "action_posted_but_chat_not_confirmed",
+                "chat_open_action_posted": True,
+                "target_detected": True,
+                "target_candidate_count": 1,
+                "actionable_element_resolved": True,
+                "selected_element_role": "AXButton",
+                "selected_relation": "row_node",
+                "available_ax_actions": ["AXPress"],
+                "chosen_method": "axpress",
+                "axpress_attempted": True,
+                "axpress_result": "success",
+                "ax_error_code": 0,
+                "ui_changed_after_action": False,
+                "destination_confirmed": False,
+                "final_reresolution_status": "confirmed",
+            }
+        )
+        self.assertTrue(instrumented.action_posted)
+        self.assertEqual(instrumented.navigation_action_diagnostics["selected_relation"], "row_node")
+        self.assertEqual(instrumented.navigation_action_diagnostics["ax_error_code"], 0)
+        self.assertFalse(instrumented.navigation_action_diagnostics["ui_changed_after_action"])
 
         # Action never posted -> genuine navigation failure, stays fail-closed.
         for outcome in ("project_open_failed", "chat_row_not_interactable", "click_posting_failed"):

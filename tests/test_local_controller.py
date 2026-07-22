@@ -24,6 +24,7 @@ from agent.local_controller import (
     StartRequestValidationResult,
     build_local_controller_read_model,
     create_pending_approval_snapshot,
+    default_initial_run_executor,
     start_local_controller_run,
     validate_local_controller_start_request,
 )
@@ -370,17 +371,21 @@ def _destination_event(
     )
 
 
-def _send_plan(*, changed_files_count: int | None = 1) -> SupervisePlan:
+def _send_plan(
+    *,
+    changed_files_count: int | None = 1,
+    sandbox: str = "read-only",
+) -> SupervisePlan:
     return SupervisePlan(
         action=SuperviseAction.ASK_SEND_TO_GPT,
         reason="codex_result_ready",
         event_ids={"codex_exec_finished": 10},
         repo_path="/repo",
-        sandbox="read-only",
+        sandbox=sandbox,
         status="completed",
         codex_exit_code=0,
         codex_timed_out=False,
-        codex_sandbox="read-only",
+        codex_sandbox=sandbox,
         changed_files_count=changed_files_count,
         supervision_decision="continue",
     )
@@ -568,7 +573,6 @@ class LocalControllerValidationTests(unittest.TestCase):
                 (str(file_path), "Task", "read-only", "repository_path_not_directory"),
                 (repo, " ", "read-only", "initial_instruction_required"),
                 (repo, "Task", "bad", "invalid_browser_sandbox"),
-                (repo, "Task", "danger-full-access", "danger_full_access_not_available_in_local_controller"),
             ]
             for path, instruction, sandbox, reason in cases:
                 with self.subTest(reason=reason):
@@ -666,24 +670,38 @@ class LocalControllerRunCreationTests(unittest.TestCase):
         self.assertEqual(profile_events[0]["metadata"]["reasoning_effort"], CODEX_DEFAULT_SELECTION)
         self.assertEqual(profile_events[0]["metadata"]["approval_policy"], CODEX_DEFAULT_SELECTION)
 
-    def test_start_defensively_rejects_fabricated_full_access_validated_request(self) -> None:
-        session = LocalControllerSession()
-        ledger = FakeLedger()
-        request = StartRequestValidationResult(
-            ok=True,
-            repository_path="/tmp",
-            initial_instruction="Task",
-            sandbox="danger-full-access",
-            project_title="Project",
-            chat_title="Chat",
+    def test_start_accepts_explicit_autonomous_full_access(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            session = LocalControllerSession()
+            ledger = FakeLedger()
+            request = validate_local_controller_start_request(
+                repo,
+                "Task",
+                "danger-full-access",
+                project_title="Project",
+                chat_title="Chat",
+            )
+
+            result = start_local_controller_run(session, request, ledger=ledger)
+
+        self.assertTrue(request.ok)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.metadata["sandbox"], "danger-full-access")
+        self.assertTrue(result.metadata["autonomous_full_access"])
+        self.assertFalse(result.metadata["browser_safe_sandbox"])
+        profile_events = [
+            event
+            for event in ledger.events
+            if event["event_type"] == RUN_EXECUTION_PROFILE_SELECTED_EVENT_TYPE
+        ]
+        self.assertEqual(profile_events[0]["metadata"]["approval_policy"], "never")
+        read_model = build_local_controller_read_model(
+            "run-1",
+            ledger=ledger,
+            session=session,
         )
-
-        result = start_local_controller_run(session, request, ledger=ledger)
-
-        self.assertFalse(result.ok)
-        self.assertEqual(result.reason_code, "danger_full_access_not_available_in_local_controller")
-        self.assertEqual(ledger.create_run_calls, [])
-        self.assertEqual(ledger.events, [])
+        self.assertTrue(read_model.configuration_complete)
+        self.assertEqual(read_model.sandbox, "danger-full-access")
 
     def test_start_with_omitted_model_persists_codex_default_and_launches_without_model_arg(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
@@ -1258,6 +1276,28 @@ class LocalControllerChatGPTUILeaseDashboardTests(unittest.TestCase):
 
 
 class LocalControllerApprovalSnapshotTests(unittest.TestCase):
+    def test_full_access_send_is_routine_even_when_changed_files_are_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            events = [
+                _controller_event(repo, sandbox="danger-full-access"),
+                _event(10, "codex_exec_finished", {"exit_code": 0}),
+            ]
+            ledger = FakeLedger(_run(), events)
+            model = build_local_controller_read_model(
+                "run-1",
+                ledger=ledger,
+                planner=Planner(
+                    _send_plan(
+                        changed_files_count=None,
+                        sandbox="danger-full-access",
+                    )
+                ),
+            )
+
+        self.assertTrue(model.routine_action_available)
+        self.assertFalse(model.requires_human_approval)
+        self.assertFalse(create_pending_approval_snapshot(model).ok)
+
     def test_send_snapshot_captures_planner_identity_in_memory_only(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             events = [_controller_event(repo), _event(10, "codex_exec_finished", {"exit_code": 0})]
@@ -1445,6 +1485,23 @@ class DirectCodexInitialExecutor:
 
 
 class LocalControllerStateMachineTests(unittest.TestCase):
+    def test_default_initial_executor_confirms_dashboard_full_access(self) -> None:
+        ledger = FakeLedger()
+        with mock.patch(
+            "agent.local_controller.execute_initial_direct_codex_run_service",
+            return_value=InitialRunExecutionResult(ok=True),
+        ) as coordinator:
+            default_initial_run_executor(
+                run_id="run-1",
+                run=ledger.run,
+                initial_instruction="Task",
+                repository_path="/tmp/repo",
+                sandbox="danger-full-access",
+                ledger=ledger,
+            )
+
+        self.assertTrue(coordinator.call_args.kwargs["confirm_full_access"])
+
     def test_one_active_run_guard_blocks_second_start_and_race(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             executor = BlockingInitialExecutor()

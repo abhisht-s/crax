@@ -13,6 +13,7 @@ from typing import Protocol
 
 
 PROCESS_RESOLUTION_METHOD = "nsworkspace_running_applications"
+CLASSIC_CHATGPT_BUNDLE_IDS = {"com.openai.chat", "com.openai.chatgpt"}
 AX_READ_METHOD = "macos_accessibility_read_only_navigation_tree"
 PRIVACY_POLICY_VERSION = "chatgpt_navigation_ui_tree_v1"
 DEFAULT_MAX_DEPTH = 16
@@ -3674,7 +3675,14 @@ def _project_content_context(
     content_frame = _frame_tuple(content_container.get("frame"))
     tab_bottom = float((tab_context or {}).get("tabs_bottom") or 0.0) or _project_tabs_bottom(snapshots, content_frame, header_frame, sidebar)
     header_bottom = header_frame[1] + header_frame[3] if header_frame else (content_frame[1] if content_frame else 0.0)
-    list_top = max(header_bottom, tab_bottom)
+    # Current ChatGPT builds can expose the project name as AXWindow.AXTitle
+    # instead of a project heading within the content pane.  The window bottom
+    # is not a content header boundary; once Chats/Sources are independently
+    # proved, their tab band is the safe lower boundary for the chat list.
+    if header.role == "AXWindow" and tab_bottom > 0.0:
+        list_top = tab_bottom
+    else:
+        list_top = max(header_bottom, tab_bottom)
     fallback_list = {
         "path": content_container.get("path") or "",
         "role": content_container.get("role") or "",
@@ -4805,9 +4813,9 @@ def _base_project_chat_open_result(project_title: str, chat_title: str, app_name
         "process_resolution_method": None,
         "project_open_result": {},
         "matched_chat_row": {},
-        # True once the chat-open action was physically posted against the exact
-        # freshly re-resolved target row, independent of the navigator's own
-        # (non-authoritative) post-action confirmation heuristic.
+        # True once an AXPress or validated-click action path reported success
+        # for the exact freshly re-resolved target. It is not proof of a
+        # physical UI change or destination confirmation.
         "chat_open_action_posted": False,
         "visible_chat_count": 0,
         "visible_chats": [],
@@ -4891,6 +4899,22 @@ def _base_project_chat_open_result(project_title: str, chat_title: str, app_name
         "identity_failure_reasons": [],
         "chosen_method": "",
         "axpress_attempt": {},
+        "axpress_post_action_evidence": {},
+        # These fields distinguish a selected target, an attempted native AX
+        # action, and observed UI/destination evidence.  They are intentionally
+        # structural only; no unrelated AX text is retained here.
+        "target_detected": False,
+        "target_candidate_count": 0,
+        "actionable_element_resolved": False,
+        "selected_element_role": "",
+        "selected_relation": "",
+        "available_ax_actions": [],
+        "axpress_attempted": False,
+        "axpress_result": "not_attempted",
+        "ax_error_code": None,
+        "ui_changed_after_action": False,
+        "destination_confirmed": False,
+        "final_reresolution_status": "not_attempted",
         "calculated_global_point": _xy_report(None),
         "calculated_point_hit_test": {},
         "calculated_point_hit_test_relationship": "",
@@ -5191,12 +5215,14 @@ def _open_ready_project_chat_plan(
                         _apply_project_chat_count_stage_explanation(result)
                     result["fresh_target_re_resolution_confirmed"] = bool(retry.get("fresh_re_resolution_confirmed"))
                     result["final_re_resolution_re_resolved"] = bool(retry.get("fresh_re_resolution_confirmed"))
+                    result["final_reresolution_status"] = f"failed:{retry.get('outcome') or (retry.get('plan') or {}).get('status') or 'unresolved'}"
                     result.update({"outcome": retry.get("outcome") or "target_detected_but_not_stably_re_resolved", "error": retry.get("error") or ""})
                     return result
             if fresh_plan["status"] == "ready":
                 pass
             else:
                 result["fresh_target_re_resolution_confirmed"] = bool(alignment.get("fresh_re_resolution_confirmed"))
+                result["final_reresolution_status"] = f"failed:{alignment.get('outcome') or (alignment.get('plan') or {}).get('status') or 'unresolved'}"
                 if alignment.get("plan"):
                     result.update(_project_chat_plan_result_fields(alignment["plan"]))
                     _apply_project_chat_count_stage_explanation(result)
@@ -5222,10 +5248,12 @@ def _open_ready_project_chat_plan(
                     _apply_project_chat_count_stage_explanation(result)
                 result["fresh_target_re_resolution_confirmed"] = bool(retry.get("fresh_re_resolution_confirmed"))
                 result["final_re_resolution_re_resolved"] = bool(retry.get("fresh_re_resolution_confirmed"))
+                result["final_reresolution_status"] = f"failed:{retry.get('outcome') or (retry.get('plan') or {}).get('status') or 'unresolved'}"
                 result.update({"outcome": retry.get("outcome") or "target_detected_but_not_stably_re_resolved", "error": retry.get("error") or ""})
                 return result
     if fresh_plan["status"] != "ready":
         result["fresh_target_re_resolution_confirmed"] = False
+        result["final_reresolution_status"] = f"failed:{fresh_plan['status']}"
         result.update(_project_chat_plan_result_fields(fresh_plan))
         _apply_project_chat_count_stage_explanation(result)
         if result.get("target_exact_match_detected"):
@@ -5240,6 +5268,7 @@ def _open_ready_project_chat_plan(
         return result
     result["fresh_target_re_resolution_confirmed"] = True
     result["final_re_resolution_re_resolved"] = True
+    result["final_reresolution_status"] = "confirmed"
     result.update(_project_chat_plan_result_fields(fresh_plan))
     _apply_project_chat_count_stage_explanation(result)
     _record_project_chat_target_alignment_not_required(result, fresh_plan)
@@ -5252,13 +5281,20 @@ def _open_ready_project_chat_plan(
     axpress_target = fresh_plan.get("axpress_target") or {}
     if axpress_target.get("path"):
         result["chosen_method"] = "axpress"
+        result["axpress_attempted"] = True
         try:
             _invoke_reader_ax_action(reader, axpress_target["path"], "AXPress")
             result["actions_performed"].append({"path": axpress_target["path"], "action": "AXPress"})
         except Exception as exc:
-            result["axpress_attempt"] = {"ok": False, "error": str(exc), "target": axpress_target}
+            error_code = _reader_last_ax_action_error_code(reader, axpress_target["path"], "AXPress")
+            result["axpress_attempt"] = {"ok": False, "error": str(exc), "error_code": error_code, "target": axpress_target}
+            result["axpress_result"] = "failed"
+            result["ax_error_code"] = error_code
         else:
-            result["axpress_attempt"] = {"ok": True, "error": "", "target": axpress_target}
+            error_code = _reader_last_ax_action_error_code(reader, axpress_target["path"], "AXPress")
+            result["axpress_attempt"] = {"ok": True, "error": "", "error_code": error_code, "target": axpress_target}
+            result["axpress_result"] = "success"
+            result["ax_error_code"] = error_code
             result["chat_open_action_posted"] = True
             result["final_re_resolution_action_posted"] = True
             post = _project_chat_post_action_inspection(
@@ -5271,14 +5307,18 @@ def _open_ready_project_chat_plan(
                 sleep_function=sleep_function,
             )
             result["post_action_evidence"] = post
+            _apply_project_chat_post_action_diagnostics(result, post)
             if post.get("inspection_available") and post.get("confirmed"):
                 result.update({"ok": True, "outcome": "chat_opened_after_scrolling_via_axpress" if scrolled_before_match else "chat_opened_via_axpress"})
                 return result
             if not post.get("inspection_available"):
                 result.update({"outcome": "post_action_inspection_unavailable", "error": post.get("error") or "Post-action AX inspection was unavailable."})
                 return result
-            result.update({"outcome": "action_posted_but_chat_not_confirmed", "error": post.get("reason") or "Chat open was not confirmed after AXPress."})
-            return result
+            # AXPress can return success without activating the row in current
+            # ChatGPT builds. Preserve the failed observation and try exactly
+            # one existing hit-test-validated geometry click below; no blind
+            # coordinate action is introduced here.
+            result["axpress_post_action_evidence"] = post
 
     stable_plan = _fresh_project_chat_open_plan(
         reader,
@@ -5304,7 +5344,11 @@ def _open_ready_project_chat_plan(
     if click_plan["status"] != "ready":
         result.update({"outcome": click_plan["status"], "error": click_plan.get("error", "")})
         return result
-    result["chosen_method"] = "validated_geometry_click"
+    result["chosen_method"] = (
+        "axpress_then_validated_geometry_click"
+        if result.get("axpress_attempted")
+        else "validated_geometry_click"
+    )
     try:
         clicker = click_service_factory()
         if not clicker.has_permission():
@@ -5330,6 +5374,7 @@ def _open_ready_project_chat_plan(
         sleep_function=sleep_function,
     )
     result["post_action_evidence"] = post
+    _apply_project_chat_post_action_diagnostics(result, post)
     if post.get("inspection_available") and post.get("confirmed"):
         result.update({"ok": True, "outcome": "chat_opened_after_scrolling_via_validated_click" if scrolled_before_match else "chat_opened_via_validated_click"})
     elif not post.get("inspection_available"):
@@ -6926,6 +6971,7 @@ def _project_chat_open_plan_from_snapshots(
         "ax_window_frame": ax_window_frame,
         "windowserver_bounds": windowserver_bounds,
         "display_bounds": _collect_display_bounds_without_cursor(display_probe_factory),
+        "target_candidate_count": 0,
     }
     if resolution.get("status") != "visible_chats_found":
         if resolution.get("status") == "project_chat_list_identity_not_confirmed":
@@ -6947,6 +6993,7 @@ def _project_chat_open_plan_from_snapshots(
         elif representation["reason"] == "empty_or_malformed_accessibility_text":
             malformed_rows += 1
     matches = [item[0] for item in match_candidates]
+    base["target_candidate_count"] = len(matches)
     if not matches:
         status = (
             "chat_title_not_unambiguously_representable_by_accessibility"
@@ -7024,10 +7071,32 @@ def _project_chat_row_interactable(
 
 
 def _project_chat_axpress_target(title_snapshot: AXElementSnapshot, row_snapshot: AXElementSnapshot) -> dict:
-    for relation, snapshot in (("title_node", title_snapshot), ("row_node", row_snapshot)):
-        actions = _safe_actions(snapshot.actions)
-        if "AXPress" in actions:
-            return {"path": snapshot.path, "relation": relation, "actions": actions}
+    # The structurally resolved row is the primary activation target.  A text
+    # child can advertise AXPress without being the control ChatGPT actually
+    # uses to open the chat, so never prefer it over the enclosing row.
+    row_actions = _safe_actions(row_snapshot.actions)
+    if row_snapshot.enabled is not False and "AXPress" in row_actions:
+        return {
+            "path": row_snapshot.path,
+            "relation": "row_node",
+            "role": row_snapshot.role,
+            "actions": row_actions,
+        }
+
+    title_actions = _safe_actions(title_snapshot.actions)
+    title_is_actionable_control = title_snapshot.role in {"AXButton", "AXLink"}
+    title_is_resolved_row = title_snapshot.path == row_snapshot.path
+    if (
+        title_snapshot.enabled is not False
+        and "AXPress" in title_actions
+        and (title_is_actionable_control or title_is_resolved_row)
+    ):
+        return {
+            "path": title_snapshot.path,
+            "relation": "title_node" if not title_is_resolved_row else "row_node",
+            "role": title_snapshot.role,
+            "actions": title_actions,
+        }
     return {}
 
 
@@ -7122,6 +7191,17 @@ def _project_chat_plan_result_fields(plan: dict) -> dict:
     resolution = plan.get("project_chat_resolution") or {}
     fields = _project_visible_chats_resolution_fields(resolution) if resolution else {}
     row = plan.get("matched_chat_row") or {}
+    axpress_target = plan.get("axpress_target") or {}
+    selected_snapshot = None
+    selected_path = str(axpress_target.get("path") or "")
+    for snapshot in (plan.get("row_snapshot"), plan.get("title_snapshot")):
+        if snapshot is not None and snapshot.path == selected_path:
+            selected_snapshot = snapshot
+            break
+    available_actions = sorted(
+        set(_safe_actions(getattr(plan.get("row_snapshot"), "actions", ())))
+        | set(_safe_actions(getattr(plan.get("title_snapshot"), "actions", ())))
+    )
     return {
         **fields,
         "matched_chat_row": _project_chat_row_summary(row),
@@ -7134,6 +7214,14 @@ def _project_chat_plan_result_fields(plan: dict) -> dict:
         "canonical_visible_chat_count_considered": int(plan.get("canonical_visible_chat_count_considered") or 0),
         "visible_chat_accessibility_representation_summary": plan.get("visible_chat_accessibility_representation_summary") or [],
         "resolver_snapshot_id": plan.get("resolver_snapshot_id") or "",
+        "target_detected": int(plan.get("target_candidate_count") or 0) == 1,
+        "target_candidate_count": int(plan.get("target_candidate_count") or 0),
+        "actionable_element_resolved": bool(selected_path),
+        "selected_element_role": (
+            selected_snapshot.role if selected_snapshot is not None else str(axpress_target.get("role") or "")
+        ),
+        "selected_relation": str(axpress_target.get("relation") or ""),
+        "available_ax_actions": available_actions,
     }
 
 
@@ -8936,6 +9024,22 @@ def _invoke_reader_ax_action(reader: object, path: str, action: str, *, action_c
     _reader_perform_action(reader, path, action, action_context=action_context)
 
 
+def _reader_last_ax_action_error_code(reader: object, path: str, action: str) -> int | None:
+    record = getattr(reader, "last_ax_action_result", None)
+    if not isinstance(record, dict):
+        return None
+    if record.get("path") != path or record.get("action") != action:
+        return None
+    error_code = record.get("error_code")
+    return int(error_code) if isinstance(error_code, int) else None
+
+
+def _apply_project_chat_post_action_diagnostics(result: dict, post: dict) -> None:
+    signals = post.get("signals") or []
+    result["ui_changed_after_action"] = bool(signals)
+    result["destination_confirmed"] = bool(post.get("inspection_available") and post.get("confirmed"))
+
+
 def _verify_destination_status(pre: dict, post: dict, kind: str, title: str) -> str:
     if post.get("requested_title_selected"):
         if not pre.get("requested_title_selected"):
@@ -9446,6 +9550,7 @@ class _ActionAXReader(_ReadOnlyAXReader):
             c_void_p(element),
             c_void_p(self._attribute_ref(action)),
         )
+        self.last_ax_action_result = {"path": path, "action": action, "error_code": int(error)}
         return error == 0
 
 
@@ -9467,6 +9572,7 @@ class _AutonomousSidebarAXReader(_DetailedReadOnlyAXReader):
         if not element:
             raise AXDiagnosticError(f"No AX element was captured for path {path}.")
         error = self._ax.AXUIElementPerformAction(c_void_p(element), c_void_p(self._attribute_ref(action)))
+        self.last_ax_action_result = {"path": path, "action": action, "error_code": int(error)}
         return error == 0
 
 
@@ -11082,12 +11188,16 @@ class _ObjCRuntime:
         expected = app_name.casefold()
         name = localized_name.casefold()
         bundle = bundle_id.casefold()
+        # Both the Classic desktop client and the separate Work/Codex client
+        # currently advertise themselves as "ChatGPT" in NSWorkspace.  The
+        # navigation and destination verifier must always address Classic; a
+        # display-name match would otherwise choose whichever process has the
+        # larger PID.  Refuse every non-Classic bundle rather than falling back
+        # to the Work/Codex client.
+        if expected == "chatgpt":
+            return 200 if bundle in CLASSIC_CHATGPT_BUNDLE_IDS else 0
         if name == expected:
             return 100
-        if expected == "chatgpt" and bundle in {"com.openai.chat", "com.openai.chatgpt"}:
-            return 90
-        if expected == "chatgpt" and "chatgpt" in name:
-            return 70
         if expected == "calculator" and bundle == "com.apple.calculator":
             return 90
         return 0

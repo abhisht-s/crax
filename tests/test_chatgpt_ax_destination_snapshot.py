@@ -107,6 +107,33 @@ class ChatGPTAXDestinationSnapshotAdapterTests(unittest.TestCase):
         self.assertEqual(snap.active_conversation_chat_title, "")
         self.assertEqual(snap.active_conversation_project_title, "")
 
+    def test_active_conversation_identity_ignores_offscreen_transcript_before_toolbar_title(self) -> None:
+        nodes = (
+            AXDestinationNode(path="W", depth=0, role="AXWindow", title="ChatGPT"),
+            AXDestinationNode(
+                path="W.1.1.3.1.1.1.2.1.1",
+                depth=9,
+                role="AXStaticText",
+                description="Old transcript text, not a project identity",
+                frame=(291.0, -1985.0, 586.0, 95.0),
+            ),
+            AXDestinationNode(
+                path="W.2.1.3",
+                depth=3,
+                role="AXButton",
+                description=f"{CHAT_TITLE}, {PROJECT_TITLE}",
+                actions=("AXPress", "Name:Remove from toolbar", "Name:Move next"),
+                frame=(262.0, -52.0, 215.0, 52.0),
+            ),
+        )
+
+        snap = ax_snapshot_module._snapshot_from_observation(
+            _complete_observation(nodes=nodes)
+        )
+
+        self.assertEqual(snap.active_conversation_chat_title, CHAT_TITLE)
+        self.assertEqual(snap.active_conversation_project_title, PROJECT_TITLE)
+
     def test_focused_window_is_usable_when_windows_list_is_empty(self) -> None:
         reader = object.__new__(ax_snapshot_module._ReadOnlyAXTreeReader)
         reader._copy_attribute = lambda _app, name: 42 if name == "AXFocusedWindow" else ()

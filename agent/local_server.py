@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from agent.local_controller import LocalController, LocalControllerSession
+from agent.repository_picker import RepositoryPickerResult, choose_repository_directory
 from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
     CODEX_DEFAULT_SELECTION,
@@ -28,11 +29,16 @@ LOCAL_SERVER_APPROVAL_BODY_LIMIT = 4 * 1024
 LOCAL_SERVER_GENERIC_BODY_LIMIT = 8 * 1024
 LOCAL_SERVER_PROGRESS_LIMIT = 100
 LOCAL_SERVER_SSE_HEARTBEAT_SECONDS = 2.0
-LOCAL_SERVER_PERMISSION_PRESET_VALUES = ("read-only", "workspace-write")
+LOCAL_SERVER_PERMISSION_PRESET_VALUES = (
+    "read-only",
+    "workspace-write",
+    "danger-full-access",
+)
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 SSE_CONTENT_TYPE = "text/event-stream; charset=utf-8"
 WEB_STATIC_DIR = Path(__file__).with_name("web_static")
+DEFAULT_GREETING_PATH = Path(__file__).resolve().parent.parent / "kick_off_prompt_gpt.md"
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/assets/style.css": ("style.css", "text/css; charset=utf-8"),
@@ -185,6 +191,9 @@ def _make_handler(server_runtime: LocalControllerServer):
             if path == "/api/execution-profile/options":
                 self._write_json(200, _execution_profile_options_payload())
                 return
+            if path == "/api/default-greeting":
+                self._write_json(200, _default_greeting_payload())
+                return
             if path == "/api/runs/current":
                 self._write_json(200, _state_payload(server_runtime.controller.get_current_state()))
                 return
@@ -210,6 +219,17 @@ def _make_handler(server_runtime: LocalControllerServer):
 
         def _handle_post(self, path: str) -> None:
             self._validate_origin()
+            if path == "/api/repository/pick":
+                payload = self._read_json_body(
+                    LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                    require_object=True,
+                    allow_empty=True,
+                )
+                if payload:
+                    raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                picker_result = choose_repository_directory()
+                self._write_repository_picker_result(picker_result)
+                return
             if path == "/api/runs/start":
                 payload = self._read_json_body(LOCAL_SERVER_START_BODY_LIMIT, require_object=True, allow_empty=False)
                 result = server_runtime.controller.start_run(**_start_run_kwargs(payload))
@@ -243,6 +263,22 @@ def _make_handler(server_runtime: LocalControllerServer):
                 self._write_operation_result(result, success_status=200)
                 return
             self._write_error(404, "route_not_found", "API route was not found.")
+
+        def _write_repository_picker_result(self, result: RepositoryPickerResult) -> None:
+            payload = {
+                "ok": result.ok,
+                "selected": result.selected,
+                "repository_path": result.repository_path,
+                "reason_code": result.reason_code,
+                "error_message": result.error_message,
+            }
+            if result.ok:
+                self._write_json(200, payload)
+                return
+            status = 409 if result.reason_code == "repository_picker_in_progress" else 500
+            if result.reason_code == "repository_picker_unavailable":
+                status = 501
+            self._write_json(status, payload)
 
         def _handle_progress_sse(self, *, after_sequence: int, limit: int) -> None:
             self.send_response(200)
@@ -457,12 +493,6 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     kwargs["project_title"] = destination.project_title
     kwargs["chat_title"] = destination.chat_title
     sandbox = payload["sandbox"]
-    if sandbox == "danger-full-access":
-        raise LocalServerError(
-            400,
-            "danger_full_access_not_available_in_local_controller",
-            "danger-full-access is not available through the local controller.",
-        )
     if not isinstance(sandbox, str) or sandbox not in LOCAL_SERVER_PERMISSION_PRESET_VALUES:
         allowed_text = ", ".join(LOCAL_SERVER_PERMISSION_PRESET_VALUES)
         raise LocalServerError(
@@ -688,6 +718,28 @@ def _health_payload(server_runtime: LocalControllerServer) -> dict[str, Any]:
     }
 
 
+def _default_greeting_payload() -> dict[str, Any]:
+    try:
+        initial_instruction = DEFAULT_GREETING_PATH.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise LocalServerError(
+            500,
+            "default_greeting_unavailable",
+            "The default greeting could not be loaded.",
+        )
+    if not initial_instruction.strip():
+        raise LocalServerError(
+            500,
+            "default_greeting_unavailable",
+            "The default greeting is empty.",
+        )
+    return {
+        "ok": True,
+        "initial_instruction": initial_instruction,
+        "source": DEFAULT_GREETING_PATH.name,
+    }
+
+
 def _session_payload(server_runtime: LocalControllerServer) -> dict[str, Any]:
     runtime = _runtime(server_runtime.controller)
     return {
@@ -719,7 +771,7 @@ def _execution_profile_options_payload() -> dict[str, Any]:
             "reasoning_effort": _option_payload(options["reasoning_effort"], "Codex default"),
             "approval_policy": _option_payload(
                 options["approval_policy"],
-                "Codex default — not dashboard-controlled yet",
+                "Codex default — Full Access bypasses approvals",
             ),
         },
     }
@@ -736,6 +788,7 @@ def _sandbox_label(value: str) -> str:
     return {
         "read-only": "Read Only",
         "workspace-write": "Workspace Write",
+        "danger-full-access": "Full Access (Autonomous)",
     }.get(value, value)
 
 
@@ -747,6 +800,10 @@ def _sandbox_description(value: str) -> str:
         "workspace-write": (
             "Codex can edit files in this repository. Outside-workspace and dangerous "
             "access remain blocked by this dashboard run."
+        ),
+        "danger-full-access": (
+            "Codex runs autonomously without filesystem, network, or prompt-policy "
+            "limits. The loop does not request per-run approval."
         ),
     }.get(value, "")
 

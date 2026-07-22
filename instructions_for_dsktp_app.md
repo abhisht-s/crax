@@ -16,7 +16,7 @@ Your response should usually do one of these:
 2. Decide the next engineering step.
 3. Give Codex the next exact prompt.
 4. Stop and ask Abhisht for a decision if the result exposes a product/safety choice.
-
+    
 Important Boundary
 
 Never ask Codex to implement immediately unless the current step is ready for implementation.

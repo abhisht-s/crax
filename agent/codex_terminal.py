@@ -189,6 +189,16 @@ def _file_change_summary(event: dict[str, Any]) -> dict[str, object]:
     return {}
 
 
+def _assistant_commentary_text(event: dict[str, Any]) -> str | None:
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type") or item.get("kind")
+    if not isinstance(item_type, str) or item_type.strip().lower() != "agent_message":
+        return None
+    return _bounded_text(item.get("text"), CODEX_PROGRESS_SUMMARY_LIMIT)
+
+
 def _progress_event(
     *,
     kind: str,
@@ -247,6 +257,16 @@ def normalize_codex_jsonl_event(line: str) -> dict[str, object]:
     command = _nested_dict_value(parsed, "command") or _nested_dict_value(parsed, "cmd")
     tool_name = _nested_dict_value(parsed, "tool_name") or _nested_dict_value(parsed, "tool")
     exit_code = _nested_dict_value(parsed, "exit_code")
+    commentary = _assistant_commentary_text(parsed)
+
+    if commentary is not None:
+        return _progress_event(
+            kind="assistant_commentary",
+            status=status,
+            title="Codex update",
+            summary=commentary,
+            metadata=metadata,
+        )
 
     if "blocked" in lowered:
         return _progress_event(
@@ -553,14 +573,11 @@ def run_codex_exec(
     ]
     if json_stream:
         command.append("--json")
-    command.extend(
-        [
-            "-C",
-            resolved_repo_path_text,
-            "-s",
-            sandbox,
-        ]
-    )
+    command.extend(["-C", resolved_repo_path_text])
+    if sandbox == "danger-full-access":
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    else:
+        command.extend(["-s", sandbox])
     if model_text != CODEX_DEFAULT_SELECTION:
         command.extend(["-m", model_text])
     command.extend(

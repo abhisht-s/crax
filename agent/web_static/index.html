@@ -24,10 +24,22 @@
         <h2 id="startup-heading">Start Run</h2>
         <div class="form-grid">
           <label for="repository-path">Repository path</label>
-          <input id="repository-path" name="repository_path" type="text" autocomplete="off">
+          <div class="field-stack">
+            <div class="repository-picker-row">
+              <input id="repository-path" name="repository_path" type="text" autocomplete="off">
+              <button id="repository-browse-button" type="button" class="secondary">Browse...</button>
+            </div>
+            <p id="repository-picker-status" class="form-note" aria-live="polite"></p>
+          </div>
 
           <label for="initial-task">Initial task</label>
-          <textarea id="initial-task" name="initial_instruction" rows="6"></textarea>
+          <div class="field-stack">
+            <textarea id="initial-task" name="initial_instruction" rows="6"></textarea>
+            <div class="field-action-row">
+              <button id="default-greeting-button" type="button" class="secondary">Default greeting</button>
+              <span id="default-greeting-status" class="form-note" aria-live="polite"></span>
+            </div>
+          </div>
 
           <label for="project-title">ChatGPT Project</label>
           <input id="project-title" name="project_title" type="text" autocomplete="off">
@@ -61,7 +73,7 @@
           <span id="reasoning-lock" class="locked-value">Codex default</span>
 
           <span>Approval</span>
-          <span id="approval-lock" class="locked-value">Codex default — not dashboard-controlled yet</span>
+          <span id="approval-lock" class="locked-value">Codex default — Full Access bypasses approvals</span>
         </div>
         <div class="action-row">
           <button id="start-button" type="button">Start run</button>
@@ -153,7 +165,7 @@
       </section>
 
       <section id="codex-live-panel" class="panel" aria-labelledby="codex-live-heading">
-        <h2 id="codex-live-heading">Codex Live Progress</h2>
+        <h2 id="codex-live-heading">Codex Working Notes</h2>
         <p id="codex-live-state" class="status-badge status-muted" aria-live="polite">No active run</p>
         <dl class="summary-grid codex-live-grid">
           <div><dt>Final message</dt><dd id="codex-live-final">Not available yet</dd></div>
@@ -187,8 +199,11 @@
       </section>
 
       <section id="event-timeline-panel" class="panel wide" aria-labelledby="timeline-heading">
-        <h2 id="timeline-heading">Event Timeline</h2>
-        <ol id="event-timeline" class="timeline"></ol>
+        <h2 id="timeline-heading">Diagnostics</h2>
+        <details id="event-timeline-details">
+          <summary>Raw event timeline</summary>
+          <ol id="event-timeline" class="timeline"></ol>
+        </details>
       </section>
     </main>
   </body>

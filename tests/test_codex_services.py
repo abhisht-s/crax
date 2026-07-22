@@ -236,6 +236,75 @@ def _temporary_real_ledger():
 
 
 class CodexTerminalTimeoutTests(unittest.TestCase):
+    def test_agent_message_json_event_becomes_bounded_assistant_commentary(self) -> None:
+        event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item-1",
+                        "type": "agent_message",
+                        "text": "I found the narrow seam and am preserving the existing behavior.",
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(event["kind"], "assistant_commentary")
+        self.assertEqual(event["title"], "Codex update")
+        self.assertEqual(
+            event["summary"],
+            "I found the narrow seam and am preserving the existing behavior.",
+        )
+        self.assertNotIn("text", json.dumps(event["metadata"], sort_keys=True))
+
+    def test_non_message_json_event_does_not_become_assistant_commentary(self) -> None:
+        event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item-2",
+                        "type": "command_execution",
+                        "command": "zsh -lc pwd",
+                        "aggregated_output": "private command output",
+                        "exit_code": 0,
+                    },
+                }
+            )
+        )
+
+        self.assertEqual(event["kind"], "command_finished")
+        self.assertNotIn("private command output", json.dumps(event, sort_keys=True))
+
+    def test_full_access_uses_explicit_approval_and_sandbox_bypass(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["codex"],
+            returncode=0,
+            stdout="done\n",
+            stderr="",
+        )
+
+        def run_side_effect(command, **_kwargs):
+            final_path = Path(command[command.index("--output-last-message") + 1])
+            final_path.write_text("done", encoding="utf-8")
+            return completed
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "run", side_effect=run_side_effect) as run,
+        ):
+            codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                sandbox="danger-full-access",
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("-s", command)
+
     def test_run_codex_exec_requests_run_scoped_final_message_artifact(self) -> None:
         completed = subprocess.CompletedProcess(
             args=["codex"],
@@ -618,6 +687,27 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         encoded = json.dumps(event, sort_keys=True)
         self.assertIn("stdout_length", encoded)
         self.assertNotIn("raw body must be summarized", encoded)
+
+    def test_real_ledger_preserves_assistant_commentary_kind_and_text(self) -> None:
+        with _temporary_real_ledger():
+            run_id = ledger_module.create_run("Task")
+            stored = ledger_module.add_codex_progress_event(
+                run_id,
+                "inv-commentary",
+                {
+                    "source": "codex_cli_jsonl",
+                    "kind": "assistant_commentary",
+                    "status": "completed",
+                    "title": "Codex update",
+                    "summary": "I found a stable seam and am checking it now.",
+                    "metadata": {"event_type": "item.completed"},
+                },
+            )
+            events = ledger_module.list_codex_progress_events(run_id)
+
+        self.assertEqual(stored["kind"], "assistant_commentary")
+        self.assertEqual(events[0]["kind"], "assistant_commentary")
+        self.assertEqual(events[0]["summary"], "I found a stable seam and am checking it now.")
 
     def test_controller_profile_default_model_launches_without_model_arg(self) -> None:
         ledger = FakeLedger(

@@ -175,6 +175,17 @@ class RecordingCallable:
 
 
 class GovernanceServiceTests(unittest.TestCase):
+    def test_successful_full_access_run_remains_autonomous(self) -> None:
+        result = self._apply(sandbox="danger-full-access")
+
+        self.assertEqual(result.next_status, "completed")
+        self.assertTrue(result.auto_supervision_allowed)
+        self.assertFalse(result.human_review_required)
+        self.assertIn(
+            "autonomous_full_access_policy_bypass",
+            result.governance_observation["observation_flags"],
+        )
+
     def _apply(
         self,
         *,

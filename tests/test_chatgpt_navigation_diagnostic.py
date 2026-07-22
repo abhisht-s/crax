@@ -179,12 +179,13 @@ class _FailingAlignmentReader(_TimedActionReader):
 
 
 class _AXPerformActionRecorder:
-    def __init__(self) -> None:
+    def __init__(self, error_code: int = 0) -> None:
         self.calls: list[tuple[int | None, int | None]] = []
+        self.error_code = error_code
 
     def AXUIElementPerformAction(self, element: object, action_ref: object) -> int:
         self.calls.append((getattr(element, "value", None), getattr(action_ref, "value", None)))
-        return 0
+        return self.error_code
 
 
 class _DisplayProbe:
@@ -895,8 +896,10 @@ def _alignment_dispatch_context(
     }
 
 
-def _autonomous_dispatch_reader(path: str = "W.1.4.11") -> tuple[nav._AutonomousSidebarAXReader, _AXPerformActionRecorder]:
-    recorder = _AXPerformActionRecorder()
+def _autonomous_dispatch_reader(
+    path: str = "W.1.4.11", *, error_code: int = 0
+) -> tuple[nav._AutonomousSidebarAXReader, _AXPerformActionRecorder]:
+    recorder = _AXPerformActionRecorder(error_code=error_code)
     reader = object.__new__(nav._AutonomousSidebarAXReader)
     reader._elements_by_path = {path: 111}
     reader._ax = recorder
@@ -1117,6 +1120,13 @@ def _title_inventory_result() -> dict:
 
 
 class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
+    def test_process_match_for_chatgpt_requires_classic_bundle(self) -> None:
+        runtime = object.__new__(nav._ObjCRuntime)
+
+        self.assertEqual(runtime._match_score("ChatGPT", "ChatGPT", "com.openai.chat"), 200)
+        self.assertEqual(runtime._match_score("ChatGPT", "ChatGPT", "com.openai.codex"), 0)
+        self.assertEqual(runtime._match_score("ChatGPT", "ChatGPT", "com.example.other"), 0)
+
     def test_non_macos_returns_structured_unsupported_result(self) -> None:
         with mock.patch.object(nav.sys, "platform", "linux"):
             result = nav.inspect_chatgpt_navigation_ui()
@@ -2437,6 +2447,33 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertEqual(chat["title_role"], "AXStaticText")
         self.assertEqual(chat["action_names"], ["AXPress"])
 
+    def test_window_titled_project_uses_tabs_not_window_bottom_for_chat_list(self) -> None:
+        snapshots = []
+        for snapshot in _scrollable_project_chat_page(["AI Engineering Operator"]):
+            if snapshot.path == "W":
+                snapshots.append(
+                    nav.AXElementSnapshot(
+                        path="W", depth=0, role="AXWindow", title="Watch to Codex", frame=snapshot.frame
+                    )
+                )
+            elif snapshot.path == "W.1.1":
+                snapshots.append(
+                    nav.AXElementSnapshot(
+                        path=snapshot.path, depth=snapshot.depth, role="AXHeading", value="", frame=snapshot.frame
+                    )
+                )
+            else:
+                snapshots.append(snapshot)
+
+        result = nav.resolve_open_project_content_and_visible_chats(
+            "Watch to Codex", snapshots, (0, 0, 1200, 900)
+        )
+
+        self.assertEqual(result["status"], "visible_chats_found")
+        self.assertEqual(result["project_content_container"]["path"], "W")
+        self.assertEqual(result["chat_list_container"]["path"], "W.1.4")
+        self.assertEqual(result["visible_chats"][0]["title"], "AI Engineering Operator")
+
     def test_project_chat_open_matches_clean_title_only_not_preview_or_partial(self) -> None:
         project_open = mock.Mock(return_value={"ok": True, "outcome": "dry_run_ready", "visible_chat_count": 0, "visible_chats": []})
         reader = _AutonomousReader([_project_visible_chats_snapshots()] * 2, {"available": True, "path": "W.2.5.2.1"})
@@ -2845,6 +2882,142 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
 
         self.assertIs(result["chat_open_action_posted"], True)
         self.assertIn(("W.1.4.1", "AXPress"), reader.actions)
+
+    def test_project_chat_axpress_prefers_enclosing_row_over_static_title_child(self) -> None:
+        row = nav.AXElementSnapshot(
+            path="W.1.4.1", depth=3, role="AXButton", actions=("AXPress",), enabled=True
+        )
+        title = nav.AXElementSnapshot(
+            path="W.1.4.1.1", depth=4, role="AXStaticText", actions=("AXPress",), enabled=True
+        )
+
+        target = nav._project_chat_axpress_target(title, row)
+
+        self.assertEqual(target["path"], row.path)
+        self.assertEqual(target["relation"], "row_node")
+        self.assertEqual(target["role"], "AXButton")
+
+    def test_project_chat_axpress_rejects_static_title_and_allows_actionable_title_control(self) -> None:
+        row_without_press = nav.AXElementSnapshot(path="W.1.4.1", depth=3, role="AXGroup", enabled=True)
+        static_title = nav.AXElementSnapshot(
+            path="W.1.4.1.1", depth=4, role="AXStaticText", actions=("AXPress",), enabled=True
+        )
+        control_title = nav.AXElementSnapshot(
+            path="W.1.4.1.1", depth=4, role="AXLink", actions=("AXPress",), enabled=True
+        )
+
+        self.assertEqual(nav._project_chat_axpress_target(static_title, row_without_press), {})
+        target = nav._project_chat_axpress_target(control_title, row_without_press)
+        self.assertEqual(target["path"], control_title.path)
+        self.assertEqual(target["relation"], "title_node")
+
+    def test_static_title_axpress_without_row_action_uses_validated_click_fallback(self) -> None:
+        snapshots = []
+        for snapshot in _project_visible_chats_without_axpress():
+            if snapshot.path == "W.2.5.2.1":
+                snapshots.append(
+                    nav.AXElementSnapshot(
+                        path=snapshot.path,
+                        depth=snapshot.depth,
+                        role="AXStaticText",
+                        value=snapshot.value,
+                        actions=("AXPress",),
+                        enabled=True,
+                        frame=snapshot.frame,
+                    )
+                )
+            else:
+                snapshots.append(snapshot)
+        reader = _AutonomousReader(
+            [snapshots] * 6,
+            {"available": True, "path": "W.2.5.2.1", "role": "AXStaticText", "title": {"literal": "Profile Photo Verification Change"}},
+        )
+        clicker = _ClickService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Profile Photo Verification Change",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["chosen_method"], "validated_geometry_click")
+        self.assertNotIn(("W.2.5.2.1", "AXPress"), reader.actions)
+        self.assertEqual(len(clicker.clicks), 1)
+
+    def test_axpress_success_without_ui_change_records_unconfirmed_diagnostics(self) -> None:
+        page = _scrollable_project_chat_page(["City-wise Restrictions"])
+        reader = _AutonomousReader(
+            [page] * 6,
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "City-wise Restrictions"}},
+        )
+        clicker = _ClickService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="City-wise Restrictions",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "action_posted_but_chat_not_confirmed")
+        self.assertEqual(result["axpress_result"], "success")
+        self.assertEqual(result["chosen_method"], "axpress_then_validated_geometry_click")
+        self.assertEqual(len(clicker.clicks), 1)
+        self.assertFalse(result["axpress_post_action_evidence"]["confirmed"])
+        self.assertFalse(result["ui_changed_after_action"])
+        self.assertFalse(result["destination_confirmed"])
+
+    def test_axpress_error_is_retained_and_does_not_post_action_without_click_fallback(self) -> None:
+        class FailingPressReader(_AutonomousReader):
+            def perform_action(self, path: str, action: str, *, action_context: dict | None = None) -> bool:
+                self.actions.append((path, action))
+                self.action_contexts.append(action_context)
+                if action == "AXPress":
+                    self.last_ax_action_result = {"path": path, "action": action, "error_code": -25205}
+                    return False
+                return True
+
+        page = _scrollable_project_chat_page(["City-wise Restrictions"])
+        reader = FailingPressReader(
+            [page] * 5,
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "City-wise Restrictions"}},
+        )
+        clicker = _ClickService(permitted=False)
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="City-wise Restrictions",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(return_value={"ok": True, "outcome": "destination_opened_and_visible_chats_resolved", "visible_chat_count": 1}),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "click_posting_failed")
+        self.assertTrue(result["axpress_attempted"])
+        self.assertEqual(result["axpress_result"], "failed")
+        self.assertEqual(result["ax_error_code"], -25205)
+        self.assertFalse(result["chat_open_action_posted"])
 
     def test_project_chat_open_reports_no_action_posted_before_open_action(self) -> None:
         # A dry-run (confirm_open_chat=False) resolves the target but never posts
@@ -3473,6 +3646,17 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertTrue(reader.perform_action("W.1.4.11", "AXPress"))
 
         self.assertEqual(recorder.calls, [(111, 333)])
+
+    def test_dispatch_retains_nonzero_axpress_error_code(self) -> None:
+        reader, recorder = _autonomous_dispatch_reader(error_code=-25205)
+
+        self.assertFalse(reader.perform_action("W.1.4.11", "AXPress"))
+
+        self.assertEqual(recorder.calls, [(111, 333)])
+        self.assertEqual(
+            reader.last_ax_action_result,
+            {"path": "W.1.4.11", "action": "AXPress", "error_code": -25205},
+        )
 
     def test_target_detection_on_canonical_title_posts_zero_additional_scrolls_and_fresh_axpress(self) -> None:
         preview = "SELECT * FROM users; function hydratePreview() { return true; }"
@@ -4274,6 +4458,10 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertEqual(output.lines, [])
         self.assertEqual(reader.actions, [])
         self.assertEqual(result["unique_chat_titles_printed"], 0)
+        self.assertFalse(result["target_detected"])
+        self.assertFalse(result["actionable_element_resolved"])
+        self.assertFalse(result["axpress_attempted"])
+        self.assertEqual(result["final_reresolution_status"], "not_attempted")
 
     # --- Focused tests: overlap-safe scan continuity and valid termination ----
 

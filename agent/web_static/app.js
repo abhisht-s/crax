@@ -9,14 +9,16 @@
   const PROGRESS_EVENT_RENDER_LIMIT = 8;
   const PROGRESS_EVENT_MEMORY_LIMIT = 50;
   const TEXT_LIMIT = 600;
-  const ALLOWED_PERMISSION_PRESET_VALUES = new Set(["read-only", "workspace-write"]);
+  const ALLOWED_PERMISSION_PRESET_VALUES = new Set(["read-only", "workspace-write", "danger-full-access"]);
   const PERMISSION_PRESET_LABELS = {
     "read-only": "Read Only",
     "workspace-write": "Workspace Write",
+    "danger-full-access": "Full Access (Autonomous)",
   };
   const PERMISSION_PRESET_DESCRIPTIONS = {
     "read-only": "Codex can inspect the workspace. Edits are not allowed for this dashboard run.",
     "workspace-write": "Codex can edit files in this repository. Outside-workspace and dangerous access remain blocked by this dashboard run.",
+    "danger-full-access": "Codex runs autonomously without filesystem, network, or prompt-policy limits. The loop does not request per-run approval.",
   };
   const STALE_LEASE_RECOVERABLE_RUN_STATUSES = new Set([
     "completed",
@@ -34,6 +36,8 @@
   let currentStatePayload = null;
   let profileOptions = null;
   let optionsRequestInFlight = false;
+  let repositoryPickerRequestInFlight = false;
+  let defaultGreetingRequestInFlight = false;
   let startRequestInFlight = false;
   let approvalRequestInFlight = false;
   let tickRequestInFlight = false;
@@ -67,7 +71,11 @@
     for (const id of [
       "connection-status",
       "repository-path",
+      "repository-browse-button",
+      "repository-picker-status",
       "initial-task",
+      "default-greeting-button",
+      "default-greeting-status",
       "project-title",
       "chat-title",
       "allow-destination-navigation",
@@ -139,7 +147,9 @@
 
   function wireEvents() {
     elements["start-button"].addEventListener("click", onStartRun);
+    elements["repository-browse-button"].addEventListener("click", onBrowseRepository);
     elements["repository-path"].addEventListener("input", updateControlState);
+    elements["default-greeting-button"].addEventListener("click", onDefaultGreeting);
     elements["initial-task"].addEventListener("input", updateControlState);
     elements["project-title"].addEventListener("input", updateControlState);
     elements["chat-title"].addEventListener("input", updateControlState);
@@ -184,6 +194,14 @@
 
   async function startRun(payload) {
     return requestJson("POST", "/api/runs/start", payload);
+  }
+
+  async function pickRepository() {
+    return requestJson("POST", "/api/repository/pick", {});
+  }
+
+  async function getDefaultGreeting() {
+    return requestJson("GET", "/api/default-greeting");
   }
 
   async function submitApproval(decision) {
@@ -395,6 +413,50 @@
     setText(elements["startup-status"], result.ok ? "Run started." : safeMessage(result));
     if (result.status !== 401) {
       await forceRefresh();
+    }
+    updateControlState();
+  }
+
+  async function onBrowseRepository() {
+    if (repositoryPickerRequestInFlight || !controllerToken) {
+      return;
+    }
+    repositoryPickerRequestInFlight = true;
+    setText(elements["repository-picker-status"], "Opening folder picker...");
+    updateControlState();
+    const result = await pickRepository();
+    repositoryPickerRequestInFlight = false;
+    if (result.status === 401) {
+      return;
+    }
+    if (result.ok && result.selected && typeof result.repository_path === "string") {
+      elements["repository-path"].value = result.repository_path;
+      setText(elements["repository-picker-status"], "Repository selected.");
+    } else if (result.ok) {
+      setText(elements["repository-picker-status"], "No folder selected.");
+    } else {
+      setText(elements["repository-picker-status"], safeMessage(result));
+    }
+    updateControlState();
+  }
+
+  async function onDefaultGreeting() {
+    if (defaultGreetingRequestInFlight || !controllerToken) {
+      return;
+    }
+    defaultGreetingRequestInFlight = true;
+    setText(elements["default-greeting-status"], "Loading default greeting...");
+    updateControlState();
+    const result = await getDefaultGreeting();
+    defaultGreetingRequestInFlight = false;
+    if (result.status === 401) {
+      return;
+    }
+    if (result.ok && typeof result.initial_instruction === "string") {
+      elements["initial-task"].value = result.initial_instruction;
+      setText(elements["default-greeting-status"], "Default greeting loaded.");
+    } else {
+      setText(elements["default-greeting-status"], safeMessage(result));
     }
     updateControlState();
   }
@@ -907,31 +969,26 @@
   function renderProgressEvents() {
     const list = elements["codex-live-events"];
     list.replaceChildren();
-    const events = progressEvents.slice(-PROGRESS_EVENT_RENDER_LIMIT);
+    const events = progressEvents
+      .filter((event) => event && event.kind === "assistant_commentary" && event.summary)
+      .slice(-PROGRESS_EVENT_RENDER_LIMIT);
     if (!events.length) {
       const item = document.createElement("li");
       item.className = "progress-event";
       const message = document.createElement("p");
-      setText(message, progressRunId ? "Waiting for Codex progress." : "No active run.");
+      setText(message, progressRunId ? "Waiting for Codex to share an update." : "No active run.");
       item.append(message);
       list.append(item);
       return;
     }
     for (const event of events) {
       const item = document.createElement("li");
-      item.className = "progress-event";
-
-      const meta = document.createElement("div");
-      meta.className = "progress-meta";
-      appendSpan(meta, `#${valueOrNone(event.sequence)}`);
-      appendSpan(meta, valueOrNone(event.created_at));
-      appendSpan(meta, valueOrNone(event.kind));
-      appendSpan(meta, valueOrNone(event.status));
+      item.className = "progress-event progress-commentary";
 
       const message = document.createElement("p");
-      setText(message, progressEventLabel(event));
+      setText(message, event.summary);
 
-      item.append(meta, message);
+      item.append(message);
       list.append(item);
     }
   }
@@ -1096,11 +1153,19 @@
       !elements["initial-task"].value.trim() ||
       !elements["project-title"].value.trim() ||
       !elements["chat-title"].value.trim();
-    const disableInputs = !controllerToken || activeRun || running || startRequestInFlight;
+    const disableInputs =
+      !controllerToken ||
+      activeRun ||
+      running ||
+      startRequestInFlight ||
+      repositoryPickerRequestInFlight ||
+      defaultGreetingRequestInFlight;
     const disableStart =
       disableInputs || optionsUnavailable || invalidSelection || requiredFieldsMissing;
     elements["repository-path"].disabled = disableInputs;
+    elements["repository-browse-button"].disabled = disableInputs;
     elements["initial-task"].disabled = disableInputs;
+    elements["default-greeting-button"].disabled = disableInputs;
     elements["project-title"].disabled = disableInputs;
     elements["chat-title"].disabled = disableInputs;
     elements["allow-destination-navigation"].disabled = disableInputs;
@@ -1147,7 +1212,9 @@
   function setMutationDisabled(disabled) {
     for (const id of [
       "repository-path",
+      "repository-browse-button",
       "initial-task",
+      "default-greeting-button",
       "project-title",
       "chat-title",
       "allow-destination-navigation",
@@ -1230,7 +1297,7 @@
     setText(elements["reasoning-lock"], optionLabel(locked.reasoning_effort, "Codex default"));
     setText(
       elements["approval-lock"],
-      optionLabel(locked.approval_policy, "Codex default — not dashboard-controlled yet"),
+      optionLabel(locked.approval_policy, "Codex default — Full Access bypasses approvals"),
     );
     updatePermissionPresetDescription();
   }
