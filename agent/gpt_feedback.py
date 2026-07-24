@@ -11,8 +11,8 @@ SUBMISSION_MARKER_END = "END_AGENT_SUBMISSION"
 # Keep both handoff guards aligned at the operator-approved transport limit.
 # The payload guard includes the compact wrapper and submission marker, so a
 # message near this boundary can still be rejected with its own explicit event.
-MAX_CLEAN_FINAL_MESSAGE_CHARS = 50_000
-MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS = 50_000
+MAX_CLEAN_FINAL_MESSAGE_CHARS = 100_000
+MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS = 100_000
 
 
 def _event_metadata(event: dict) -> dict | None:

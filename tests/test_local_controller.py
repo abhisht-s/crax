@@ -64,6 +64,7 @@ class FakeLedger:
         self.list_events_calls: list[str] = []
         self.destination_bind_calls: list[dict] = []
         self.execution_profile_bind_calls: list[dict] = []
+        self.update_run_status_calls: list[dict] = []
         self.destination_bind_status = destination_bind_status
         self.profile_bind_status = profile_bind_status
         self._next_run_number = 1
@@ -103,6 +104,26 @@ class FakeLedger:
         self.events.append(event)
         self.added_events.append(event)
         return event
+
+    def update_run_status(
+        self,
+        run_id: str,
+        status: RunStatus,
+        final_summary: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        self.update_run_status_calls.append(
+            {
+                "run_id": run_id,
+                "status": status,
+                "final_summary": final_summary,
+                "error": error,
+            }
+        )
+        if self.run is not None and self.run.get("id") == run_id:
+            self.run["status"] = status.value
+            self.run["final_summary"] = final_summary
+            self.run["error"] = error
 
     def bind_run_destination(
         self,
@@ -912,6 +933,77 @@ class LocalControllerRunCreationTests(unittest.TestCase):
 
 
 class LocalControllerReadModelTests(unittest.TestCase):
+    def test_latest_unresolved_failure_is_exposed_with_exact_recovery_details(self) -> None:
+        events = [
+            _controller_event("/tmp", event_id=1),
+            _event(
+                2,
+                "local_controller_action_failed",
+                {
+                    "schema_version": 1,
+                    "action_key": "ask_send_to_gpt",
+                    "source": "automatic_progress",
+                    "reason_code": "chatgpt_not_frontmost",
+                    "error_message": "ChatGPT was not frontmost.",
+                    "retry_classification": "retryable",
+                    "retryable": True,
+                    "recovery_message": "Open ChatGPT, then retry this exact action.",
+                    "action_executed": False,
+                    "run_status_before_action": "completed",
+                    "run_status_after_action": "completed",
+                    "source_event_ids": {"codex_exec_finished": 10},
+                },
+                message="Controller action paused after failure.",
+            ),
+        ]
+        model = build_local_controller_read_model(
+            "run-1",
+            ledger=FakeLedger(_run(), events),
+            planner=lambda *args, **kwargs: _send_plan(changed_files_count=0),
+        )
+
+        self.assertEqual(model.latest_failure["event_id"], 2)
+        self.assertEqual(model.latest_failure["action_key"], "ask_send_to_gpt")
+        self.assertEqual(model.latest_failure["reason_code"], "chatgpt_not_frontmost")
+        self.assertEqual(model.latest_failure["error_message"], "ChatGPT was not frontmost.")
+        self.assertTrue(model.latest_failure["retryable"])
+        self.assertEqual(
+            model.actionable_error_message,
+            "ChatGPT was not frontmost.",
+        )
+
+    def test_resolving_retried_failure_does_not_resurrect_superseded_failure(self) -> None:
+        failure_metadata = {
+            "schema_version": 1,
+            "action_key": "capture_gpt_response",
+            "reason_code": "sentinel_malformed_stable",
+            "error_message": "Malformed sentinel.",
+            "retry_classification": "retryable",
+            "retryable": True,
+            "recovery_message": "Retry capture.",
+        }
+        events = [
+            _controller_event("/tmp", event_id=1),
+            _event(2, "local_controller_action_failed", failure_metadata),
+            _event(
+                3,
+                "local_controller_action_failed",
+                {**failure_metadata, "supersedes_failure_event_id": 2},
+            ),
+            _event(
+                4,
+                "local_controller_failure_resolved",
+                {"schema_version": 1, "failure_event_id": 3},
+            ),
+        ]
+        model = build_local_controller_read_model(
+            "run-1",
+            ledger=FakeLedger(_run(), events),
+            planner=lambda *args, **kwargs: _send_plan(changed_files_count=0),
+        )
+
+        self.assertIsNone(model.latest_failure)
+
     def test_read_model_rehydrates_repo_and_sandbox_from_controller_event_not_session(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             events = [_controller_event(repo, "workspace-write"), _event(2, "codex_exec_finished", {"exit_code": 0})]
@@ -1565,6 +1657,34 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             self.assertEqual(sum(1 for result in results if result.reason_code == "active_run_exists"), 1)
             self.assertEqual(len(race_ledger.create_run_calls), 1)
 
+    def test_terminal_active_run_is_replaced_by_new_start(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            executor = BlockingInitialExecutor()
+            ledger = FakeLedger(_run(RunStatus.FAILED.value))
+            session = LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="blocked",
+            )
+            controller = LocalController(
+                session=session,
+                ledger=ledger,
+                initial_run_executor=executor,
+            )
+
+            result = controller.start_run(
+                repository_path=repo,
+                initial_instruction="New task",
+                project_title="Project",
+                chat_title="Chat",
+                sandbox="read-only",
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(ledger.create_run_calls, ["New task"])
+            self.assertTrue(executor.entered.wait(1))
+            executor.release.set()
+            controller.current_worker.join(1)
+
     def test_initial_worker_is_async_and_uses_safe_executor_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             executor = BlockingInitialExecutor()
@@ -1743,7 +1863,12 @@ class LocalControllerStateMachineTests(unittest.TestCase):
         controller.current_worker.join(1)
 
         self.assertEqual(len(step.calls), 1)
-        self.assertEqual(controller.session.controller_state, "blocked")
+        self.assertEqual(controller.session.controller_state, "waiting_for_retry")
+        failure = controller.ledger.added_events[-1]
+        self.assertEqual(failure["event_type"], "local_controller_action_failed")
+        self.assertEqual(failure["metadata"]["action_key"], "ask_send_to_gpt")
+        self.assertEqual(failure["metadata"]["reason_code"], "project_not_active")
+        self.assertTrue(failure["metadata"]["retryable"])
 
     def test_completed_run_status_with_pending_handoff_is_not_controller_completed(self) -> None:
         events = [
@@ -1965,10 +2090,14 @@ class LocalControllerStateMachineTests(unittest.TestCase):
         failing.request_automatic_progress()
         failing.current_worker.join(1)
         self.assertFalse(failing.action_running)
-        self.assertEqual(failing.session.controller_state, "failed")
+        self.assertEqual(failing.session.controller_state, "waiting_for_retry")
         self.assertEqual(failing.last_exception_summary["type"], "RuntimeError")
+        self.assertEqual(
+            failing.ledger.added_events[-1]["event_type"],
+            "local_controller_action_failed",
+        )
 
-    def test_worker_failures_are_visible_without_ledger_failure_events(self) -> None:
+    def test_worker_failures_are_persisted_for_manual_retry(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             initial = BlockingInitialExecutor(exception=RuntimeError("initial failed"))
             controller = LocalController(ledger=FakeLedger(), initial_run_executor=initial)
@@ -1983,12 +2112,176 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             initial.release.set()
             controller.current_worker.join(1)
 
-            self.assertEqual(controller.session.controller_state, "failed")
+            self.assertEqual(controller.session.controller_state, "waiting_for_retry")
             self.assertEqual(controller.last_exception_summary["type"], "RuntimeError")
-            self.assertNotIn(
-                "controller_failed",
-                [event["event_type"] for event in controller.ledger.events],
+            failure = controller.ledger.added_events[-1]
+            self.assertEqual(failure["event_type"], "local_controller_action_failed")
+            self.assertEqual(failure["metadata"]["action_key"], "initial_codex")
+            self.assertEqual(
+                failure["metadata"]["error_message"],
+                "RuntimeError: initial failed",
             )
+            self.assertTrue(failure["metadata"]["retryable"])
+
+    def test_manual_retry_replays_exact_failed_action_and_resumes_progress(self) -> None:
+        failure_event = _event(
+            11,
+            "local_controller_action_failed",
+            {
+                "schema_version": 1,
+                "action_key": "capture_gpt_response",
+                "source": "automatic_progress",
+                "reason_code": "sentinel_malformed_stable",
+                "error_message": "The ChatGPT response sentinel is malformed.",
+                "retry_classification": "retryable",
+                "retryable": True,
+                "recovery_message": "Remove the blocker, then retry.",
+                "action_executed": True,
+                "run_status_before_action": "completed",
+                "run_status_after_action": "needs_review",
+                "source_event_ids": {"gpt_feedback_submission_verified": 10},
+            },
+        )
+        routine = _model(
+            action="capture_gpt_response",
+            routine=True,
+            stage="routine_action_available",
+            planner_metadata={
+                "action": "capture_gpt_response",
+                "reason": "waiting_for_response",
+                "event_ids": {"gpt_feedback_submission_verified": 10},
+            },
+        )
+        completed = _model(
+            action="stop",
+            reason="extracted_prompt_already_run",
+            terminal=True,
+            completed=True,
+            stage="completed",
+        )
+        step = StepRecorder()
+        ledger = FakeLedger(_run(RunStatus.NEEDS_REVIEW.value), [failure_event])
+        controller = LocalController(
+            session=LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="waiting_for_retry",
+            ),
+            ledger=ledger,
+            read_model_builder=ReadModelSequence(routine, completed, repeat_last=False),
+            supervision_step=step,
+        )
+
+        result = controller.retry_failed_action(11)
+        controller.current_worker.join(1)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.reason_code, "retry_worker_started")
+        self.assertEqual(len(step.calls), 1)
+        self.assertEqual(step.calls[0][1]["expected_planner_action"], "capture_gpt_response")
+        self.assertEqual(
+            step.calls[0][1]["expected_event_ids"],
+            {"gpt_feedback_submission_verified": 10},
+        )
+        self.assertEqual(ledger.run["status"], RunStatus.COMPLETED.value)
+        self.assertEqual(controller.session.controller_state, "completed")
+        event_types = [event["event_type"] for event in ledger.added_events]
+        self.assertEqual(
+            event_types,
+            [
+                "local_controller_retry_status_restored",
+                "local_controller_retry_requested",
+                "local_controller_failure_resolved",
+            ],
+        )
+
+    def test_manual_retry_rejects_stale_or_unsafe_failure(self) -> None:
+        failure_event = _event(
+            11,
+            "local_controller_action_failed",
+            {
+                "schema_version": 1,
+                "action_key": "ask_send_to_gpt",
+                "reason_code": "chatgpt_submission_ambiguous",
+                "error_message": "Submission outcome is ambiguous.",
+                "retry_classification": "reconcile",
+                "retryable": False,
+                "recovery_message": "Inspect and reconcile the ChatGPT message first.",
+            },
+        )
+        controller = LocalController(
+            session=LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="blocked",
+            ),
+            ledger=FakeLedger(_run(), [failure_event]),
+        )
+
+        stale = controller.retry_failed_action(10)
+        unsafe = controller.retry_failed_action(11)
+
+        self.assertEqual(stale.reason_code, "stale_failure_retry")
+        self.assertEqual(unsafe.reason_code, "failure_requires_reconciliation")
+        self.assertFalse(controller.action_running)
+
+    def test_concurrent_manual_retry_clicks_start_only_one_attempt(self) -> None:
+        failure_event = _event(
+            11,
+            "local_controller_action_failed",
+            {
+                "schema_version": 1,
+                "action_key": "capture_gpt_response",
+                "reason_code": "capture_timeout",
+                "error_message": "Capture timed out.",
+                "retry_classification": "retryable",
+                "retryable": True,
+                "recovery_message": "Wait for the response, then retry.",
+                "run_status_before_action": "completed",
+                "run_status_after_action": "completed",
+            },
+        )
+        routine = _model(
+            action="capture_gpt_response",
+            routine=True,
+            planner_metadata={
+                "action": "capture_gpt_response",
+                "reason": "waiting_for_response",
+                "event_ids": {"gpt_feedback_submission_verified": 10},
+            },
+        )
+        completed = _model(
+            action="stop",
+            reason="extracted_prompt_already_run",
+            terminal=True,
+            completed=True,
+        )
+        step = StepRecorder()
+        step.block = True
+        ledger = FakeLedger(_run(), [failure_event])
+        controller = LocalController(
+            session=LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="waiting_for_retry",
+            ),
+            ledger=ledger,
+            read_model_builder=ReadModelSequence(routine, completed, repeat_last=False),
+            supervision_step=step,
+        )
+
+        first = controller.retry_failed_action(11)
+        self.assertTrue(step.entered.wait(1))
+        second = controller.retry_failed_action(11)
+        step.release.set()
+        controller.current_worker.join(1)
+
+        self.assertTrue(first.ok)
+        self.assertEqual(second.reason_code, "action_already_running")
+        self.assertEqual(len(step.calls), 1)
+        self.assertEqual(
+            [event["event_type"] for event in ledger.added_events].count(
+                "local_controller_retry_requested"
+            ),
+            1,
+        )
 
     def test_controller_uses_only_injected_execution_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as repo:

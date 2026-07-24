@@ -57,6 +57,52 @@ In the dashboard, paste the contents of `kick_off_prompt_gpt.md`, choose `Worksp
 
 For macOS automation, allow your terminal app in System Settings -> Privacy & Security -> Accessibility when macOS prompts. The ChatGPT Desktop app must already be open to the project/chat you want the loop to use.
 
+## Remote dashboard from a phone
+
+Remote access is opt-in and designed for a private Tailscale network. The Python
+server still binds only to `127.0.0.1`; Tailscale Serve provides the private
+HTTPS endpoint. Do not use Tailscale Funnel or expose the controller directly to
+the public internet.
+
+1. Install Tailscale on the Mac and phone and sign both into the same tailnet.
+2. Choose a fixed local port and find the Mac's HTTPS tailnet name.
+3. Start CRAX with the repositories that the phone may select:
+
+```sh
+agent-loop-local \
+  --port 8765 \
+  --remote-base-url https://YOUR-MAC.YOUR-TAILNET.ts.net \
+  --repository-root "$HOME/Documents"
+```
+
+4. In another Terminal, proxy the private tailnet URL to the loopback server:
+
+```sh
+tailscale serve --bg http://127.0.0.1:8765
+```
+
+5. Open the printed `Remote pairing URL` on the phone. The one-time code is
+   exchanged for a revocable, expiring device credential stored in a Secure,
+   HttpOnly cookie.
+
+Paired admins can list, rotate, and revoke device credentials from the
+dashboard's Paired devices panel.
+
+The phone dashboard can select an authorized Git repository, start a run,
+observe Codex progress, approve or reject actions, continue/retry work, manage a
+stale ChatGPT UI lease, and stop the current run. The macOS folder dialog is not
+available remotely; use the repository catalog populated by `--repository-root`.
+
+Remote Full Access is disabled by default. To make it available, the Mac owner
+must add `--allow-remote-full-access`, and the phone must type
+`ENABLE FULL ACCESS` for each such run. Prefer `Workspace Write`.
+
+To stop serving the dashboard through Tailscale:
+
+```sh
+tailscale serve reset
+```
+
 # DETAILS AND HOW IT WORKS
 
 CRAX is the agent orchestrator when you are not arount. The idea is simple:

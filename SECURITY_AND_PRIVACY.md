@@ -109,3 +109,41 @@ Current protections are useful for a local single-user dashboard, but they are
 not a remote access security boundary. Do not expose the local server to a
 network. Do not assume localhost token checks protect against malicious local
 software, compromised browser context, or a user who shares the bootstrap URL.
+
+## Opt-In Remote Mode
+
+Remote mode preserves the loopback-only Python bind and is intended to sit
+behind Tailscale Serve. Tailscale provides private device reachability and TLS;
+CRAX adds a second application-level device credential. Remote mode is enabled
+only when `--remote-base-url` is supplied.
+
+Remote controls include:
+
+- exact trusted Host and Origin validation for the configured HTTPS URL,
+- one-time pairing codes with a short expiration,
+- random device credentials stored only as SHA-256 fingerprints,
+- Secure, HttpOnly, SameSite cookies in the phone browser,
+- read/control/admin authorization checks per route,
+- expiring and revocable paired devices,
+- remote mutation audit records,
+- repository authorization under explicit `--repository-root` directories,
+- remote Full Access disabled unless the Mac owner opts in,
+- a fresh typed confirmation for every remote Full Access run.
+
+The local bootstrap token remains available for the browser opened directly on
+the Mac. It is not returned to or stored by paired remote devices.
+
+Remote mode does not make public-internet exposure safe. In particular:
+
+- do not use Tailscale Funnel, a public reverse proxy, router port forwarding,
+  ngrok, or a public Cloudflare Tunnel for this server;
+- anyone controlling a paired admin device can start Codex runs and drive the
+  ChatGPT Desktop handoff;
+- a malicious process on the Mac remains outside this threat boundary;
+- Tailscale account and device security are part of the trusted computing base;
+- the remotely displayed run data can contain sensitive repository and prompt
+  information described above.
+
+If a phone is lost, remove it from the tailnet and revoke its CRAX device
+credential. Stop remote serving with `tailscale serve reset`. Removing the
+device does not delete historical remote audit records or run evidence.

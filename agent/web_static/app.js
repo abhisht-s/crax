@@ -8,7 +8,6 @@
   const PROGRESS_POLL_MS = 2000;
   const PROGRESS_EVENT_RENDER_LIMIT = 8;
   const PROGRESS_EVENT_MEMORY_LIMIT = 50;
-  const TEXT_LIMIT = 600;
   const ALLOWED_PERMISSION_PRESET_VALUES = new Set(["read-only", "workspace-write", "danger-full-access"]);
   const PERMISSION_PRESET_LABELS = {
     "read-only": "Read Only",
@@ -26,9 +25,19 @@
     "rejected",
     "needs_review",
   ]);
+  const REPLACEABLE_RUN_STATUSES = new Set([
+    "completed",
+    "failed",
+    "needs_review",
+    "rejected",
+  ]);
 
   const elements = {};
   let controllerToken = "";
+  let authenticated = false;
+  let remoteMode = false;
+  let currentPrincipal = null;
+  let pendingPairingCode = "";
   let pollingStopped = false;
   let stateRequestInFlight = false;
   let pollTimer = null;
@@ -41,6 +50,8 @@
   let startRequestInFlight = false;
   let approvalRequestInFlight = false;
   let tickRequestInFlight = false;
+  let retryRequestInFlight = false;
+  let cancelRequestInFlight = false;
   let leaseRequestInFlight = false;
   let leaseReleaseRequestInFlight = false;
   let currentLeasePayload = null;
@@ -53,25 +64,44 @@
   let progressPollTimer = null;
   let progressRequestInFlight = false;
 
-  document.addEventListener("DOMContentLoaded", () => {
+  document.addEventListener("DOMContentLoaded", async () => {
     collectElements();
     wireEvents();
-    controllerToken = captureTokenFromFragment();
-    if (!controllerToken) {
-      setConnectionState("token-missing", "Token missing");
-      setMutationDisabled(true);
-      return;
+    const bootstrap = captureBootstrapFromFragment();
+    controllerToken = bootstrap.token;
+    pendingPairingCode = bootstrap.pairingCode;
+    if (pendingPairingCode) {
+      elements["pairing-code"].value = pendingPairingCode;
     }
     setConnectionState("connecting", "Connecting");
+    const sessionReady = await initializeSession();
+    if (!sessionReady) {
+      showPairingPanel();
+      return;
+    }
     refreshProfileOptions();
     refreshCurrentState();
+    if ("serviceWorker" in navigator && window.isSecureContext) {
+      navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+    }
   });
 
   function collectElements() {
     for (const id of [
       "connection-status",
+      "pairing-panel",
+      "pairing-code",
+      "device-label",
+      "pair-button",
+      "pairing-status",
+      "remote-device-panel",
+      "refresh-devices-button",
+      "remote-device-status",
+      "remote-device-list",
+      "startup-panel",
       "repository-path",
       "repository-browse-button",
+      "repository-catalog",
       "repository-picker-status",
       "initial-task",
       "default-greeting-button",
@@ -80,10 +110,13 @@
       "chat-title",
       "allow-destination-navigation",
       "sandbox-select",
+      "full-access-button",
       "permission-preset-description",
       "model-select",
       "reasoning-lock",
       "approval-lock",
+      "full-access-confirmation-label",
+      "full-access-confirmation",
       "start-button",
       "startup-status",
       "run-id",
@@ -105,11 +138,6 @@
       "planner-action",
       "planner-reason",
       "actionable-error",
-      "latest-codex-summary",
-      "latest-chatgpt-submission-summary",
-      "latest-chatgpt-capture-summary",
-      "latest-prompt-extraction-summary",
-      "latest-governance-summary",
       "codex-live-state",
       "codex-live-final",
       "codex-live-error",
@@ -123,6 +151,18 @@
       "progress-description",
       "tick-button",
       "tick-status",
+      "failure-panel",
+      "failure-summary",
+      "failure-action",
+      "failure-event-id",
+      "failure-reason",
+      "failure-timestamp",
+      "failure-error",
+      "failure-recovery",
+      "retry-button",
+      "retry-status",
+      "cancel-run-button",
+      "cancel-run-status",
       "lease-state",
       "lease-owner-run",
       "lease-owner-pid",
@@ -139,44 +179,195 @@
       "lease-release-button",
       "lease-release-status",
       "terminal-status",
-      "event-timeline",
     ]) {
       elements[id] = document.getElementById(id);
     }
   }
 
   function wireEvents() {
+    elements["pair-button"].addEventListener("click", onPairDevice);
+    elements["refresh-devices-button"].addEventListener("click", refreshRemoteDevices);
     elements["start-button"].addEventListener("click", onStartRun);
     elements["repository-browse-button"].addEventListener("click", onBrowseRepository);
     elements["repository-path"].addEventListener("input", updateControlState);
+    elements["repository-catalog"].addEventListener("change", () => {
+      if (elements["repository-catalog"].value) {
+        elements["repository-path"].value = elements["repository-catalog"].value;
+      }
+      updateControlState();
+    });
     elements["default-greeting-button"].addEventListener("click", onDefaultGreeting);
     elements["initial-task"].addEventListener("input", updateControlState);
     elements["project-title"].addEventListener("input", updateControlState);
     elements["chat-title"].addEventListener("input", updateControlState);
     elements["sandbox-select"].addEventListener("change", () => {
       updatePermissionPresetDescription();
+      updateFullAccessConfirmation();
       updateControlState();
     });
+    elements["full-access-button"].addEventListener("click", onSelectFullAccess);
     elements["model-select"].addEventListener("change", updateControlState);
+    elements["full-access-confirmation"].addEventListener("input", updateControlState);
     elements["approve-button"].addEventListener("click", () => onApproval("approved"));
     elements["reject-button"].addEventListener("click", () => onApproval("rejected"));
     elements["tick-button"].addEventListener("click", onTick);
+    elements["retry-button"].addEventListener("click", onRetry);
+    elements["cancel-run-button"].addEventListener("click", onCancelRun);
     elements["lease-confirm-stale"].addEventListener("change", updateControlState);
     elements["lease-release-reason"].addEventListener("input", updateControlState);
     elements["lease-allow-owner-pid-alive"].addEventListener("change", updateControlState);
     elements["lease-release-button"].addEventListener("click", onReleaseStaleLease);
   }
 
-  function captureTokenFromFragment() {
+  function captureBootstrapFromFragment() {
     const hash = window.location.hash || "";
     let token = "";
+    let pairingCode = "";
     if (hash.startsWith("#token=") && hash.indexOf("&") === -1) {
       token = hash.slice("#token=".length);
+    } else if (hash.startsWith("#pair=") && hash.indexOf("&") === -1) {
+      pairingCode = hash.slice("#pair=".length);
     }
     if (hash) {
       history.replaceState(null, "", window.location.pathname + window.location.search);
     }
-    return token;
+    return { token, pairingCode };
+  }
+
+  async function initializeSession() {
+    const result = await requestJson("GET", "/api/session", undefined, { suppressAuthFailure: true });
+    if (!result.ok) {
+      authenticated = false;
+      setConnectionState("token-missing", "Pairing required");
+      setMutationDisabled(true);
+      return false;
+    }
+    authenticated = true;
+    remoteMode = result.remote_mode === true;
+    currentPrincipal = result.principal || null;
+    elements["pairing-panel"].classList.add("hidden");
+    elements["startup-panel"].classList.remove("remote-locked");
+    setConnectionState("connected", remoteMode ? "Remote connected" : "Connected");
+    if (remoteMode) {
+      await loadRepositoryCatalog();
+      elements["remote-device-panel"].classList.remove("hidden");
+      await refreshRemoteDevices();
+    }
+    return true;
+  }
+
+  async function onPairDevice() {
+    const code = elements["pairing-code"].value.trim();
+    const deviceLabel = elements["device-label"].value.trim();
+    if (!code || !deviceLabel) {
+      setText(elements["pairing-status"], "Pairing code and device name are required.");
+      return;
+    }
+    elements["pair-button"].disabled = true;
+    setText(elements["pairing-status"], "Pairing...");
+    const result = await requestJson(
+      "POST",
+      "/api/remote/pair",
+      { code, device_label: deviceLabel },
+      { suppressAuthFailure: true },
+    );
+    elements["pair-button"].disabled = false;
+    if (!result.ok) {
+      setText(elements["pairing-status"], safeMessage(result));
+      return;
+    }
+    setText(elements["pairing-status"], "Phone paired.");
+    pollingStopped = false;
+    if (await initializeSession()) {
+      refreshProfileOptions();
+      refreshCurrentState();
+    }
+  }
+
+  function showPairingPanel() {
+    elements["pairing-panel"].classList.remove("hidden");
+    elements["startup-panel"].classList.add("remote-locked");
+  }
+
+  async function getRemoteDevices() {
+    return requestJson("GET", "/api/remote/devices");
+  }
+
+  async function revokeRemoteDevice(deviceId) {
+    return requestJson("POST", "/api/remote/devices/revoke", { device_id: deviceId });
+  }
+
+  async function rotateCurrentRemoteDevice() {
+    return requestJson("POST", "/api/remote/devices/rotate-current", {});
+  }
+
+  async function refreshRemoteDevices() {
+    if (!authenticated || !remoteMode) {
+      return;
+    }
+    setText(elements["remote-device-status"], "Loading...");
+    const result = await getRemoteDevices();
+    if (!result.ok || !Array.isArray(result.devices)) {
+      setText(elements["remote-device-status"], safeMessage(result));
+      return;
+    }
+    renderRemoteDevices(result.devices);
+    setText(elements["remote-device-status"], `${result.devices.length} device records.`);
+  }
+
+  function renderRemoteDevices(devices) {
+    const list = elements["remote-device-list"];
+    list.replaceChildren();
+    for (const device of devices) {
+      const item = document.createElement("li");
+      const details = document.createElement("span");
+      const current = currentPrincipal && currentPrincipal.device_id === device.id;
+      const state = device.active ? "active" : "revoked or expired";
+      setText(details, `${device.label || "Unnamed device"}${current ? " (this device)" : ""} — ${state}`);
+      item.appendChild(details);
+      if (device.active) {
+        const actions = document.createElement("span");
+        actions.className = "device-actions";
+        if (current) {
+          const rotateButton = document.createElement("button");
+          rotateButton.type = "button";
+          rotateButton.className = "secondary";
+          setText(rotateButton, "Rotate credential");
+          rotateButton.addEventListener("click", async () => {
+            rotateButton.disabled = true;
+            const result = await rotateCurrentRemoteDevice();
+            setText(
+              elements["remote-device-status"],
+              result.ok ? "Credential rotated." : safeMessage(result),
+            );
+            rotateButton.disabled = false;
+          });
+          actions.appendChild(rotateButton);
+        }
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "secondary";
+        setText(button, "Revoke");
+        button.addEventListener("click", async () => {
+          if (!window.confirm(`Revoke ${device.label || "this device"}?`)) {
+            return;
+          }
+          button.disabled = true;
+          const result = await revokeRemoteDevice(device.id);
+          setText(elements["remote-device-status"], result.ok ? "Device revoked." : safeMessage(result));
+          if (current && result.ok) {
+            authenticated = false;
+            pollingStopped = true;
+            showPairingPanel();
+            return;
+          }
+          await refreshRemoteDevices();
+        });
+        actions.appendChild(button);
+        item.appendChild(actions);
+      }
+      list.appendChild(item);
+    }
   }
 
   async function getCurrentState() {
@@ -190,6 +381,10 @@
 
   async function getProfileOptions() {
     return requestJson("GET", "/api/execution-profile/options");
+  }
+
+  async function getRepositories(query) {
+    return requestJson("GET", `/api/repositories?query=${encodeURIComponent(query || "")}`);
   }
 
   async function startRun(payload) {
@@ -212,6 +407,16 @@
     return requestJson("POST", "/api/tick", {});
   }
 
+  async function requestRetry(failureEventId) {
+    return requestJson("POST", "/api/runs/current/retry", {
+      failure_event_id: failureEventId,
+    });
+  }
+
+  async function requestCancel() {
+    return requestJson("POST", "/api/runs/current/cancel", {});
+  }
+
   async function getChatGPTUILease() {
     return requestJson("GET", "/api/chatgpt-ui-lease");
   }
@@ -220,13 +425,16 @@
     return requestJson("POST", "/api/chatgpt-ui-lease/release-stale", payload);
   }
 
-  async function requestJson(method, path, payload) {
-    const headers = { "X-Controller-Token": controllerToken };
+  async function requestJson(method, path, payload, requestOptions) {
+    const headers = {};
+    if (controllerToken) {
+      headers["X-Controller-Token"] = controllerToken;
+    }
     const options = {
       method,
       headers,
       cache: "no-store",
-      credentials: "omit",
+      credentials: "same-origin",
     };
     if (payload !== undefined) {
       headers["Content-Type"] = "application/json";
@@ -244,11 +452,13 @@
       };
     }
     const data = await readJsonResponse(response);
-    if (response.status === 401) {
+    if (response.status === 401 && !(requestOptions && requestOptions.suppressAuthFailure)) {
+      authenticated = false;
       pollingStopped = true;
       clearPollTimer();
       setConnectionState("auth-failed", "API authentication failed");
       setMutationDisabled(true);
+      showPairingPanel();
     }
     return {
       ok: response.ok && Boolean(data.ok),
@@ -278,7 +488,7 @@
   }
 
   async function refreshCurrentState() {
-    if (pollingStopped || stateRequestInFlight || !controllerToken) {
+    if (pollingStopped || stateRequestInFlight || !authenticated) {
       return;
     }
     stateRequestInFlight = true;
@@ -311,7 +521,7 @@
   }
 
   async function refreshLeaseStatus() {
-    if (leaseRequestInFlight || !controllerToken) {
+    if (leaseRequestInFlight || !authenticated) {
       return;
     }
     leaseRequestInFlight = true;
@@ -326,7 +536,7 @@
   }
 
   async function refreshProfileOptions() {
-    if (optionsRequestInFlight || !controllerToken) {
+    if (optionsRequestInFlight || !authenticated) {
       return;
     }
     optionsRequestInFlight = true;
@@ -371,7 +581,7 @@
   }
 
   async function onStartRun() {
-    if (startRequestInFlight || !controllerToken) {
+    if (startRequestInFlight || !authenticated) {
       return;
     }
     const repositoryPath = elements["repository-path"].value.trim();
@@ -381,6 +591,7 @@
     const sandbox = elements["sandbox-select"].value;
     const model = elements["model-select"].value;
     const allowDestinationNavigation = Boolean(elements["allow-destination-navigation"].checked);
+    const fullAccessConfirmation = elements["full-access-confirmation"].value.trim();
     if (!repositoryPath) {
       setText(elements["startup-status"], "Repository path is required.");
       return;
@@ -408,6 +619,9 @@
       sandbox,
       model,
       allow_destination_navigation: allowDestinationNavigation,
+      ...(sandbox === "danger-full-access"
+        ? { full_access_confirmation: fullAccessConfirmation }
+        : {}),
     });
     startRequestInFlight = false;
     setText(elements["startup-status"], result.ok ? "Run started." : safeMessage(result));
@@ -417,8 +631,33 @@
     updateControlState();
   }
 
+  function onSelectFullAccess() {
+    const fullAccessAvailable = Array.from(elements["sandbox-select"].options)
+      .some((option) => option.value === "danger-full-access");
+    if (!fullAccessAvailable) {
+      setText(
+        elements["startup-status"],
+        "Remote Full Access requires --allow-remote-full-access on the Mac.",
+      );
+      return;
+    }
+    elements["sandbox-select"].value = "danger-full-access";
+    updatePermissionPresetDescription();
+    updateFullAccessConfirmation();
+    updateControlState();
+    if (remoteMode) {
+      elements["full-access-confirmation"].focus();
+    }
+  }
+
   async function onBrowseRepository() {
-    if (repositoryPickerRequestInFlight || !controllerToken) {
+    if (repositoryPickerRequestInFlight || !authenticated) {
+      return;
+    }
+    if (remoteMode) {
+      await loadRepositoryCatalog();
+      elements["repository-catalog"].classList.remove("hidden");
+      elements["repository-catalog"].focus();
       return;
     }
     repositoryPickerRequestInFlight = true;
@@ -440,8 +679,45 @@
     updateControlState();
   }
 
+  async function loadRepositoryCatalog() {
+    if (!authenticated) {
+      return;
+    }
+    setText(elements["repository-picker-status"], "Loading authorized repositories...");
+    const result = await getRepositories("");
+    if (!result.ok || !Array.isArray(result.repositories)) {
+      setText(elements["repository-picker-status"], safeMessage(result));
+      return;
+    }
+    const currentValue = elements["repository-catalog"].value;
+    elements["repository-catalog"].replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Select an authorized repository";
+    elements["repository-catalog"].appendChild(placeholder);
+    for (const repository of result.repositories) {
+      if (!repository || typeof repository.path !== "string") {
+        continue;
+      }
+      const option = document.createElement("option");
+      option.value = repository.path;
+      option.textContent = repository.name
+        ? `${repository.name} — ${repository.path}`
+        : repository.path;
+      elements["repository-catalog"].appendChild(option);
+    }
+    elements["repository-catalog"].value = currentValue;
+    elements["repository-catalog"].classList.remove("hidden");
+    setText(
+      elements["repository-picker-status"],
+      result.repositories.length
+        ? `${result.repositories.length} authorized repositories available.`
+        : "No authorized repositories found. Configure --repository-root on the Mac.",
+    );
+  }
+
   async function onDefaultGreeting() {
-    if (defaultGreetingRequestInFlight || !controllerToken) {
+    if (defaultGreetingRequestInFlight || !authenticated) {
       return;
     }
     defaultGreetingRequestInFlight = true;
@@ -462,7 +738,7 @@
   }
 
   async function onApproval(decision) {
-    if (approvalRequestInFlight || !controllerToken) {
+    if (approvalRequestInFlight || !authenticated) {
       return;
     }
     approvalRequestInFlight = true;
@@ -478,7 +754,7 @@
   }
 
   async function onTick() {
-    if (tickRequestInFlight || !controllerToken) {
+    if (tickRequestInFlight || !authenticated) {
       return;
     }
     tickRequestInFlight = true;
@@ -493,8 +769,68 @@
     updateControlState();
   }
 
+  async function onRetry() {
+    if (retryRequestInFlight || !authenticated) {
+      return;
+    }
+    const model = currentStatePayload && currentStatePayload.state
+      ? currentStatePayload.state
+      : null;
+    const failure = model && model.latest_failure ? model.latest_failure : null;
+    const failureEventId = failure && Number.isInteger(failure.event_id)
+      ? failure.event_id
+      : 0;
+    if (!failureEventId) {
+      setText(elements["retry-status"], "No current failure is available to retry.");
+      return;
+    }
+    if (failure.retryable !== true) {
+      setText(
+        elements["retry-status"],
+        failure.recovery_message || "This action requires review before it can be retried safely.",
+      );
+      return;
+    }
+
+    retryRequestInFlight = true;
+    updateControlState();
+    setText(elements["retry-status"], "Retrying the failed action...");
+    const result = await requestRetry(failureEventId);
+    retryRequestInFlight = false;
+    setText(
+      elements["retry-status"],
+      result.ok ? "Retry started from the paused action." : safeMessage(result),
+    );
+    if (result.status !== 401) {
+      await forceRefresh();
+    }
+    updateControlState();
+  }
+
+  async function onCancelRun() {
+    if (cancelRequestInFlight || !authenticated) {
+      return;
+    }
+    if (!window.confirm("Stop the current CRAX run and terminate an active Codex process?")) {
+      return;
+    }
+    cancelRequestInFlight = true;
+    updateControlState();
+    setText(elements["cancel-run-status"], "Stopping run...");
+    const result = await requestCancel();
+    cancelRequestInFlight = false;
+    setText(
+      elements["cancel-run-status"],
+      result.ok ? "Stop requested." : safeMessage(result),
+    );
+    if (result.status !== 401) {
+      await forceRefresh();
+    }
+    updateControlState();
+  }
+
   async function onReleaseStaleLease() {
-    if (leaseReleaseRequestInFlight || !controllerToken) {
+    if (leaseReleaseRequestInFlight || !authenticated) {
       return;
     }
     const lease = currentChatGPTUILease();
@@ -585,7 +921,7 @@
   }
 
   function startProgressStream() {
-    if (!controllerToken || !progressRunId || progressStreamController || !window.ReadableStream) {
+    if (!authenticated || !progressRunId || progressStreamController || !window.ReadableStream) {
       return;
     }
     progressStreamController = new AbortController();
@@ -610,9 +946,9 @@
     const cursor = encodeURIComponent(String(afterSequence || 0));
     const response = await fetch(`/api/runs/current/events?after_sequence=${cursor}`, {
       method: "GET",
-      headers: { "X-Controller-Token": controllerToken },
+      headers: controllerToken ? { "X-Controller-Token": controllerToken } : {},
       cache: "no-store",
-      credentials: "omit",
+      credentials: "same-origin",
       signal: controller.signal,
     });
     if (response.status === 401) {
@@ -686,7 +1022,7 @@
   }
 
   async function refreshProgress() {
-    if (!controllerToken || !progressRunId || progressRequestInFlight) {
+    if (!authenticated || !progressRunId || progressRequestInFlight) {
       return;
     }
     progressRequestInFlight = true;
@@ -784,18 +1120,12 @@
     setText(elements["planner-reason"], valueOrNone(model && model.planner_reason_code));
     setText(elements["actionable-error"], valueOrNone(model && model.actionable_error_message));
 
-    setSummary("latest-codex-summary", model && model.latest_codex_result);
-    setSummary("latest-chatgpt-submission-summary", model && model.latest_chatgpt_submission);
-    setSummary("latest-chatgpt-capture-summary", model && model.latest_chatgpt_capture);
-    setSummary("latest-prompt-extraction-summary", model && model.latest_prompt_extraction);
-    setSummary("latest-governance-summary", model && model.latest_governance);
-
     ensureProgressTransport(rawActiveRunId);
     renderCodexLiveProgress(runtime);
     renderApproval(model, runtime);
     renderProgress(model, runtime);
+    renderFailure(model, runtime);
     renderTerminal(model, runtime);
-    renderTimeline(model && Array.isArray(model.event_timeline) ? model.event_timeline : []);
     updateControlState();
   }
 
@@ -1046,11 +1376,15 @@
   }
 
   function renderApproval(model, runtime) {
-    const required = Boolean(model && model.requires_human_approval);
+    const required = Boolean(
+      model &&
+        model.requires_human_approval &&
+        !model.latest_failure,
+    );
     elements["approval-panel"].classList.toggle("hidden", !required);
     const kind = model && model.approval_kind ? model.approval_kind.replaceAll("_", " ") : "approval";
     setText(elements["approval-kind"], required ? `Approval required: ${kind}` : "No approval is pending.");
-    const disabled = !required || runtime.action_running || approvalRequestInFlight || !controllerToken;
+    const disabled = !required || runtime.action_running || approvalRequestInFlight || !authenticated;
     elements["approve-button"].disabled = disabled;
     elements["reject-button"].disabled = disabled;
   }
@@ -1101,6 +1435,7 @@
     const available = Boolean(
       model &&
         model.routine_action_available &&
+        !model.latest_failure &&
         !model.requires_human_approval &&
         !model.terminal &&
         !model.blocked &&
@@ -1108,7 +1443,52 @@
         !runtime.action_running,
     );
     elements["progress-panel"].classList.toggle("hidden", !available);
-    elements["tick-button"].disabled = !available || tickRequestInFlight || !controllerToken;
+    elements["tick-button"].disabled = !available || tickRequestInFlight || !authenticated;
+  }
+
+  function renderFailure(model, runtime) {
+    const failure = model && model.latest_failure && typeof model.latest_failure === "object"
+      ? model.latest_failure
+      : null;
+    elements["failure-panel"].classList.toggle("hidden", !failure);
+    if (!failure) {
+      elements["retry-button"].disabled = true;
+      setText(elements["retry-status"], "");
+      return;
+    }
+
+    const retryable = failure.retryable === true;
+    const classification = valueOrNone(failure.retry_classification);
+    setText(
+      elements["failure-summary"],
+      retryable ? "Paused — ready for manual retry" : "Paused — manual review required",
+    );
+    elements["failure-summary"].className =
+      `status-badge ${retryable ? "status-warn" : "status-bad"}`;
+    setText(elements["failure-action"], valueOrNone(failure.action_key));
+    setText(elements["failure-event-id"], failure.event_id ? `#${failure.event_id}` : "None");
+    setText(
+      elements["failure-reason"],
+      `${valueOrNone(failure.reason_code)} (${classification})`,
+    );
+    setText(elements["failure-timestamp"], valueOrNone(failure.timestamp));
+    setText(
+      elements["failure-error"],
+      valueOrNone(failure.error_message || failure.message),
+    );
+    setText(
+      elements["failure-recovery"],
+      valueOrNone(failure.recovery_message),
+    );
+    elements["retry-button"].disabled =
+      !retryable ||
+      Boolean(runtime.action_running) ||
+      retryRequestInFlight ||
+      !authenticated;
+    setText(
+      elements["retry-button"],
+      retryable ? "Retry failed action" : "Retry unavailable — review required",
+    );
   }
 
   function renderTerminal(model, runtime) {
@@ -1117,69 +1497,67 @@
     elements["terminal-status"].className = `status-badge ${label.className}`;
   }
 
-  function renderTimeline(events) {
-    const list = elements["event-timeline"];
-    list.replaceChildren();
-    for (const event of events) {
-      const item = document.createElement("li");
-      item.className = "timeline-item";
-
-      const meta = document.createElement("div");
-      meta.className = "timeline-meta";
-      appendSpan(meta, `#${valueOrNone(event.event_id)}`);
-      appendSpan(meta, valueOrNone(event.timestamp));
-      appendSpan(meta, valueOrNone(event.event_type));
-
-      const message = document.createElement("p");
-      setText(message, valueOrNone(event.message));
-
-      const preview = document.createElement("pre");
-      setText(preview, boundedJson(event.metadata_preview));
-
-      item.append(meta, message, preview);
-      list.append(item);
-    }
-  }
-
   function updateControlState() {
     const model = currentStatePayload && currentStatePayload.state ? currentStatePayload.state : null;
     const runtime = model && model.controller_runtime ? model.controller_runtime : {};
     const activeRun = Boolean((model && model.run_id) || runtime.active_run_id);
     const running = Boolean(runtime.action_running);
+    const activeRunReplaceable = Boolean(
+      activeRun &&
+      !running &&
+      model &&
+      REPLACEABLE_RUN_STATUSES.has(model.run_status),
+    );
     const optionsUnavailable = optionsRequestInFlight || !profileOptions;
     const invalidSelection = !profileSelectionValid();
+    const fullAccessConfirmationMissing =
+      remoteMode &&
+      elements["sandbox-select"].value === "danger-full-access" &&
+      elements["full-access-confirmation"].value.trim() !== "ENABLE FULL ACCESS";
     const requiredFieldsMissing =
       !elements["repository-path"].value.trim() ||
       !elements["initial-task"].value.trim() ||
       !elements["project-title"].value.trim() ||
       !elements["chat-title"].value.trim();
     const disableInputs =
-      !controllerToken ||
-      activeRun ||
+      !authenticated ||
+      (activeRun && !activeRunReplaceable) ||
       running ||
       startRequestInFlight ||
       repositoryPickerRequestInFlight ||
       defaultGreetingRequestInFlight;
     const disableStart =
-      disableInputs || optionsUnavailable || invalidSelection || requiredFieldsMissing;
+      disableInputs ||
+      optionsUnavailable ||
+      invalidSelection ||
+      requiredFieldsMissing ||
+      fullAccessConfirmationMissing;
     elements["repository-path"].disabled = disableInputs;
     elements["repository-browse-button"].disabled = disableInputs;
+    elements["repository-catalog"].disabled = disableInputs;
     elements["initial-task"].disabled = disableInputs;
     elements["default-greeting-button"].disabled = disableInputs;
     elements["project-title"].disabled = disableInputs;
     elements["chat-title"].disabled = disableInputs;
     elements["allow-destination-navigation"].disabled = disableInputs;
     elements["sandbox-select"].disabled = disableInputs || optionsUnavailable;
+    elements["full-access-button"].disabled = disableInputs || optionsUnavailable;
     elements["model-select"].disabled = disableInputs || optionsUnavailable;
+    elements["full-access-confirmation"].disabled = disableInputs;
     elements["start-button"].disabled = disableStart;
+    elements["cancel-run-button"].disabled =
+      !authenticated || !activeRun || cancelRequestInFlight || Boolean(model && model.terminal);
 
     if (model) {
       renderApproval(model, runtime);
       renderProgress(model, runtime);
+      renderFailure(model, runtime);
     } else {
       elements["approve-button"].disabled = true;
       elements["reject-button"].disabled = true;
       elements["tick-button"].disabled = true;
+      elements["retry-button"].disabled = true;
+      elements["cancel-run-button"].disabled = true;
     }
     updateLeaseControlState();
   }
@@ -1195,7 +1573,7 @@
     const releaseAllowed = Boolean(
       active && (lease.release_allowed || (ownerPidAlive && overrideSelected && ownerRunRecoverable)),
     );
-    const disabledBase = !controllerToken || leaseReleaseRequestInFlight || !active;
+    const disabledBase = !authenticated || leaseReleaseRequestInFlight || !active;
     const missingConfirmation = !elements["lease-confirm-stale"].checked;
     const missingReason = !elements["lease-release-reason"].value.trim();
 
@@ -1213,17 +1591,22 @@
     for (const id of [
       "repository-path",
       "repository-browse-button",
+      "repository-catalog",
       "initial-task",
       "default-greeting-button",
       "project-title",
       "chat-title",
       "allow-destination-navigation",
       "sandbox-select",
+      "full-access-button",
       "model-select",
+      "full-access-confirmation",
       "start-button",
       "approve-button",
       "reject-button",
       "tick-button",
+      "retry-button",
+      "cancel-run-button",
       "lease-confirm-stale",
       "lease-release-reason",
       "lease-allow-owner-pid-alive",
@@ -1231,10 +1614,6 @@
     ]) {
       elements[id].disabled = disabled;
     }
-  }
-
-  function setSummary(id, value) {
-    setText(elements[id], value ? boundedJson(value) : "None");
   }
 
   function renderDestinationBinding(model) {
@@ -1300,6 +1679,11 @@
       optionLabel(locked.approval_policy, "Codex default — Full Access bypasses approvals"),
     );
     updatePermissionPresetDescription();
+    updateFullAccessConfirmation();
+    const fullAccessAvailable = sandboxOptions.some(
+      (option) => option.value === "danger-full-access",
+    );
+    elements["full-access-button"].classList.toggle("hidden", !fullAccessAvailable);
   }
 
   function replaceOptions(select, options, preferredValue) {
@@ -1348,6 +1732,15 @@
     setText(elements["permission-preset-description"], optionDescription(selected, fallback));
   }
 
+  function updateFullAccessConfirmation() {
+    const visible = remoteMode && elements["sandbox-select"].value === "danger-full-access";
+    elements["full-access-confirmation-label"].classList.toggle("hidden", !visible);
+    elements["full-access-confirmation"].classList.toggle("hidden", !visible);
+    if (!visible) {
+      elements["full-access-confirmation"].value = "";
+    }
+  }
+
   function permissionPresetSummary(value) {
     if (!value) {
       return "None";
@@ -1378,14 +1771,6 @@
     return String(value).replace(/"/g, '\\"');
   }
 
-  function boundedJson(value) {
-    const text = JSON.stringify(value === undefined ? null : value, null, 2);
-    if (text.length <= TEXT_LIMIT) {
-      return text;
-    }
-    return `${text.slice(0, TEXT_LIMIT)}...`;
-  }
-
   function safeMessage(result) {
     const reason = result && result.reason_code ? result.reason_code : "request_failed";
     const message = result && result.error_message ? result.error_message : "Request failed.";
@@ -1395,6 +1780,9 @@
   function terminalLabel(model, runtime) {
     if (runtime.action_running) {
       return { text: "Action currently running", className: "status-warn" };
+    }
+    if (runtime.controller_state === "waiting_for_retry") {
+      return { text: "Paused — waiting for manual retry", className: "status-warn" };
     }
     if (model && model.requires_human_approval) {
       return { text: "Waiting for approval", className: "status-warn" };
@@ -1433,12 +1821,6 @@
       className = "status-badge status-warn";
     }
     elements["connection-status"].className = className;
-  }
-
-  function appendSpan(parent, text) {
-    const span = document.createElement("span");
-    setText(span, text);
-    parent.append(span);
   }
 
   function valueOrNone(value) {

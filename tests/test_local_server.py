@@ -33,6 +33,8 @@ class FakeController:
         self.state_calls = 0
         self.approval_calls: list[str] = []
         self.tick_calls = 0
+        self.retry_calls: list[int] = []
+        self.cancel_calls = 0
         self.lease_status_calls = 0
         self.lease_release_calls: list[dict] = []
         self.progress_calls: list[dict] = []
@@ -40,6 +42,8 @@ class FakeController:
         self.state_result = self._result(ok=False, reason="no_active_run")
         self.approval_result = self._result(ok=True, reason="approval_worker_started", run_id="run-1")
         self.tick_result = self._result(ok=True, reason="routine_worker_started", run_id="run-1")
+        self.retry_result = self._result(ok=True, reason="retry_worker_started", run_id="run-1")
+        self.cancel_result = self._result(ok=True, reason="cancel_requested", run_id="run-1")
         self.progress_result = self._result(
             ok=True,
             reason="progress_loaded",
@@ -120,6 +124,14 @@ class FakeController:
     def request_automatic_progress(self):
         self.tick_calls += 1
         return self.tick_result
+
+    def retry_failed_action(self, failure_event_id: int):
+        self.retry_calls.append(failure_event_id)
+        return self.retry_result
+
+    def request_cancel(self):
+        self.cancel_calls += 1
+        return self.cancel_result
 
     def get_current_progress(self, *, after_sequence: int = 0, limit: int = 100):
         self.progress_calls.append({"after_sequence": after_sequence, "limit": limit})
@@ -260,6 +272,7 @@ class LocalServerAuthHostAndHeaderTests(LocalServerHTTPTestCase):
             ("POST", "/api/repository/pick"),
             ("POST", "/api/approval"),
             ("POST", "/api/tick"),
+            ("POST", "/api/runs/current/retry"),
             ("POST", "/api/chatgpt-ui-lease/release-stale"),
         ):
             with self.subTest(path=path):
@@ -317,6 +330,8 @@ class LocalServerAuthHostAndHeaderTests(LocalServerHTTPTestCase):
         self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(headers["Referrer-Policy"], "no-referrer")
+        self.assertIn("default-src 'self'", headers["Content-Security-Policy"])
 
 
 class LocalServerEndpointTests(LocalServerHTTPTestCase):
@@ -660,6 +675,50 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["reason_code"], "unexpected_request_fields")
 
+    def test_manual_retry_route(self) -> None:
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/retry",
+            body={"failure_event_id": 42},
+            token=self.token,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["reason_code"], "retry_worker_started")
+        self.assertEqual(self.controller.retry_calls, [42])
+
+        for invalid in (0, -1, True, "42", None):
+            with self.subTest(invalid=invalid):
+                status, _headers, payload = self.request(
+                    "POST",
+                    "/api/runs/current/retry",
+                    body={"failure_event_id": invalid},
+                    token=self.token,
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["reason_code"], "invalid_failure_event_id")
+
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/retry",
+            body={"failure_event_id": 42, "extra": True},
+            token=self.token,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["reason_code"], "unexpected_request_fields")
+
+        self.controller.retry_result = self.controller._result(
+            ok=False,
+            reason="failure_requires_reconciliation",
+            error="review first",
+        )
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/retry",
+            body={"failure_event_id": 42},
+            token=self.token,
+        )
+        self.assertEqual(status, 409)
+
     def test_chatgpt_ui_lease_status_route_returns_sanitized_metadata(self) -> None:
         self.controller.lease_status_result = self.controller._result(
             ok=True,
@@ -782,6 +841,18 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["Content-Type"], "application/javascript; charset=utf-8")
 
+        status, headers, raw = self.request_raw("GET", "/manifest.webmanifest")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/manifest+json; charset=utf-8")
+
+        status, headers, raw = self.request_raw("GET", "/service-worker.js")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/javascript; charset=utf-8")
+
+        status, headers, raw = self.request_raw("GET", "/assets/icon.svg")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "image/svg+xml")
+
         status, _headers, payload = self.request("GET", "/api/missing", token=self.token)
         self.assertEqual(status, 404)
         self.assertEqual(payload["reason_code"], "route_not_found")
@@ -805,6 +876,12 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
             self.request("POST", "/api/runs/start", body=_start_body(), token=self.token)
             self.request("POST", "/api/approval", body={"decision": "approved"}, token=self.token)
             self.request("POST", "/api/tick", body={}, token=self.token)
+            self.request(
+                "POST",
+                "/api/runs/current/retry",
+                body={"failure_event_id": 42},
+                token=self.token,
+            )
             self.request("GET", "/api/chatgpt-ui-lease", token=self.token)
             self.request(
                 "POST",

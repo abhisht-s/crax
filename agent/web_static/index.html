@@ -3,23 +3,50 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Agent Loop Local Controller</title>
+    <meta name="theme-color" content="#181818">
+    <title>Agent Controller</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/style.css">
     <script src="/assets/app.js" defer></script>
   </head>
   <body>
     <header class="app-header">
       <div>
-        <h1>Agent Loop Local Controller</h1>
-        <p class="subtitle">Local run dashboard</p>
+        <h1>Agent Controller</h1>
       </div>
-      <section class="connection-panel" aria-labelledby="connection-heading">
-        <h2 id="connection-heading">Connection</h2>
-        <p id="connection-status" class="status-badge status-muted" aria-live="polite">Connecting</p>
+      <section class="connection-panel" aria-label="Controller connection">
+        <p class="connection-label">Controller connection</p>
+        <p id="connection-status" class="status-badge connection-status status-muted" aria-live="polite">Connecting</p>
       </section>
     </header>
 
     <main class="layout">
+      <section id="pairing-panel" class="panel pairing-panel hidden" aria-labelledby="pairing-heading">
+        <h2 id="pairing-heading">Pair this phone</h2>
+        <p>Enter the one-time code shown by CRAX on your Mac. The paired credential stays in a secure browser cookie.</p>
+        <div class="form-grid">
+          <label for="pairing-code">Pairing code</label>
+          <input id="pairing-code" name="pairing_code" type="text" autocomplete="one-time-code" autocapitalize="none">
+          <label for="device-label">Device name</label>
+          <input id="device-label" name="device_label" type="text" value="My phone" autocomplete="off">
+        </div>
+        <div class="action-row">
+          <button id="pair-button" type="button">Pair phone</button>
+          <span id="pairing-status" class="inline-status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section id="remote-device-panel" class="panel hidden" aria-labelledby="remote-device-heading">
+        <h2 id="remote-device-heading">Paired devices</h2>
+        <p class="form-note">Revoke a phone immediately if it is lost or should no longer control CRAX.</p>
+        <div class="action-row">
+          <button id="refresh-devices-button" type="button" class="secondary">Refresh devices</button>
+          <span id="remote-device-status" class="inline-status" aria-live="polite"></span>
+        </div>
+        <ul id="remote-device-list" class="device-list"></ul>
+      </section>
+
       <section id="startup-panel" class="panel" aria-labelledby="startup-heading">
         <h2 id="startup-heading">Start Run</h2>
         <div class="form-grid">
@@ -29,6 +56,9 @@
               <input id="repository-path" name="repository_path" type="text" autocomplete="off">
               <button id="repository-browse-button" type="button" class="secondary">Browse...</button>
             </div>
+            <select id="repository-catalog" class="hidden" aria-label="Authorized repositories">
+              <option value="">Select an authorized repository</option>
+            </select>
             <p id="repository-picker-status" class="form-note" aria-live="polite"></p>
           </div>
 
@@ -61,6 +91,7 @@
             <select id="sandbox-select" name="sandbox" aria-describedby="permission-preset-description">
               <option value="">Loading...</option>
             </select>
+            <button id="full-access-button" type="button" class="danger hidden">Use Full Access</button>
             <p id="permission-preset-description" class="form-note">Codex can inspect the workspace. Edits are not allowed for this dashboard run.</p>
           </div>
 
@@ -74,6 +105,9 @@
 
           <span>Approval</span>
           <span id="approval-lock" class="locked-value">Codex default — Full Access bypasses approvals</span>
+
+          <label for="full-access-confirmation" id="full-access-confirmation-label" class="hidden">Full Access confirmation</label>
+          <input id="full-access-confirmation" class="hidden" name="full_access_confirmation" type="text" autocomplete="off" placeholder="Type ENABLE FULL ACCESS">
         </div>
         <div class="action-row">
           <button id="start-button" type="button">Start run</button>
@@ -81,87 +115,85 @@
         </div>
       </section>
 
-      <section id="active-run-panel" class="panel" aria-labelledby="active-run-heading">
-        <h2 id="active-run-heading">Current Run</h2>
-        <dl class="summary-grid">
-          <div><dt>Run ID</dt><dd id="run-id">None</dd></div>
-          <div><dt>Repository</dt><dd id="run-repository">None</dd></div>
-          <div><dt>Bound Project</dt><dd id="run-project-title">None</dd></div>
-          <div><dt>Bound Chat</dt><dd id="run-chat-title">None</dd></div>
-          <div><dt>Destination binding</dt><dd id="run-destination-state">No autonomous destination binding</dd></div>
-          <div><dt>Navigation approved</dt><dd id="run-navigation-approved">Disabled</dd></div>
-          <div><dt>Handoff phase</dt><dd id="run-handoff-phase">None</dd></div>
-          <div><dt>Permission preset / sandbox</dt><dd id="run-sandbox">None</dd></div>
-          <div><dt>Model</dt><dd id="run-model">None</dd></div>
-          <div><dt>Reasoning</dt><dd id="run-reasoning">None</dd></div>
-          <div><dt>Approval</dt><dd id="run-approval">None</dd></div>
-          <div><dt>Profile source</dt><dd id="run-profile-source">None</dd></div>
-          <div><dt>Run status</dt><dd id="run-status">None</dd></div>
-          <div><dt>Controller</dt><dd id="controller-state">idle</dd></div>
-          <div><dt>Action</dt><dd id="action-running">Not running</dd></div>
-          <div><dt>Stage</dt><dd id="current-stage">Idle</dd></div>
-          <div><dt>Planner action</dt><dd id="planner-action">None</dd></div>
-          <div><dt>Planner reason</dt><dd id="planner-reason">None</dd></div>
-          <div><dt>Actionable error</dt><dd id="actionable-error">None</dd></div>
-        </dl>
+      <section id="active-run-panel" class="panel disclosure-panel" aria-labelledby="active-run-heading">
+        <details>
+          <summary>
+            <span>
+              <span id="active-run-heading" class="disclosure-title">Current run</span>
+              <span class="disclosure-hint">Run details and controls</span>
+            </span>
+            <span id="terminal-status" class="status-badge status-muted">Idle</span>
+          </summary>
+          <div class="disclosure-content">
+            <dl class="summary-grid">
+              <div><dt>Run ID</dt><dd id="run-id">None</dd></div>
+              <div><dt>Repository</dt><dd id="run-repository">None</dd></div>
+              <div><dt>Bound Project</dt><dd id="run-project-title">None</dd></div>
+              <div><dt>Bound Chat</dt><dd id="run-chat-title">None</dd></div>
+              <div><dt>Destination binding</dt><dd id="run-destination-state">No autonomous destination binding</dd></div>
+              <div><dt>Navigation approved</dt><dd id="run-navigation-approved">Disabled</dd></div>
+              <div><dt>Handoff phase</dt><dd id="run-handoff-phase">None</dd></div>
+              <div><dt>Permission preset / sandbox</dt><dd id="run-sandbox">None</dd></div>
+              <div><dt>Model</dt><dd id="run-model">None</dd></div>
+              <div><dt>Reasoning</dt><dd id="run-reasoning">None</dd></div>
+              <div><dt>Approval</dt><dd id="run-approval">None</dd></div>
+              <div><dt>Profile source</dt><dd id="run-profile-source">None</dd></div>
+              <div><dt>Run status</dt><dd id="run-status">None</dd></div>
+              <div><dt>Controller</dt><dd id="controller-state">idle</dd></div>
+              <div><dt>Action</dt><dd id="action-running">Not running</dd></div>
+              <div><dt>Stage</dt><dd id="current-stage">Idle</dd></div>
+              <div><dt>Planner action</dt><dd id="planner-action">None</dd></div>
+              <div><dt>Planner reason</dt><dd id="planner-reason">None</dd></div>
+              <div><dt>Actionable error</dt><dd id="actionable-error">None</dd></div>
+            </dl>
+            <div class="action-row">
+              <button id="cancel-run-button" type="button" class="danger">Emergency stop</button>
+              <span id="cancel-run-status" class="inline-status" aria-live="polite"></span>
+            </div>
+            <p class="form-note">Stops controller progression and terminates an active Codex process.</p>
+          </div>
+        </details>
       </section>
 
-      <section id="chatgpt-ui-lease-panel" class="panel" aria-labelledby="chatgpt-ui-lease-heading">
-        <h2 id="chatgpt-ui-lease-heading">ChatGPT UI lease</h2>
-        <p id="lease-state" class="status-badge status-muted" aria-live="polite">Loading</p>
-        <dl class="summary-grid lease-grid">
-          <div><dt>Owner run</dt><dd id="lease-owner-run">None</dd></div>
-          <div><dt>Owner PID</dt><dd id="lease-owner-pid">None</dd></div>
-          <div><dt>Acquired at</dt><dd id="lease-acquired-at">None</dd></div>
-          <div><dt>Acquire event</dt><dd id="lease-active-event-id">None</dd></div>
-          <div><dt>Token SHA-256</dt><dd id="lease-token-sha256">None</dd></div>
-          <div><dt>Owner run status</dt><dd id="lease-owner-run-status">None</dd></div>
-          <div><dt>PID state</dt><dd id="lease-owner-pid-state">Unknown</dd></div>
-          <div><dt>Release allowed</dt><dd id="lease-release-allowed">No</dd></div>
-          <div><dt>Latest denial</dt><dd id="lease-latest-denial">None</dd></div>
-        </dl>
-        <div class="lease-controls">
-          <label class="checkbox-cell" for="lease-confirm-stale">
-            <input id="lease-confirm-stale" name="lease_confirm_stale" type="checkbox">
-            <span>Confirm this lease is stale</span>
-          </label>
-          <label for="lease-release-reason">Reason</label>
-          <input id="lease-release-reason" name="lease_release_reason" type="text" autocomplete="off">
-          <label class="checkbox-cell" for="lease-allow-owner-pid-alive">
-            <input id="lease-allow-owner-pid-alive" name="lease_allow_owner_pid_alive" type="checkbox">
-            <span>PID-reuse override for an owner PID that appears alive</span>
-          </label>
-        </div>
-        <div class="action-row">
-          <button id="lease-release-button" type="button">Release stale ChatGPT UI lease</button>
-          <span id="lease-release-status" class="inline-status" aria-live="polite"></span>
-        </div>
-      </section>
-
-      <section id="latest-summaries-panel" class="panel" aria-labelledby="summaries-heading">
-        <h2 id="summaries-heading">Latest Summaries</h2>
-        <div class="summary-list">
-          <section>
-            <h3>Codex</h3>
-            <pre id="latest-codex-summary"></pre>
-          </section>
-          <section>
-            <h3>ChatGPT submission</h3>
-            <pre id="latest-chatgpt-submission-summary"></pre>
-          </section>
-          <section>
-            <h3>ChatGPT capture</h3>
-            <pre id="latest-chatgpt-capture-summary"></pre>
-          </section>
-          <section>
-            <h3>Prompt extraction</h3>
-            <pre id="latest-prompt-extraction-summary"></pre>
-          </section>
-          <section>
-            <h3>Governance</h3>
-            <pre id="latest-governance-summary"></pre>
-          </section>
-        </div>
+      <section id="chatgpt-ui-lease-panel" class="panel disclosure-panel" aria-labelledby="chatgpt-ui-lease-heading">
+        <details>
+          <summary>
+            <span>
+              <span id="chatgpt-ui-lease-heading" class="disclosure-title">ChatGPT UI lease</span>
+              <span class="disclosure-hint">Lease details and recovery</span>
+            </span>
+            <span id="lease-state" class="status-badge status-muted" aria-live="polite">Loading</span>
+          </summary>
+          <div class="disclosure-content">
+            <dl class="summary-grid lease-grid">
+              <div><dt>Owner run</dt><dd id="lease-owner-run">None</dd></div>
+              <div><dt>Owner PID</dt><dd id="lease-owner-pid">None</dd></div>
+              <div><dt>Acquired at</dt><dd id="lease-acquired-at">None</dd></div>
+              <div><dt>Acquire event</dt><dd id="lease-active-event-id">None</dd></div>
+              <div><dt>Token SHA-256</dt><dd id="lease-token-sha256">None</dd></div>
+              <div><dt>Owner run status</dt><dd id="lease-owner-run-status">None</dd></div>
+              <div><dt>PID state</dt><dd id="lease-owner-pid-state">Unknown</dd></div>
+              <div><dt>Release allowed</dt><dd id="lease-release-allowed">No</dd></div>
+              <div><dt>Latest denial</dt><dd id="lease-latest-denial">None</dd></div>
+            </dl>
+            <div class="lease-controls">
+              <label class="checkbox-cell" for="lease-confirm-stale">
+                <input id="lease-confirm-stale" name="lease_confirm_stale" type="checkbox">
+                <span>Confirm this lease is stale</span>
+              </label>
+              <label for="lease-release-reason">Reason</label>
+              <input id="lease-release-reason" name="lease_release_reason" type="text" autocomplete="off">
+              <label class="checkbox-cell" for="lease-allow-owner-pid-alive">
+                <input id="lease-allow-owner-pid-alive" name="lease_allow_owner_pid_alive" type="checkbox">
+                <span>PID-reuse override for an owner PID that appears alive</span>
+              </label>
+            </div>
+            <div class="action-row">
+              <button id="lease-release-button" type="button">Release stale ChatGPT UI lease</button>
+              <span id="lease-release-status" class="inline-status" aria-live="polite"></span>
+            </div>
+          </div>
+        </details>
       </section>
 
       <section id="codex-live-panel" class="panel" aria-labelledby="codex-live-heading">
@@ -193,18 +225,25 @@
         </div>
       </section>
 
-      <section id="terminal-panel" class="panel" aria-labelledby="terminal-heading">
-        <h2 id="terminal-heading">Run State</h2>
-        <p id="terminal-status" class="status-badge status-muted">Idle</p>
+      <section id="failure-panel" class="panel failure-panel hidden" aria-labelledby="failure-heading">
+        <h2 id="failure-heading">Action Paused</h2>
+        <p id="failure-summary" class="status-badge status-bad" aria-live="polite">An action failed.</p>
+        <dl class="summary-grid failure-grid">
+          <div><dt>Failed action</dt><dd id="failure-action">None</dd></div>
+          <div><dt>Failure event</dt><dd id="failure-event-id">None</dd></div>
+          <div><dt>Reason code</dt><dd id="failure-reason">None</dd></div>
+          <div><dt>Occurred at</dt><dd id="failure-timestamp">None</dd></div>
+        </dl>
+        <h3>What went wrong</h3>
+        <p id="failure-error" class="failure-message">No failure is active.</p>
+        <h3>Before retrying</h3>
+        <p id="failure-recovery" class="failure-recovery">Remove the blocker reported above.</p>
+        <div class="action-row">
+          <button id="retry-button" type="button">Retry failed action</button>
+          <span id="retry-status" class="inline-status" aria-live="polite"></span>
+        </div>
       </section>
 
-      <section id="event-timeline-panel" class="panel wide" aria-labelledby="timeline-heading">
-        <h2 id="timeline-heading">Diagnostics</h2>
-        <details id="event-timeline-details">
-          <summary>Raw event timeline</summary>
-          <ol id="event-timeline" class="timeline"></ol>
-        </details>
-      </section>
     </main>
   </body>
 </html>

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import ledger as default_ledger
+from agent.codex_terminal import terminate_codex_run
 from agent.initial_codex_run_services import execute_initial_direct_codex_run_service
 from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
@@ -51,6 +52,7 @@ LOCAL_CONTROLLER_STATE_IDLE = "idle"
 LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX = "starting_initial_codex"
 LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION = "running_routine_action"
 LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL = "waiting_for_approval"
+LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY = "waiting_for_retry"
 LOCAL_CONTROLLER_STATE_BLOCKED = "blocked"
 LOCAL_CONTROLLER_STATE_FAILED = "failed"
 LOCAL_CONTROLLER_STATE_COMPLETED = "completed"
@@ -60,6 +62,16 @@ LOCAL_CONTROLLER_TERMINAL_STATES = (
     LOCAL_CONTROLLER_STATE_COMPLETED,
 )
 LOCAL_CONTROLLER_INITIAL_CODEX_TIMEOUT_SECONDS: float | None = None
+LOCAL_CONTROLLER_ACTION_FAILED_EVENT_TYPE = "local_controller_action_failed"
+LOCAL_CONTROLLER_ACTION_FAILED_MESSAGE = "Controller action paused after failure."
+LOCAL_CONTROLLER_RETRY_REQUESTED_EVENT_TYPE = "local_controller_retry_requested"
+LOCAL_CONTROLLER_RETRY_REQUESTED_MESSAGE = "Manual retry requested for failed controller action."
+LOCAL_CONTROLLER_FAILURE_RESOLVED_EVENT_TYPE = "local_controller_failure_resolved"
+LOCAL_CONTROLLER_FAILURE_RESOLVED_MESSAGE = "Failed controller action succeeded after manual retry."
+LOCAL_CONTROLLER_RETRY_STATUS_RESTORED_EVENT_TYPE = "local_controller_retry_status_restored"
+LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION = 1
+LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE = "local_controller_cancel_requested"
+LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE = "Operator requested cancellation."
 
 EVENT_METADATA_PREVIEW_LIMIT = 1200
 TEXT_METADATA_PREVIEW_LIMIT = 240
@@ -170,6 +182,7 @@ class LocalControllerReadModel:
     event_timeline: list[LocalControllerEventTimelineRow]
     controller_runtime: dict[str, Any]
     configuration_complete: bool
+    latest_failure: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +210,21 @@ class LocalControllerOperationResult:
     controller_state: str | None = None
     read_model: LocalControllerReadModel | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ControllerFailureResult:
+    ok: bool
+    reason_code: str
+    error_message: str
+    retryable_override: bool | None = None
+    action_executed: bool = False
+    blocked: bool = True
+    planner_action: str | None = None
+    planner_reason_code: str | None = None
+    next_state_hint: str = "waiting_for_retry"
+    run_status: str | None = None
+    planner_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def default_initial_run_executor(
@@ -232,6 +260,7 @@ class LocalController:
         supervision_step: Callable[..., Any] = run_supervision_step_service,
         initial_run_executor: Callable[..., Any] | None = None,
     ) -> None:
+        restore_persisted_session = session is None
         self.session = session or LocalControllerSession()
         self.ledger = ledger
         self.read_model_builder = read_model_builder or build_local_controller_read_model
@@ -240,6 +269,7 @@ class LocalController:
             lambda **kwargs: default_initial_run_executor(**kwargs, ledger=self.ledger)
         )
         self._lock = threading.Lock()
+        self.cancel_requested = threading.Event()
         self.action_running = False
         self.current_worker: threading.Thread | None = None
         self.current_action_kind: str | None = None
@@ -248,6 +278,8 @@ class LocalController:
         self.last_exception_summary: dict[str, Any] | None = None
         self.automatic_burst_count = 0
         self.automatic_burst_reason: str | None = None
+        if restore_persisted_session:
+            self._restore_persisted_session()
 
     @property
     def controller_state(self) -> str:
@@ -285,13 +317,34 @@ class LocalController:
 
         with self._lock:
             if self.session.active_run_id is not None:
-                return LocalControllerOperationResult(
-                    ok=False,
-                    reason_code="active_run_exists",
-                    error_message="A local controller run is already active.",
-                    run_id=self.session.active_run_id,
-                    controller_state=self.session.controller_state,
+                active_run_id = self.session.active_run_id
+                active_run = self.ledger.get_run(active_run_id)
+                active_status = (
+                    str(active_run.get("status") or "")
+                    if isinstance(active_run, dict)
+                    else ""
                 )
+                if (
+                    self.action_running
+                    or active_status
+                    not in {
+                        RunStatus.COMPLETED.value,
+                        RunStatus.FAILED.value,
+                        RunStatus.NEEDS_REVIEW.value,
+                        RunStatus.REJECTED.value,
+                    }
+                ):
+                    return LocalControllerOperationResult(
+                        ok=False,
+                        reason_code="active_run_exists",
+                        error_message="A local controller run is already active.",
+                        run_id=active_run_id,
+                        controller_state=self.session.controller_state,
+                    )
+                self.session.active_run_id = None
+                self.session.pending_approval = None
+                self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+                self._persist_session_locked()
 
             start_result = start_local_controller_run(
                 self.session,
@@ -311,6 +364,7 @@ class LocalController:
                 raise ValueError("start_local_controller_run returned no run_id")
             self.session.controller_state = LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX
             self.session.pending_approval = None
+            self.cancel_requested.clear()
             self._mark_action_running_locked("initial_codex")
             self.last_exception_summary = None
             self.last_action_result_summary = {
@@ -326,6 +380,7 @@ class LocalController:
                 None,
             )
             self.current_worker = worker
+            self._persist_session_locked()
             worker.start()
 
         return LocalControllerOperationResult(
@@ -410,6 +465,14 @@ class LocalController:
                     run_id=run_id,
                     controller_state=self.session.controller_state,
                 )
+            if self.session.controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="manual_retry_required",
+                    error_message="The last failed action is paused for an explicit manual retry.",
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                )
             if self.session.controller_state in LOCAL_CONTROLLER_TERMINAL_STATES:
                 return LocalControllerOperationResult(
                     ok=False,
@@ -473,6 +536,212 @@ class LocalController:
             controller_state=self.session.controller_state,
             read_model=self.get_current_state(run_id).read_model,
         )
+
+    def request_cancel(self) -> LocalControllerOperationResult:
+        with self._lock:
+            run_id = self.session.active_run_id
+            if run_id is None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="no_active_run",
+                    error_message="No active run is available.",
+                    controller_state=self.session.controller_state,
+                )
+            self.cancel_requested.set()
+            self.session.pending_approval = None
+            self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            self.automatic_burst_reason = "operator_cancelled"
+            self._persist_session_locked()
+
+        termination = terminate_codex_run(run_id)
+        self.ledger.add_event(
+            run_id,
+            LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE,
+            LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE,
+            {
+                "source": LOCAL_CONTROLLER_SOURCE,
+                "controller_mode": LOCAL_CONTROLLER_MODE,
+                "process_termination": termination,
+            },
+        )
+        try:
+            self.ledger.update_run_status(
+                run_id,
+                RunStatus.FAILED,
+                error="Run cancelled by operator.",
+            )
+        except (AttributeError, TypeError):
+            pass
+        return LocalControllerOperationResult(
+            ok=True,
+            reason_code="cancel_requested",
+            run_id=run_id,
+            controller_state=LOCAL_CONTROLLER_STATE_BLOCKED,
+            read_model=self.get_current_state(run_id).read_model,
+            metadata={"process_termination": termination},
+        )
+
+    def retry_failed_action(self, failure_event_id: int) -> LocalControllerOperationResult:
+        if isinstance(failure_event_id, bool) or not isinstance(failure_event_id, int) or failure_event_id <= 0:
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="invalid_failure_event_id",
+                error_message="failure_event_id must be a positive integer.",
+                controller_state=self.session.controller_state,
+            )
+
+        with self._lock:
+            run_id = self.session.active_run_id
+            if run_id is None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="no_active_run",
+                    error_message="No active run is available.",
+                    controller_state=self.session.controller_state,
+                )
+            if self.action_running:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="action_already_running",
+                    error_message="A controller action is already running.",
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                )
+            failure = _latest_unresolved_action_failure(
+                self.ledger.list_events(run_id),
+            )
+            if failure is None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="no_retryable_failure",
+                    error_message="No unresolved controller action failure is available.",
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                )
+            if failure["event_id"] != failure_event_id:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="stale_failure_retry",
+                    error_message="The requested failure is no longer the latest unresolved failure.",
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                    metadata={"latest_failure": failure},
+                )
+            if failure.get("retryable") is not True:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="failure_requires_reconciliation",
+                    error_message=str(
+                        failure.get("recovery_message")
+                        or "This failure cannot be retried safely without review."
+                    ),
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                    metadata={"latest_failure": failure},
+                )
+
+            restore_failure = self._restore_retryable_run_status(run_id, failure)
+            if restore_failure is not None:
+                return restore_failure
+
+            self.ledger.add_event(
+                run_id,
+                LOCAL_CONTROLLER_RETRY_REQUESTED_EVENT_TYPE,
+                LOCAL_CONTROLLER_RETRY_REQUESTED_MESSAGE,
+                {
+                    "schema_version": LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION,
+                    "failure_event_id": failure_event_id,
+                    "action_key": failure.get("action_key"),
+                    "reason_code": failure.get("reason_code"),
+                    "requested_at": datetime.now(UTC).isoformat(),
+                    "source": "local_dashboard",
+                },
+            )
+
+            self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            self.session.pending_approval = None
+            self._mark_action_running_locked(f"retry:{failure.get('action_key') or 'failed_action'}")
+            worker = self._new_worker(
+                self._retry_worker,
+                run_id,
+                failure_event_id,
+                failure,
+            )
+            self.current_worker = worker
+            worker.start()
+
+        return LocalControllerOperationResult(
+            ok=True,
+            reason_code="retry_worker_started",
+            run_id=run_id,
+            controller_state=self.session.controller_state,
+            metadata={
+                "failure_event_id": failure_event_id,
+                "action_key": failure.get("action_key"),
+            },
+        )
+
+    def _restore_retryable_run_status(
+        self,
+        run_id: str,
+        failure: dict[str, Any],
+    ) -> LocalControllerOperationResult | None:
+        run = self.ledger.get_run(run_id)
+        if not isinstance(run, dict):
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="run_not_found",
+                error_message=f"Run not found: {run_id}",
+                run_id=run_id,
+                controller_state=self.session.controller_state,
+            )
+        current_status = str(run.get("status") or "")
+        previous_status = str(failure.get("run_status_before_action") or "")
+        failure_status = str(failure.get("run_status_after_action") or "")
+        if current_status != RunStatus.NEEDS_REVIEW.value:
+            return None
+        if (
+            failure_status != RunStatus.NEEDS_REVIEW.value
+            or previous_status not in {RunStatus.COMPLETED.value, RunStatus.APPROVED.value}
+        ):
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="retry_status_restore_unsafe",
+                error_message=(
+                    "The current needs_review status cannot be tied safely to "
+                    "this failed action, so it was not changed."
+                ),
+                run_id=run_id,
+                controller_state=self.session.controller_state,
+                metadata={"latest_failure": failure},
+            )
+        update_status = getattr(self.ledger, "update_run_status", None)
+        if not callable(update_status):
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="retry_status_restore_unavailable",
+                error_message="Run status restoration is unavailable.",
+                run_id=run_id,
+                controller_state=self.session.controller_state,
+            )
+        update_status(
+            run_id,
+            RunStatus(previous_status),
+            final_summary=run.get("final_summary"),
+            error=None,
+        )
+        self.ledger.add_event(
+            run_id,
+            LOCAL_CONTROLLER_RETRY_STATUS_RESTORED_EVENT_TYPE,
+            "Retry restored the pre-failure run status.",
+            {
+                "schema_version": LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION,
+                "failure_event_id": failure.get("event_id"),
+                "previous_status": current_status,
+                "restored_status": previous_status,
+            },
+        )
+        return None
 
     def get_chatgpt_ui_lease_status(self) -> LocalControllerOperationResult:
         lease = _chatgpt_ui_lease_status(ledger=self.ledger)
@@ -706,16 +975,37 @@ class LocalController:
                 sandbox=sandbox,
                 timeout_seconds=None,
             )
+            if self.cancel_requested.is_set():
+                return
             summary = _action_result_summary(result, "initial_run")
             with self._lock:
                 self.last_action_result_summary = summary
             if not _result_ok(result):
-                with self._lock:
-                    self.session.controller_state = LOCAL_CONTROLLER_STATE_FAILED
+                self._pause_for_action_failure(
+                    run_id,
+                    action_key="initial_codex",
+                    result=result,
+                    run_status_before_action=(
+                        str(run.get("status") or "") if isinstance(run, dict) else None
+                    ),
+                    source="initial_worker",
+                    retry_context={
+                        "repository_path": repository_path,
+                        "sandbox": sandbox,
+                    },
+                )
                 return
             self._automatic_progress_loop(run_id, starting_burst_count=0)
         except Exception as exc:
-            self._record_worker_exception(exc)
+            self._record_worker_exception(
+                exc,
+                run_id=run_id,
+                action_key="initial_codex",
+                retry_context={
+                    "repository_path": repository_path,
+                    "sandbox": sandbox,
+                },
+            )
         finally:
             self._clear_action_running()
 
@@ -723,9 +1013,167 @@ class LocalController:
         try:
             self._automatic_progress_loop(run_id, starting_burst_count=starting_burst_count)
         except Exception as exc:
-            self._record_worker_exception(exc)
+            self._record_worker_exception(
+                exc,
+                run_id=run_id,
+                action_key=self.current_action_kind or "routine_progress",
+            )
         finally:
             self._clear_action_running()
+
+    def _retry_worker(
+        self,
+        run_id: str,
+        failure_event_id: int,
+        failure: dict[str, Any],
+    ) -> None:
+        try:
+            action_key = str(failure.get("action_key") or "")
+            if action_key == "initial_codex":
+                self._retry_initial_codex(run_id, failure_event_id, failure)
+                return
+
+            read_model = self._build_read_model(run_id)
+            if not read_model.configuration_complete or not read_model.repository_path or not read_model.sandbox:
+                self._pause_for_action_failure(
+                    run_id,
+                    action_key=action_key or "routine_progress",
+                    result=_controller_failure_result(
+                        "run_configuration_missing",
+                        "Run configuration is missing; retry could not start.",
+                    ),
+                    run_status_before_action=read_model.run_status,
+                    source="manual_retry",
+                    supersedes_failure_event_id=failure_event_id,
+                )
+                return
+            if read_model.planner_action != action_key:
+                self._pause_for_action_failure(
+                    run_id,
+                    action_key=action_key or "routine_progress",
+                    result=_controller_failure_result(
+                        "retry_planner_action_changed",
+                        (
+                            "The planner no longer selects the failed action "
+                            f"(expected {action_key!r}, got {read_model.planner_action!r})."
+                        ),
+                        retryable=False,
+                    ),
+                    run_status_before_action=read_model.run_status,
+                    source="manual_retry",
+                    supersedes_failure_event_id=failure_event_id,
+                )
+                return
+
+            result = self.run_supervision_step(
+                run_id,
+                read_model.repository_path,
+                read_model.sandbox,
+                approval_mode="auto",
+                expected_planner_action=action_key,
+                expected_event_ids=_planner_event_ids(read_model),
+                expected_prompt_sha256=_string_or_none(
+                    read_model.planner_metadata.get("prompt_sha")
+                ),
+                allow_destination_navigation=read_model.allow_destination_navigation,
+                ledger=self.ledger,
+            )
+            if self.cancel_requested.is_set():
+                return
+            with self._lock:
+                self.last_action_result_summary = _action_result_summary(
+                    result,
+                    "manual_retry",
+                )
+            if not _result_ok(result) or getattr(result, "blocked", False):
+                self._pause_for_action_failure(
+                    run_id,
+                    action_key=action_key,
+                    result=result,
+                    run_status_before_action=read_model.run_status,
+                    source="manual_retry",
+                    supersedes_failure_event_id=failure_event_id,
+                )
+                return
+
+            self._record_failure_resolved(
+                run_id,
+                failure_event_id,
+                action_key,
+                result,
+            )
+            self._automatic_progress_loop(run_id, starting_burst_count=0)
+        except Exception as exc:
+            self._record_worker_exception(
+                exc,
+                run_id=run_id,
+                action_key=str(failure.get("action_key") or "manual_retry"),
+                retry_context={"retried_failure_event_id": failure_event_id},
+                supersedes_failure_event_id=failure_event_id,
+            )
+        finally:
+            self._clear_action_running()
+
+    def _retry_initial_codex(
+        self,
+        run_id: str,
+        failure_event_id: int,
+        failure: dict[str, Any],
+    ) -> None:
+        read_model = self._build_read_model(run_id)
+        run = self.ledger.get_run(run_id)
+        if (
+            not isinstance(run, dict)
+            or not read_model.repository_path
+            or not read_model.sandbox
+            or not isinstance(run.get("user_instruction"), str)
+        ):
+            self._pause_for_action_failure(
+                run_id,
+                action_key="initial_codex",
+                result=_controller_failure_result(
+                    "run_configuration_missing",
+                    "Initial Codex retry could not reconstruct the run configuration.",
+                ),
+                run_status_before_action=read_model.run_status,
+                source="manual_retry",
+                supersedes_failure_event_id=failure_event_id,
+            )
+            return
+        result = self.initial_run_executor(
+            run_id=run_id,
+            run=run,
+            initial_instruction=run["user_instruction"],
+            repository_path=read_model.repository_path,
+            sandbox=read_model.sandbox,
+            timeout_seconds=None,
+        )
+        with self._lock:
+            self.last_action_result_summary = _action_result_summary(
+                result,
+                "manual_retry_initial_run",
+            )
+        if not _result_ok(result):
+            self._pause_for_action_failure(
+                run_id,
+                action_key="initial_codex",
+                result=result,
+                run_status_before_action=read_model.run_status,
+                source="manual_retry",
+                retry_context={
+                    "repository_path": read_model.repository_path,
+                    "sandbox": read_model.sandbox,
+                },
+                supersedes_failure_event_id=failure_event_id,
+            )
+            return
+        self._record_failure_resolved(
+            run_id,
+            failure_event_id,
+            "initial_codex",
+            result,
+        )
+        self._automatic_progress_loop(run_id, starting_burst_count=0)
 
     def _approval_worker(self, snapshot: PendingApprovalSnapshot, decision: str) -> None:
         try:
@@ -734,12 +1182,16 @@ class LocalController:
                     self.session.pending_approval = None
             read_model = self._build_read_model(snapshot.run_id)
             if not read_model.configuration_complete or not read_model.repository_path or not read_model.sandbox:
-                with self._lock:
-                    self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
-                    self.last_action_result_summary = {
-                        "kind": "approval_decision",
-                        "reason_code": "run_configuration_missing",
-                    }
+                self._pause_for_action_failure(
+                    snapshot.run_id,
+                    action_key=snapshot.planner_action,
+                    result=_controller_failure_result(
+                        "run_configuration_missing",
+                        "Run configuration is missing; the approved action could not run.",
+                    ),
+                    run_status_before_action=read_model.run_status,
+                    source="approval_decision",
+                )
                 return
             event_ids = snapshot.planner_metadata.get("event_ids")
             event_ids = event_ids if isinstance(event_ids, dict) else {}
@@ -755,18 +1207,36 @@ class LocalController:
                 allow_destination_navigation=read_model.allow_destination_navigation,
                 ledger=self.ledger,
             )
+            if self.cancel_requested.is_set():
+                return
             with self._lock:
                 self.last_action_result_summary = _action_result_summary(result, "approval_decision")
+            if not _result_ok(result) or getattr(result, "blocked", False):
+                self._pause_for_action_failure(
+                    snapshot.run_id,
+                    action_key=snapshot.planner_action,
+                    result=result,
+                    run_status_before_action=read_model.run_status,
+                    source="approval_decision",
+                )
+                return
             refreshed = self._build_read_model(snapshot.run_id)
             self._commit_state_from_read_model(refreshed, allow_pending_snapshot=False)
         except Exception as exc:
-            self._record_worker_exception(exc)
+            self._record_worker_exception(
+                exc,
+                run_id=snapshot.run_id,
+                action_key=snapshot.planner_action,
+                retry_context={"approval_decision": decision},
+            )
         finally:
             self._clear_action_running()
 
     def _automatic_progress_loop(self, run_id: str, *, starting_burst_count: int) -> None:
         burst_count = starting_burst_count
         while True:
+            if self.cancel_requested.is_set():
+                return
             read_model = self._build_read_model(run_id)
             if read_model.requires_human_approval:
                 self._store_pending_approval(read_model)
@@ -778,12 +1248,16 @@ class LocalController:
                 self._commit_state_from_read_model(read_model, allow_pending_snapshot=False)
                 return
             if not read_model.repository_path or not read_model.sandbox:
-                with self._lock:
-                    self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
-                    self.last_action_result_summary = {
-                        "kind": "routine_progress",
-                        "reason_code": "run_configuration_missing",
-                    }
+                self._pause_for_action_failure(
+                    run_id,
+                    action_key=read_model.planner_action or "routine_progress",
+                    result=_controller_failure_result(
+                        "run_configuration_missing",
+                        "Run configuration is missing; routine work could not continue.",
+                    ),
+                    run_status_before_action=read_model.run_status,
+                    source="automatic_progress",
+                )
                 return
 
             with self._lock:
@@ -798,6 +1272,8 @@ class LocalController:
                 allow_destination_navigation=read_model.allow_destination_navigation,
                 ledger=self.ledger,
             )
+            if self.cancel_requested.is_set():
+                return
             burst_count += 1
             with self._lock:
                 self.automatic_burst_count = burst_count
@@ -809,8 +1285,13 @@ class LocalController:
                 or not _result_ok(result)
             ):
                 if getattr(result, "blocked", False) or not _result_ok(result):
-                    with self._lock:
-                        self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                    self._pause_for_action_failure(
+                        run_id,
+                        action_key=read_model.planner_action or "routine_progress",
+                        result=result,
+                        run_status_before_action=read_model.run_status,
+                        source="automatic_progress",
+                    )
                     return
                 refreshed = self._build_read_model(run_id)
                 self._commit_state_from_read_model(
@@ -835,11 +1316,12 @@ class LocalController:
                 self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
             else:
                 self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+            self._persist_session_locked()
 
     def _store_pending_approval(self, read_model: LocalControllerReadModel) -> None:
         snapshot_result = create_pending_approval_snapshot(read_model)
-        with self._lock:
-            if snapshot_result.ok:
+        if snapshot_result.ok:
+            with self._lock:
                 self.session.pending_approval = snapshot_result.snapshot
                 self.session.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
                 self.last_action_result_summary = {
@@ -849,13 +1331,19 @@ class LocalController:
                     if snapshot_result.snapshot
                     else None,
                 }
-            else:
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
-                self.last_action_result_summary = {
-                    "kind": "approval_gate",
-                    "reason_code": snapshot_result.reason_code,
-                    "error_message": snapshot_result.error_message,
-                }
+                self._persist_session_locked()
+            return
+        self._pause_for_action_failure(
+            read_model.run_id,
+            action_key=read_model.planner_action or "approval_snapshot",
+            result=_controller_failure_result(
+                snapshot_result.reason_code or "approval_snapshot_invalid",
+                snapshot_result.error_message or "The approval snapshot could not be created.",
+                retryable=False,
+            ),
+            run_status_before_action=read_model.run_status,
+            source="approval_snapshot",
+        )
 
     def _build_read_model(self, run_id: str) -> LocalControllerReadModel:
         return self.read_model_builder(run_id, ledger=self.ledger, session=self.session)
@@ -876,11 +1364,217 @@ class LocalController:
             self.action_running = False
             self.current_action_kind = None
             self.current_action_started_at = None
+            self._persist_session_locked()
 
-    def _record_worker_exception(self, exc: Exception) -> None:
+    def _persist_session_locked(self) -> None:
+        writer = getattr(self.ledger, "save_local_controller_snapshot", None)
+        if not callable(writer):
+            return
+        pending = asdict(self.session.pending_approval) if self.session.pending_approval else None
+        try:
+            writer(
+                {
+                    "active_run_id": self.session.active_run_id,
+                    "controller_state": self.session.controller_state,
+                    "pending_approval": pending,
+                }
+            )
+        except Exception:
+            return
+
+    def _restore_persisted_session(self) -> None:
+        reader = getattr(self.ledger, "load_local_controller_snapshot", None)
+        if not callable(reader):
+            return
+        try:
+            snapshot = reader()
+        except Exception:
+            return
+        if not isinstance(snapshot, dict):
+            return
+        active_run_id = snapshot.get("active_run_id")
+        if not isinstance(active_run_id, str) or not active_run_id:
+            return
+        active_run = self.ledger.get_run(active_run_id)
+        if active_run is None:
+            return
+        active_status = str(active_run.get("status") or "")
+        if active_status in {
+            RunStatus.COMPLETED.value,
+            RunStatus.FAILED.value,
+            RunStatus.NEEDS_REVIEW.value,
+            RunStatus.REJECTED.value,
+        }:
+            self._persist_session_locked()
+            return
+        controller_state = snapshot.get("controller_state")
+        if controller_state not in {
+            LOCAL_CONTROLLER_STATE_IDLE,
+            LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX,
+            LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION,
+            LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL,
+            LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY,
+            LOCAL_CONTROLLER_STATE_BLOCKED,
+            LOCAL_CONTROLLER_STATE_FAILED,
+            LOCAL_CONTROLLER_STATE_COMPLETED,
+        }:
+            controller_state = LOCAL_CONTROLLER_STATE_IDLE
+        pending = _pending_approval_from_snapshot(snapshot.get("pending_approval"))
+        if controller_state in {
+            LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX,
+            LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION,
+        }:
+            controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            pending = None
+        if (
+            controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
+            and pending is None
+        ):
+            controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+        self.session.active_run_id = active_run_id
+        self.session.controller_state = str(controller_state)
+        self.session.pending_approval = pending
+
+    def _pause_for_action_failure(
+        self,
+        run_id: str,
+        *,
+        action_key: str,
+        result: Any,
+        run_status_before_action: str | None,
+        source: str,
+        retry_context: dict[str, Any] | None = None,
+        supersedes_failure_event_id: int | None = None,
+    ) -> dict[str, Any]:
+        if self.cancel_requested.is_set():
+            return {
+                "reason_code": "operator_cancelled",
+                "error_message": "Run cancelled by operator.",
+                "retryable": False,
+            }
+        classification = _failure_retry_classification(
+            action_key,
+            result,
+            retry_context=retry_context,
+        )
+        reason_code = (
+            _string_or_none(getattr(result, "reason_code", None))
+            or "controller_action_failed"
+        )
+        error_message = (
+            _bounded_string(getattr(result, "error_message", None))
+            or reason_code
+        )
+        planner_metadata = getattr(result, "planner_metadata", None)
+        metadata = {
+            "schema_version": LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION,
+            "failure_id": str(uuid.uuid4()),
+            "run_id": run_id,
+            "action_key": action_key,
+            "source": source,
+            "reason_code": reason_code,
+            "error_message": error_message,
+            "retry_classification": classification["classification"],
+            "retryable": classification["retryable"],
+            "recovery_message": classification["recovery_message"],
+            "action_executed": bool(getattr(result, "action_executed", False)),
+            "planner_action": _string_or_none(
+                getattr(result, "planner_action", None)
+            ),
+            "planner_reason_code": _string_or_none(
+                getattr(result, "planner_reason_code", None)
+            ),
+            "next_state_hint": _string_or_none(
+                getattr(result, "next_state_hint", None)
+            ),
+            "run_status_before_action": run_status_before_action,
+            "run_status_after_action": _string_or_none(
+                getattr(result, "run_status", None)
+            ),
+            "source_event_ids": (
+                planner_metadata.get("event_ids", {})
+                if isinstance(planner_metadata, dict)
+                and isinstance(planner_metadata.get("event_ids"), dict)
+                else {}
+            ),
+            "supersedes_failure_event_id": supersedes_failure_event_id,
+            "retry_context": _safe_preview_value(retry_context or {}),
+        }
+        self.ledger.add_event(
+            run_id,
+            LOCAL_CONTROLLER_ACTION_FAILED_EVENT_TYPE,
+            LOCAL_CONTROLLER_ACTION_FAILED_MESSAGE,
+            metadata,
+        )
+        with self._lock:
+            self.last_action_result_summary = {
+                "kind": source,
+                "ok": False,
+                "reason_code": reason_code,
+                "error_message": error_message,
+                "action_key": action_key,
+                "retry_classification": classification["classification"],
+                "retryable": classification["retryable"],
+            }
+            self.session.controller_state = (
+                LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY
+                if classification["retryable"]
+                else LOCAL_CONTROLLER_STATE_BLOCKED
+            )
+            self._persist_session_locked()
+        return metadata
+
+    def _record_failure_resolved(
+        self,
+        run_id: str,
+        failure_event_id: int,
+        action_key: str,
+        result: Any,
+    ) -> None:
+        self.ledger.add_event(
+            run_id,
+            LOCAL_CONTROLLER_FAILURE_RESOLVED_EVENT_TYPE,
+            LOCAL_CONTROLLER_FAILURE_RESOLVED_MESSAGE,
+            {
+                "schema_version": LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION,
+                "failure_event_id": failure_event_id,
+                "action_key": action_key,
+                "reason_code": _string_or_none(
+                    getattr(result, "reason_code", None)
+                ),
+                "resolved_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    def _record_worker_exception(
+        self,
+        exc: Exception,
+        *,
+        run_id: str | None = None,
+        action_key: str | None = None,
+        retry_context: dict[str, Any] | None = None,
+        supersedes_failure_event_id: int | None = None,
+    ) -> None:
+        if run_id is not None and action_key is not None:
+            self._pause_for_action_failure(
+                run_id,
+                action_key=action_key,
+                result=_controller_failure_result(
+                    "controller_worker_exception",
+                    f"{type(exc).__name__}: {exc}",
+                ),
+                run_status_before_action=(
+                    str((self.ledger.get_run(run_id) or {}).get("status") or "")
+                ),
+                source="worker_exception",
+                retry_context=retry_context,
+                supersedes_failure_event_id=supersedes_failure_event_id,
+            )
         with self._lock:
             self.last_exception_summary = _exception_summary(exc)
-            self.session.controller_state = LOCAL_CONTROLLER_STATE_FAILED
+            if run_id is None or action_key is None:
+                self.session.controller_state = LOCAL_CONTROLLER_STATE_FAILED
+                self._persist_session_locked()
 
     def _runtime_snapshot_locked(self) -> dict[str, Any]:
         pending = self.session.pending_approval
@@ -1230,6 +1924,7 @@ def build_local_controller_read_model(
     destination_binding = _destination_binding_summary(run_id, ledger=ledger) if run is not None else None
     allow_destination_navigation = _recover_navigation_setting(events)
     latest_handoff_phase = _latest_handoff_phase(events)
+    latest_failure = _latest_unresolved_action_failure(events)
     configuration_complete = configuration_reason is None
 
     plan = None
@@ -1260,6 +1955,7 @@ def build_local_controller_read_model(
         plan,
         configuration_reason=configuration_reason,
         requires_approval=requires_approval,
+        latest_failure=latest_failure,
     )
 
     return LocalControllerReadModel(
@@ -1292,6 +1988,7 @@ def build_local_controller_read_model(
         event_timeline=_event_timeline(events),
         controller_runtime=_controller_runtime(session),
         configuration_complete=configuration_complete,
+        latest_failure=latest_failure,
     )
 
 
@@ -1335,6 +2032,38 @@ def create_pending_approval_snapshot(
         created_at=datetime.now(UTC).isoformat(),
     )
     return PendingApprovalSnapshotResult(ok=True, snapshot=snapshot)
+
+
+def _pending_approval_from_snapshot(value: object) -> PendingApprovalSnapshot | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        planner_metadata = value.get("planner_metadata")
+        if not isinstance(planner_metadata, dict):
+            return None
+        return PendingApprovalSnapshot(
+            run_id=str(value["run_id"]),
+            approval_kind=str(value["approval_kind"]),
+            planner_action=str(value["planner_action"]),
+            planner_reason_code=str(value["planner_reason_code"]),
+            planner_metadata=dict(planner_metadata),
+            latest_event_id=int(value["latest_event_id"]),
+            expected_extraction_event_id=_int_or_none(
+                value.get("expected_extraction_event_id")
+            ),
+            expected_prompt_sha256=_string_or_none(
+                value.get("expected_prompt_sha256")
+            ),
+            expected_prompt_text_sha256=_string_or_none(
+                value.get("expected_prompt_text_sha256")
+            ),
+            expected_extraction_method=_string_or_none(
+                value.get("expected_extraction_method")
+            ),
+            created_at=str(value["created_at"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _recover_run_configuration(events: list[dict]) -> tuple[str | None, str | None, str | None]:
@@ -1752,6 +2481,7 @@ def _actionable_error_message(
     *,
     configuration_reason: str | None,
     requires_approval: bool,
+    latest_failure: dict[str, Any] | None = None,
 ) -> str | None:
     if run is None:
         return "Run not found."
@@ -1759,6 +2489,12 @@ def _actionable_error_message(
         return "Local controller run metadata is missing or incomplete."
     if requires_approval:
         return "Human approval is required before this action can run."
+    if latest_failure is not None:
+        return str(
+            latest_failure.get("error_message")
+            or latest_failure.get("reason_code")
+            or "The latest controller action failed."
+        )
     stop_message = getattr(plan, "stop_message", "") if plan is not None else ""
     return stop_message or None
 
@@ -2049,6 +2785,167 @@ def _result_ok(result: Any) -> bool:
     if isinstance(result, int):
         return result == 0
     return bool(result)
+
+
+def _controller_failure_result(
+    reason_code: str,
+    error_message: str,
+    *,
+    retryable: bool | None = None,
+) -> _ControllerFailureResult:
+    return _ControllerFailureResult(
+        ok=False,
+        reason_code=reason_code,
+        error_message=error_message,
+        retryable_override=retryable,
+    )
+
+
+def _planner_event_ids(read_model: LocalControllerReadModel) -> dict[str, int]:
+    raw = read_model.planner_metadata.get("event_ids")
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, value in raw.items():
+        try:
+            result[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _failure_retry_classification(
+    action_key: str,
+    result: Any,
+    *,
+    retry_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    override = getattr(result, "retryable_override", None)
+    reason_code = str(getattr(result, "reason_code", "") or "")
+    event_type = str(
+        getattr(getattr(result, "action_result", None), "event_type", "")
+        or getattr(result, "event_type", "")
+        or ""
+    )
+    ambiguous_reasons = {
+        "chatgpt_submission_ambiguous",
+        "chatgpt_submission_not_verified",
+        "extracted_prompt_run_incomplete",
+        "extracted_codex_prompt_run_failed",
+        "retry_planner_action_changed",
+    }
+    deterministic_reasons = {
+        "gpt_feedback_not_submittable",
+        "gpt_feedback_generation_failed",
+        "captured_response_integrity_failed",
+        "invalid_extracted_prompt",
+        "selected_prompt_sha_validation_failed",
+        "extracted_prompt_changed_after_approval",
+    }
+    safe_actions = {
+        str(SuperviseAction.ASK_SEND_TO_GPT),
+        str(SuperviseAction.CAPTURE_GPT_RESPONSE),
+        str(SuperviseAction.EXTRACT_NEXT_PROMPT),
+    }
+
+    if override is not None:
+        retryable = bool(override)
+    elif (
+        reason_code in ambiguous_reasons
+        or event_type == "gpt_feedback_submission_ambiguous"
+    ):
+        return {
+            "classification": "reconcile",
+            "retryable": False,
+            "recovery_message": (
+                "This action may already have produced an external effect. "
+                "Inspect and reconcile it before retrying."
+            ),
+        }
+    elif reason_code in deterministic_reasons or event_type == "gpt_feedback_generation_failed":
+        return {
+            "classification": "retry_after_fix",
+            "retryable": True,
+            "recovery_message": (
+                "Correct the reported blocker, then retry the same action."
+            ),
+        }
+    elif action_key == "initial_codex":
+        sandbox = str((retry_context or {}).get("sandbox") or "")
+        retryable = sandbox == "read-only"
+    elif action_key == str(SuperviseAction.ASK_RUN_PROMPT):
+        retryable = not bool(getattr(result, "action_executed", False))
+    else:
+        retryable = action_key in safe_actions
+
+    if retryable:
+        return {
+            "classification": "retryable",
+            "retryable": True,
+            "recovery_message": (
+                "Remove the reported blocker, then retry this exact action."
+            ),
+        }
+    return {
+        "classification": "review_required",
+        "retryable": False,
+        "recovery_message": (
+            "Retry is disabled because this action may have changed external "
+            "state or the repository. Review and reconcile it first."
+        ),
+    }
+
+
+def _latest_unresolved_action_failure(
+    events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    resolved_ids: set[int] = set()
+    for event in events:
+        if event.get("event_type") == LOCAL_CONTROLLER_ACTION_FAILED_EVENT_TYPE:
+            metadata = _event_metadata(event)
+            try:
+                resolved_ids.add(int(metadata.get("supersedes_failure_event_id")))
+            except (TypeError, ValueError):
+                pass
+            continue
+        if event.get("event_type") != LOCAL_CONTROLLER_FAILURE_RESOLVED_EVENT_TYPE:
+            continue
+        metadata = _event_metadata(event)
+        try:
+            resolved_ids.add(int(metadata.get("failure_event_id")))
+        except (TypeError, ValueError):
+            continue
+
+    for event in reversed(events):
+        if event.get("event_type") != LOCAL_CONTROLLER_ACTION_FAILED_EVENT_TYPE:
+            continue
+        event_id = _event_id(event)
+        if event_id in resolved_ids:
+            continue
+        metadata = _event_metadata(event)
+        return {
+            "event_id": event_id,
+            "timestamp": event.get("created_at"),
+            "message": event.get("message"),
+            "action_key": metadata.get("action_key"),
+            "source": metadata.get("source"),
+            "reason_code": metadata.get("reason_code"),
+            "error_message": metadata.get("error_message"),
+            "retry_classification": metadata.get("retry_classification"),
+            "retryable": metadata.get("retryable") is True,
+            "recovery_message": metadata.get("recovery_message"),
+            "action_executed": metadata.get("action_executed") is True,
+            "planner_action": metadata.get("planner_action"),
+            "planner_reason_code": metadata.get("planner_reason_code"),
+            "run_status_before_action": metadata.get("run_status_before_action"),
+            "run_status_after_action": metadata.get("run_status_after_action"),
+            "source_event_ids": (
+                metadata.get("source_event_ids")
+                if isinstance(metadata.get("source_event_ids"), dict)
+                else {}
+            ),
+        }
+    return None
 
 
 def _action_result_summary(result: Any, kind: str) -> dict[str, Any]:

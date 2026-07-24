@@ -1735,7 +1735,7 @@ class FeedbackPayloadTests(unittest.TestCase):
                 self.assertEqual(feedback["feedback_payload_length"], 0)
 
     def test_feedback_payload_oversized_final_message_is_not_submittable(self) -> None:
-        self.assertEqual(MAX_CLEAN_FINAL_MESSAGE_CHARS, 50_000)
+        self.assertEqual(MAX_CLEAN_FINAL_MESSAGE_CHARS, 100_000)
         final_message = "x" * (MAX_CLEAN_FINAL_MESSAGE_CHARS + 1)
         events = [
             self.event(
@@ -1767,9 +1767,34 @@ class FeedbackPayloadTests(unittest.TestCase):
         )
         self.assertNotIn(final_message, json.dumps(feedback))
 
+    def test_feedback_payload_above_old_limit_is_submittable(self) -> None:
+        final_message = "x" * 52_000
+        events = [
+            self.event(
+                "codex_exec_finished",
+                {
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "final_message": final_message,
+                    "final_message_path": "/tmp/run-1/final-message.md",
+                    "final_message_status": "valid",
+                    "final_message_error": None,
+                    "final_message_length": len(final_message),
+                },
+                1,
+            )
+        ]
+
+        feedback = cli.build_gpt_feedback_message({"id": "run-1", "status": "completed"}, events)
+
+        self.assertTrue(feedback["submittable"])
+        self.assertEqual(feedback["reason_code"], None)
+        self.assertGreater(feedback["feedback_payload_length"], 50_000)
+        self.assertLess(feedback["feedback_payload_length"], MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS)
+
     def test_feedback_payload_absolute_transport_limit_is_not_submittable(self) -> None:
-        self.assertEqual(MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS, 50_000)
-        changed_files = [{"path": f"src/generated_{index:04d}.py"} for index in range(3_000)]
+        self.assertEqual(MAX_CHATGPT_FEEDBACK_PAYLOAD_CHARS, 100_000)
+        changed_files = [{"path": f"src/generated_{index:04d}.py"} for index in range(6_000)]
         final_message = "Clean final message under the final-message limit."
         events = [
             self.event(

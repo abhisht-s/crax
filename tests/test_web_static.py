@@ -128,18 +128,33 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="codex-live-final"',
             'id="codex-live-error"',
             'id="codex-live-events"',
-            'id="event-timeline-details"',
             'id="approval-panel"',
             'id="approve-button"',
             'id="reject-button"',
             'id="progress-panel"',
             'id="tick-button"',
+            'id="failure-panel"',
+            'id="failure-action"',
+            'id="failure-reason"',
+            'id="failure-error"',
+            'id="failure-recovery"',
+            'id="retry-button"',
             'id="event-timeline"',
             'id="connection-status"',
         ):
             self.assertIn(required, self.html)
 
         self.assertIn("Codex Permission Preset", self.html)
+        self.assertIn("<title>Agent Controller</title>", self.html)
+        self.assertIn("<h1>Agent Controller</h1>", self.html)
+        self.assertIn('class="connection-label">Controller connection</p>', self.html)
+        self.assertIn('class="panel disclosure-panel"', self.html)
+        self.assertIn("Run details and controls", self.html)
+        self.assertIn("Lease details and recovery", self.html)
+        self.assertNotIn("Latest Summaries", self.html)
+        self.assertNotIn("Diagnostics", self.html)
+        self.assertNotIn("event-timeline", self.all_static)
+        self.assertNotIn("latest-codex-summary", self.all_static)
         self.assertIn(
             "Codex can inspect the workspace. Edits are not allowed for this dashboard run.",
             self.html,
@@ -151,7 +166,7 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn("Permission preset / sandbox", self.html)
         self.assertIn("Codex default — Full Access bypasses approvals", self.all_static)
         options = re.findall(r'<option value="([^"]*)">', self.html)
-        self.assertEqual(options, ["", ""])
+        self.assertEqual(options, ["", "", ""])
         self.assertIn("Loading...", self.html)
         self.assertIn("currently open ChatGPT Desktop destination", self.html)
         self.assertIn("exact titles", self.html)
@@ -168,6 +183,49 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertNotIn("gpt-5-codex", self.all_static)
         self.assertNotIn("gpt-5", self.all_static)
         self.assertIsNone(re.search(r"\son\w+=", self.html))
+
+    def test_dashboard_surfaces_durable_failure_and_guarded_manual_retry(self) -> None:
+        for required in (
+            'requestJson("POST", "/api/runs/current/retry"',
+            "failure_event_id: failureEventId",
+            "model.latest_failure",
+            "renderFailure(model, runtime)",
+            "Paused — ready for manual retry",
+            "Paused — manual review required",
+            "Retry unavailable — review required",
+            'elements["failure-error"]',
+            'elements["failure-recovery"]',
+            'runtime.controller_state === "waiting_for_retry"',
+        ):
+            self.assertIn(required, self.all_static)
+
+    def test_remote_pairing_repository_catalog_cancel_and_pwa_contract(self) -> None:
+        for required in (
+            'id="pairing-panel"',
+            'id="pairing-code"',
+            'id="device-label"',
+            'id="pair-button"',
+            'id="repository-catalog"',
+            'id="cancel-run-button"',
+            'id="full-access-button"',
+            "Use Full Access",
+            "Emergency stop",
+            'id="remote-device-panel"',
+            'href="/manifest.webmanifest"',
+            '"startup-panel",',
+            'elements["startup-panel"].classList.remove("remote-locked")',
+            'navigator.serviceWorker.register("/service-worker.js")',
+            '"/api/remote/pair"',
+            "/api/repositories?query=",
+            'requestJson("POST", "/api/runs/current/cancel"',
+            'requestJson("POST", "/api/remote/devices/revoke"',
+            'credentials: "same-origin"',
+            "ENABLE FULL ACCESS",
+            'elements["sandbox-select"].value = "danger-full-access"',
+            '"needs_review",',
+            "(activeRun && !activeRunReplaceable)",
+        ):
+            self.assertIn(required, self.all_static)
 
     def test_dashboard_renders_locked_and_run_profile_states_truthfully(self) -> None:
         for required in (
@@ -276,7 +334,9 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertNotIn("WebSocket", self.js)
         self.assertNotIn("EventSource", self.js)
         self.assertNotIn("clipboard", self.all_static.lower())
-        self.assertNotIn("navigator.", self.js)
+        self.assertIn("navigator.serviceWorker.register", self.js)
+        self.assertNotIn("navigator.clipboard", self.js)
+        self.assertNotIn("navigator.geolocation", self.js)
         self.assertNotIn("accessibility", self.all_static.lower())
         self.assertNotIn("AXUIElement", self.all_static)
         self.assertNotIn("verify now", self.all_static.lower())
@@ -285,7 +345,7 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertNotIn("Svelte", self.all_static)
         self.assertNotIn("https://", self.all_static)
         self.assertNotIn("http://", self.all_static)
-        self.assertNotIn("cancel", self.all_static.lower())
+        self.assertIn('requestJson("POST", "/api/runs/current/cancel"', self.js)
         self.assertNotIn("stdout", self.js.lower())
         self.assertNotIn("stderr", self.js.lower())
         self.assertNotIn("prompt_text", self.js)
@@ -310,8 +370,7 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn('event.kind === "assistant_commentary"', self.js)
         self.assertIn(".slice(-PROGRESS_EVENT_RENDER_LIMIT)", self.js)
         self.assertIn("Codex Working Notes", self.html)
-        self.assertIn("Raw event timeline", self.html)
-        self.assertNotIn('<details id="event-timeline-details" open>', self.html)
+        self.assertNotIn("Raw event timeline", self.html)
         self.assertIn("final_message_available", self.js)
         self.assertIn("pollingStopped = true", self.js)
         self.assertNotRegex(self.js, r"set(?:Timeout|Interval)\([^)]*requestTick")

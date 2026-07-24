@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import threading
 import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -18,6 +19,8 @@ CODEX_JSON_PROGRESS_SOURCE = "codex_cli_jsonl"
 CODEX_PROGRESS_TITLE_LIMIT = 240
 CODEX_PROGRESS_SUMMARY_LIMIT = 1000
 CODEX_PROGRESS_METADATA_TEXT_LIMIT = 500
+_ACTIVE_CODEX_PROCESSES: dict[str, subprocess.Popen] = {}
+_ACTIVE_CODEX_PROCESSES_LOCK = threading.Lock()
 
 
 def _utc_now() -> str:
@@ -465,6 +468,8 @@ def run_json_streaming_command(
     started_at = _utc_now()
     stdout_parts: list[str] = []
     metadata = process_metadata or {}
+    process_key = str(metadata.get("run_id") or "").strip() or None
+    process: subprocess.Popen | None = None
 
     try:
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr_file:
@@ -476,6 +481,9 @@ def run_json_streaming_command(
                 text=True,
                 bufsize=1,
             )
+            if process_key is not None:
+                with _ACTIVE_CODEX_PROCESSES_LOCK:
+                    _ACTIVE_CODEX_PROCESSES[process_key] = process
             _emit_progress(
                 progress_callback,
                 _progress_event(
@@ -539,6 +547,39 @@ def run_json_streaming_command(
             "timed_out": False,
             "started_at": started_at,
             "finished_at": _utc_now(),
+        }
+    finally:
+        if process_key is not None and process is not None:
+            with _ACTIVE_CODEX_PROCESSES_LOCK:
+                if _ACTIVE_CODEX_PROCESSES.get(process_key) is process:
+                    _ACTIVE_CODEX_PROCESSES.pop(process_key, None)
+
+
+def terminate_codex_run(run_id: str, *, timeout_seconds: float = 2.0) -> dict[str, object]:
+    with _ACTIVE_CODEX_PROCESSES_LOCK:
+        process = _ACTIVE_CODEX_PROCESSES.get(run_id)
+    if process is None or process.poll() is not None:
+        return {
+            "terminated": False,
+            "reason_code": "codex_process_not_running",
+        }
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=timeout_seconds)
+        return {
+            "terminated": True,
+            "reason_code": "codex_process_terminated",
+            "exit_code": process.returncode,
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "terminated": False,
+            "reason_code": "codex_process_termination_failed",
+            "error_message": str(exc),
         }
 
 
@@ -727,6 +768,7 @@ def run_codex_exec(
         }
 
     process_metadata = {
+        "run_id": run_id,
         "repo_path": resolved_repo_path_text,
         "sandbox": sandbox,
         "model": model_text,

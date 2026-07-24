@@ -317,6 +317,55 @@ def _init_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS remote_pairing_codes (
+            id TEXT PRIMARY KEY,
+            code_sha256 TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS remote_devices (
+            id TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            token_sha256 TEXT NOT NULL UNIQUE,
+            scopes_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked_at TEXT NULL,
+            last_used_at TEXT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS remote_audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            device_id TEXT NULL,
+            device_label TEXT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            run_id TEXT NULL,
+            reason_code TEXT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_controller_snapshot (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            updated_at TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL
+        )
+        """
+    )
 
 
 def init_db() -> None:
@@ -542,6 +591,262 @@ def list_events(run_id: str) -> list[dict]:
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def create_remote_pairing_code(
+    code_sha256: str,
+    created_at: str,
+    expires_at: str,
+) -> str:
+    init_db()
+    pairing_id = str(uuid.uuid4())
+    with closing(_connect()) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO remote_pairing_codes (
+                    id, code_sha256, created_at, expires_at, used_at
+                )
+                VALUES (?, ?, ?, ?, NULL)
+                """,
+                (pairing_id, code_sha256, created_at, expires_at),
+            )
+    return pairing_id
+
+
+def consume_remote_pairing_code(
+    *,
+    code_sha256: str,
+    consumed_at: str,
+    device_label: str,
+    token_sha256: str,
+    scopes_json: str,
+    device_expires_at: str,
+) -> dict[str, object]:
+    init_db()
+    device_id = str(uuid.uuid4())
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            """
+            SELECT id, expires_at, used_at
+            FROM remote_pairing_codes
+            WHERE code_sha256 = ?
+            """,
+            (code_sha256,),
+        ).fetchone()
+        if row is None:
+            connection.rollback()
+            return {
+                "ok": False,
+                "reason_code": "pairing_code_invalid",
+                "error_message": "Pairing code is invalid.",
+            }
+        if row["used_at"] is not None:
+            connection.rollback()
+            return {
+                "ok": False,
+                "reason_code": "pairing_code_used",
+                "error_message": "Pairing code has already been used.",
+            }
+        if str(row["expires_at"]) <= consumed_at:
+            connection.rollback()
+            return {
+                "ok": False,
+                "reason_code": "pairing_code_expired",
+                "error_message": "Pairing code has expired.",
+            }
+        cursor = connection.execute(
+            """
+            UPDATE remote_pairing_codes
+            SET used_at = ?
+            WHERE id = ? AND used_at IS NULL
+            """,
+            (consumed_at, row["id"]),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return {
+                "ok": False,
+                "reason_code": "pairing_code_used",
+                "error_message": "Pairing code has already been used.",
+            }
+        connection.execute(
+            """
+            INSERT INTO remote_devices (
+                id, label, token_sha256, scopes_json, created_at,
+                expires_at, revoked_at, last_used_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                device_id,
+                device_label,
+                token_sha256,
+                scopes_json,
+                consumed_at,
+                device_expires_at,
+                consumed_at,
+            ),
+        )
+        connection.commit()
+    return {"ok": True, "device_id": device_id}
+
+
+def authenticate_remote_device(
+    token_sha256: str,
+    authenticated_at: str,
+) -> dict[str, object] | None:
+    init_db()
+    with closing(_connect()) as connection:
+        with connection:
+            row = connection.execute(
+                """
+                SELECT id, label, scopes_json, created_at, expires_at,
+                       revoked_at, last_used_at
+                FROM remote_devices
+                WHERE token_sha256 = ?
+                  AND revoked_at IS NULL
+                  AND expires_at > ?
+                """,
+                (token_sha256, authenticated_at),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                "UPDATE remote_devices SET last_used_at = ? WHERE id = ?",
+                (authenticated_at, row["id"]),
+            )
+    return dict(row)
+
+
+def list_remote_devices(active_at: str) -> list[dict[str, object]]:
+    init_db()
+    with closing(_connect()) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, label, scopes_json, created_at, expires_at,
+                   revoked_at, last_used_at
+            FROM remote_devices
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+    return [
+        {
+            **dict(row),
+            "active": row["revoked_at"] is None and str(row["expires_at"]) > active_at,
+        }
+        for row in rows
+    ]
+
+
+def revoke_remote_device(device_id: str, revoked_at: str) -> bool:
+    init_db()
+    with closing(_connect()) as connection:
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE remote_devices
+                SET revoked_at = ?
+                WHERE id = ? AND revoked_at IS NULL
+                """,
+                (revoked_at, device_id),
+            )
+    return cursor.rowcount == 1
+
+
+def rotate_remote_device_token(
+    device_id: str,
+    token_sha256: str,
+    rotated_at: str,
+    expires_at: str,
+) -> bool:
+    init_db()
+    with closing(_connect()) as connection:
+        with connection:
+            cursor = connection.execute(
+                """
+                UPDATE remote_devices
+                SET token_sha256 = ?,
+                    expires_at = ?,
+                    last_used_at = ?
+                WHERE id = ? AND revoked_at IS NULL AND expires_at > ?
+                """,
+                (token_sha256, expires_at, rotated_at, device_id, rotated_at),
+            )
+    return cursor.rowcount == 1
+
+
+def add_remote_audit_event(
+    *,
+    created_at: str,
+    device_id: str | None,
+    device_label: str | None,
+    method: str,
+    path: str,
+    outcome: str,
+    run_id: str | None,
+    reason_code: str | None,
+) -> None:
+    init_db()
+    with closing(_connect()) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO remote_audit_events (
+                    created_at, device_id, device_label, method, path,
+                    outcome, run_id, reason_code
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    device_id,
+                    device_label,
+                    method,
+                    path,
+                    outcome,
+                    run_id,
+                    reason_code,
+                ),
+            )
+
+
+def save_local_controller_snapshot(snapshot: dict[str, object]) -> None:
+    init_db()
+    with closing(_connect()) as connection:
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO local_controller_snapshot (
+                    singleton_id, updated_at, snapshot_json
+                )
+                VALUES (1, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    snapshot_json = excluded.snapshot_json
+                """,
+                (_utc_now(), json.dumps(snapshot, sort_keys=True)),
+            )
+
+
+def load_local_controller_snapshot() -> dict[str, object] | None:
+    init_db()
+    with closing(_connect()) as connection:
+        row = connection.execute(
+            """
+            SELECT snapshot_json
+            FROM local_controller_snapshot
+            WHERE singleton_id = 1
+            """
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        decoded = json.loads(str(row["snapshot_json"]))
+    except json.JSONDecodeError:
+        return None
+    return decoded if isinstance(decoded, dict) else None
 
 
 def list_chatgpt_ui_lease_events() -> list[dict]:

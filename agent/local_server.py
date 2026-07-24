@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from dataclasses import asdict, is_dataclass
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from agent.local_controller import LocalController, LocalControllerSession
 from agent.repository_picker import RepositoryPickerResult, choose_repository_directory
+from agent.remote_access import (
+    REMOTE_FULL_ACCESS_CONFIRMATION,
+    REMOTE_SESSION_COOKIE,
+    RemoteAccessConfig,
+    RemoteAccessManager,
+    RemotePrincipal,
+)
 from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
     CODEX_DEFAULT_SELECTION,
@@ -43,6 +51,9 @@ STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
     "/assets/style.css": ("style.css", "text/css; charset=utf-8"),
     "/assets/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json; charset=utf-8"),
+    "/service-worker.js": ("service-worker.js", "application/javascript; charset=utf-8"),
+    "/assets/icon.svg": ("icon.svg", "image/svg+xml"),
 }
 
 
@@ -62,13 +73,25 @@ class LocalControllerServer:
         port: int = LOCAL_SERVER_DEFAULT_PORT,
         controller: LocalController | None = None,
         session: LocalControllerSession | None = None,
+        remote_config: RemoteAccessConfig | None = None,
+        remote_access: RemoteAccessManager | None = None,
     ) -> None:
         if host != LOCAL_SERVER_BIND_HOST:
             raise ValueError("Local controller server must bind to 127.0.0.1.")
         self.host = host
         self.configured_port = port
-        self.session = session or (controller.session if controller is not None else LocalControllerSession())
-        self.controller = controller or LocalController(session=self.session)
+        if controller is not None:
+            self.controller = controller
+            self.session = session or controller.session
+        else:
+            self.controller = LocalController(session=session)
+            self.session = self.controller.session
+        self.remote_access = remote_access or (
+            RemoteAccessManager(remote_config, ledger=self.controller.ledger)
+            if remote_config is not None
+            else None
+        )
+        self.remote_pairing_code: str | None = None
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self._lifecycle_lock = threading.Lock()
@@ -85,6 +108,7 @@ class LocalControllerServer:
                 return
             handler_class = _make_handler(self)
             self.httpd = ThreadingHTTPServer((self.host, self.configured_port), handler_class)
+            self._ensure_remote_pairing()
             self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
             self.thread.start()
 
@@ -94,6 +118,7 @@ class LocalControllerServer:
                 raise RuntimeError("Server is already started.")
             handler_class = _make_handler(self)
             self.httpd = ThreadingHTTPServer((self.host, self.configured_port), handler_class)
+            self._ensure_remote_pairing()
         try:
             self.httpd.serve_forever()
         finally:
@@ -114,6 +139,17 @@ class LocalControllerServer:
     def bootstrap_url(self) -> str:
         return f"http://{self.host}:{self.port}/#token={self.session.token}"
 
+    def remote_pairing_url(self) -> str | None:
+        if self.remote_access is None or self.remote_pairing_code is None:
+            return None
+        return self.remote_access.pairing_url(self.remote_pairing_code)
+
+    def _ensure_remote_pairing(self) -> None:
+        if self.remote_access is None or self.remote_pairing_code is not None:
+            return
+        code, _ = self.remote_access.create_pairing_code()
+        self.remote_pairing_code = code
+
     def token_matches(self, value: str | None) -> bool:
         if value is None:
             return False
@@ -124,6 +160,8 @@ def _make_handler(server_runtime: LocalControllerServer):
     class LocalControllerRequestHandler(BaseHTTPRequestHandler):
         server_version = "LocalControllerHTTP/1"
         sys_version = ""
+        principal: RemotePrincipal | None = None
+        request_path = ""
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
@@ -147,12 +185,22 @@ def _make_handler(server_runtime: LocalControllerServer):
             try:
                 parsed_url = urlsplit(self.path)
                 path = parsed_url.path
+                self.request_path = path
                 if not path.startswith("/api/"):
                     self._validate_host()
                     self._handle_static(method, path)
                     return
                 self._validate_host()
-                self._authenticate()
+                if path == "/api/remote/pair":
+                    if method != "POST":
+                        self._method_not_allowed()
+                        return
+                    self._validate_origin()
+                    self._handle_remote_pair()
+                    return
+                self.principal = self._authenticate(
+                    _required_scope(method, path)
+                )
                 if method == "GET":
                     self._handle_get(path, parsed_url.query)
                 elif method == "POST":
@@ -160,6 +208,18 @@ def _make_handler(server_runtime: LocalControllerServer):
                 else:
                     self._method_not_allowed()
             except LocalServerError as exc:
+                if (
+                    method == "POST"
+                    and self.principal is not None
+                    and server_runtime.remote_access is not None
+                ):
+                    server_runtime.remote_access.audit(
+                        self.principal,
+                        method=method,
+                        path=self.request_path,
+                        outcome="denied",
+                        reason_code=exc.reason_code,
+                    )
                 self._write_error(exc.status, exc.reason_code, exc.error_message)
             except Exception:
                 self._write_error(500, "internal_controller_error", "Internal controller error.")
@@ -186,10 +246,40 @@ def _make_handler(server_runtime: LocalControllerServer):
                 self._write_json(200, _health_payload(server_runtime))
                 return
             if path == "/api/session":
-                self._write_json(200, _session_payload(server_runtime))
+                self._write_json(
+                    200,
+                    _session_payload(server_runtime, principal=self.principal),
+                )
+                return
+            if path == "/api/repositories":
+                if server_runtime.remote_access is None:
+                    self._write_json(200, {"ok": True, "repositories": [], "remote_mode": False})
+                    return
+                params = parse_qs(query, keep_blank_values=True)
+                values = params.get("query", [""])
+                if len(values) != 1:
+                    raise LocalServerError(400, "invalid_repository_query", "Invalid repository query.")
+                self._write_json(
+                    200,
+                    {
+                        "ok": True,
+                        "remote_mode": True,
+                        "repositories": server_runtime.remote_access.list_repositories(values[0]),
+                    },
+                )
+                return
+            if path == "/api/remote/devices":
+                manager = _require_remote_access(server_runtime)
+                self._write_json(200, {"ok": True, "devices": manager.list_devices()})
                 return
             if path == "/api/execution-profile/options":
-                self._write_json(200, _execution_profile_options_payload())
+                self._write_json(
+                    200,
+                    _execution_profile_options_payload(
+                        server_runtime=server_runtime,
+                        principal=self.principal,
+                    ),
+                )
                 return
             if path == "/api/default-greeting":
                 self._write_json(200, _default_greeting_payload())
@@ -220,6 +310,12 @@ def _make_handler(server_runtime: LocalControllerServer):
         def _handle_post(self, path: str) -> None:
             self._validate_origin()
             if path == "/api/repository/pick":
+                if self.principal is not None and self.principal.kind == "remote_device":
+                    raise LocalServerError(
+                        501,
+                        "remote_repository_picker_unavailable",
+                        "Use the remote repository catalog instead of the macOS folder picker.",
+                    )
                 payload = self._read_json_body(
                     LOCAL_SERVER_GENERIC_BODY_LIMIT,
                     require_object=True,
@@ -232,7 +328,9 @@ def _make_handler(server_runtime: LocalControllerServer):
                 return
             if path == "/api/runs/start":
                 payload = self._read_json_body(LOCAL_SERVER_START_BODY_LIMIT, require_object=True, allow_empty=False)
+                _authorize_remote_start(server_runtime, self.principal, payload)
                 result = server_runtime.controller.start_run(**_start_run_kwargs(payload))
+                self._audit_remote_result(result)
                 self._write_operation_result(result, success_status=202)
                 return
             if path == "/api/approval":
@@ -245,6 +343,7 @@ def _make_handler(server_runtime: LocalControllerServer):
                         "Invalid approval decision. Expected approved or rejected.",
                     )
                 result = server_runtime.controller.submit_approval_decision(payload["decision"])
+                self._audit_remote_result(result)
                 self._write_operation_result(result, success_status=202)
                 return
             if path == "/api/tick":
@@ -252,17 +351,167 @@ def _make_handler(server_runtime: LocalControllerServer):
                 if payload:
                     raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
                 result = server_runtime.controller.request_automatic_progress()
+                self._audit_remote_result(result)
                 status = 202 if result.ok else 200
                 self._write_operation_result(result, success_status=status, default_failure_status=200)
+                return
+            if path == "/api/runs/current/retry":
+                payload = self._read_json_body(
+                    LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                    require_object=True,
+                    allow_empty=False,
+                )
+                _require_exact_fields(payload, {"failure_event_id"})
+                failure_event_id = payload["failure_event_id"]
+                if (
+                    not isinstance(failure_event_id, int)
+                    or isinstance(failure_event_id, bool)
+                    or failure_event_id <= 0
+                ):
+                    raise LocalServerError(
+                        400,
+                        "invalid_failure_event_id",
+                        "failure_event_id must be a positive integer.",
+                    )
+                result = server_runtime.controller.retry_failed_action(
+                    failure_event_id,
+                )
+                self._audit_remote_result(result)
+                self._write_operation_result(
+                    result,
+                    success_status=202,
+                    default_failure_status=409,
+                )
+                return
+            if path == "/api/runs/current/cancel":
+                payload = self._read_json_body(
+                    LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                    require_object=True,
+                    allow_empty=True,
+                )
+                if payload:
+                    raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                result = server_runtime.controller.request_cancel()
+                self._audit_remote_result(result)
+                self._write_operation_result(result, success_status=202)
+                return
+            if path == "/api/remote/devices/revoke":
+                payload = self._read_json_body(
+                    LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                    require_object=True,
+                    allow_empty=False,
+                )
+                _require_exact_fields(payload, {"device_id"})
+                device_id = payload["device_id"]
+                if not isinstance(device_id, str) or not device_id.strip():
+                    raise LocalServerError(400, "invalid_device_id", "device_id must be a non-empty string.")
+                manager = _require_remote_access(server_runtime)
+                revoked = manager.revoke_device(device_id.strip())
+                manager.audit(
+                    self.principal or RemotePrincipal("local", "admin"),
+                    method="POST",
+                    path=path,
+                    outcome="ok" if revoked else "not_found",
+                    reason_code="device_revoked" if revoked else "device_not_found",
+                )
+                self._write_json(
+                    200 if revoked else 404,
+                    {
+                        "ok": revoked,
+                        "reason_code": "device_revoked" if revoked else "device_not_found",
+                    },
+                )
+                return
+            if path == "/api/remote/devices/rotate-current":
+                payload = self._read_json_body(
+                    LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                    require_object=True,
+                    allow_empty=True,
+                )
+                if payload:
+                    raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                if self.principal is None or self.principal.kind != "remote_device" or not self.principal.device_id:
+                    raise LocalServerError(
+                        400,
+                        "remote_device_required",
+                        "Only a paired remote device can rotate its credential.",
+                    )
+                manager = _require_remote_access(server_runtime)
+                result = manager.rotate_device(self.principal.device_id)
+                manager.audit(
+                    self.principal,
+                    method="POST",
+                    path=path,
+                    outcome="ok" if result.ok else "denied",
+                    reason_code="device_credential_rotated" if result.ok else result.reason_code,
+                )
+                if not result.ok or result.token is None:
+                    self._write_error(
+                        409,
+                        result.reason_code or "device_rotation_failed",
+                        result.error_message or "Device credential rotation failed.",
+                    )
+                    return
+                self._write_json(
+                    200,
+                    {
+                        "ok": True,
+                        "reason_code": "device_credential_rotated",
+                        "expires_at": result.expires_at,
+                    },
+                    extra_headers={
+                        "Set-Cookie": _remote_session_cookie(manager, result.token)
+                    },
+                )
                 return
             if path == "/api/chatgpt-ui-lease/release-stale":
                 payload = self._read_json_body(LOCAL_SERVER_GENERIC_BODY_LIMIT, require_object=True, allow_empty=False)
                 result = server_runtime.controller.release_stale_chatgpt_ui_lease(
                     **_stale_lease_release_kwargs(payload)
                 )
+                self._audit_remote_result(result)
                 self._write_operation_result(result, success_status=200)
                 return
             self._write_error(404, "route_not_found", "API route was not found.")
+
+        def _handle_remote_pair(self) -> None:
+            manager = _require_remote_access(server_runtime)
+            payload = self._read_json_body(
+                LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                require_object=True,
+                allow_empty=False,
+            )
+            _require_exact_fields(payload, {"code", "device_label"})
+            result = manager.pair_device(payload["code"], payload["device_label"])
+            if not result.ok or result.token is None:
+                self._write_error(
+                    401,
+                    result.reason_code or "pairing_failed",
+                    result.error_message or "Pairing failed.",
+                )
+                return
+            self._write_json(
+                200,
+                {
+                    "ok": True,
+                    "reason_code": "device_paired",
+                    "device_id": result.device_id,
+                    "expires_at": result.expires_at,
+                },
+                extra_headers={"Set-Cookie": _remote_session_cookie(manager, result.token)},
+            )
+
+        def _audit_remote_result(self, result: Any) -> None:
+            if self.principal is None or server_runtime.remote_access is None:
+                return
+            server_runtime.remote_access.audit(
+                self.principal,
+                method="POST",
+                path=self.request_path,
+                outcome="ok" if bool(getattr(result, "ok", False)) else "denied",
+                run_id=getattr(result, "run_id", None),
+                reason_code=getattr(result, "reason_code", None),
+            )
 
         def _write_repository_picker_result(self, result: RepositoryPickerResult) -> None:
             payload = {
@@ -395,6 +644,8 @@ def _make_handler(server_runtime: LocalControllerServer):
                 f"{LOCAL_SERVER_BIND_HOST}:{server_runtime.port}",
                 f"localhost:{server_runtime.port}",
             }
+            if server_runtime.remote_access is not None:
+                allowed.add(server_runtime.remote_access.config.trusted_host)
             if host not in allowed:
                 raise LocalServerError(400, "invalid_host", "Invalid Host header.")
 
@@ -406,15 +657,36 @@ def _make_handler(server_runtime: LocalControllerServer):
                 f"http://{LOCAL_SERVER_BIND_HOST}:{server_runtime.port}",
                 f"http://localhost:{server_runtime.port}",
             }
+            if server_runtime.remote_access is not None:
+                allowed.add(server_runtime.remote_access.config.trusted_origin)
             if origin not in allowed:
                 raise LocalServerError(403, "invalid_origin", "Invalid Origin header.")
 
-        def _authenticate(self) -> None:
+        def _authenticate(self, required_scope: str) -> RemotePrincipal:
             token = self.headers.get(LOCAL_SERVER_TOKEN_HEADER)
-            if token is None:
-                raise LocalServerError(401, "authentication_required", "Controller token is required.")
-            if not server_runtime.token_matches(token):
+            if token is not None:
+                if server_runtime.token_matches(token):
+                    return RemotePrincipal(kind="local", scope="admin", label="local bootstrap")
                 raise LocalServerError(401, "authentication_failed", "Controller token is invalid.")
+            manager = server_runtime.remote_access
+            principal = manager.authenticate_cookie(self._session_cookie()) if manager is not None else None
+            if principal is None:
+                raise LocalServerError(401, "authentication_required", "Controller authentication is required.")
+            if not principal.permits(required_scope):
+                raise LocalServerError(403, "insufficient_scope", "This device is not authorized for the requested action.")
+            return principal
+
+        def _session_cookie(self) -> str | None:
+            raw_cookie = self.headers.get("Cookie")
+            if not raw_cookie:
+                return None
+            cookie = SimpleCookie()
+            try:
+                cookie.load(raw_cookie)
+            except Exception:
+                return None
+            morsel = cookie.get(REMOTE_SESSION_COOKIE)
+            return morsel.value if morsel is not None else None
 
         def _method_not_allowed(self) -> None:
             self._write_error(405, "method_not_allowed", "HTTP method is not allowed for this route.")
@@ -429,15 +701,32 @@ def _make_handler(server_runtime: LocalControllerServer):
                 },
             )
 
-        def _write_json(self, status: int, payload: dict[str, Any]) -> None:
+        def _write_json(
+            self,
+            status: int,
+            payload: dict[str, Any],
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             data = json.dumps(_json_safe(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
-            self._write_bytes(status, data, JSON_CONTENT_TYPE)
+            self._write_bytes(status, data, JSON_CONTENT_TYPE, extra_headers=extra_headers)
 
-        def _write_bytes(self, status: int, data: bytes, content_type: str) -> None:
+        def _write_bytes(
+            self,
+            status: int,
+            data: bytes,
+            content_type: str,
+            *,
+            extra_headers: dict[str, str] | None = None,
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'")
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -450,6 +739,62 @@ def _is_json_content_type(value: str) -> bool:
         return False
     media_type = value.split(";", 1)[0].strip().lower()
     return media_type == "application/json"
+
+
+def _required_scope(method: str, path: str) -> str:
+    if method == "GET":
+        return "admin" if path == "/api/remote/devices" else "read"
+    if path in {
+        "/api/approval",
+        "/api/tick",
+        "/api/runs/current/retry",
+        "/api/runs/current/cancel",
+    }:
+        return "control"
+    return "admin"
+
+
+def _require_remote_access(server_runtime: LocalControllerServer) -> RemoteAccessManager:
+    if server_runtime.remote_access is None:
+        raise LocalServerError(404, "remote_access_disabled", "Remote access is not enabled.")
+    return server_runtime.remote_access
+
+
+def _remote_session_cookie(manager: RemoteAccessManager, token: str) -> str:
+    return (
+        f"{REMOTE_SESSION_COOKIE}={token}; Path=/; HttpOnly; "
+        f"Secure; SameSite=Strict; Max-Age={manager.config.session_ttl_seconds}"
+    )
+
+
+def _authorize_remote_start(
+    server_runtime: LocalControllerServer,
+    principal: RemotePrincipal | None,
+    payload: dict[str, Any],
+) -> None:
+    if principal is None or principal.kind != "remote_device":
+        return
+    manager = _require_remote_access(server_runtime)
+    if not manager.repository_allowed(payload.get("repository_path")):
+        raise LocalServerError(
+            403,
+            "repository_not_authorized",
+            "Repository is outside the configured remote repository roots or is not a Git repository.",
+        )
+    if payload.get("sandbox") != "danger-full-access":
+        return
+    if not manager.config.allow_full_access:
+        raise LocalServerError(
+            403,
+            "remote_full_access_disabled",
+            "Remote Full Access is disabled by the Mac owner.",
+        )
+    if payload.get("full_access_confirmation") != REMOTE_FULL_ACCESS_CONFIRMATION:
+        raise LocalServerError(
+            400,
+            "remote_full_access_confirmation_required",
+            f"Type {REMOTE_FULL_ACCESS_CONFIRMATION!r} to start this Full Access run.",
+        )
 
 
 def _require_exact_fields(payload: dict[str, Any], expected: set[str]) -> None:
@@ -467,7 +812,7 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "project_title",
         "chat_title",
     }
-    optional = {"model", "allow_destination_navigation"}
+    optional = {"model", "allow_destination_navigation", "full_access_confirmation"}
     keys = set(payload)
     if missing := required - keys:
         raise LocalServerError(
@@ -675,6 +1020,12 @@ def _status_for_reason(reason: str, *, default_failure_status: int | None = None
         "action_already_running",
         "pending_approval_exists",
         "controller_state_terminal",
+        "manual_retry_required",
+        "no_retryable_failure",
+        "stale_failure_retry",
+        "failure_requires_reconciliation",
+        "retry_status_restore_unsafe",
+        "retry_status_restore_unavailable",
         "human_approval_required",
         "chatgpt_ui_lease_owner_pid_alive",
         "chatgpt_ui_lease_owner_pid_unknown",
@@ -715,6 +1066,12 @@ def _health_payload(server_runtime: LocalControllerServer) -> dict[str, Any]:
         "controller_state": server_runtime.session.controller_state,
         "active_run_id": server_runtime.session.active_run_id,
         "action_running": bool(runtime.get("action_running", False)),
+        "remote_mode": server_runtime.remote_access is not None,
+        "public_base_url": (
+            server_runtime.remote_access.config.public_base_url
+            if server_runtime.remote_access is not None
+            else None
+        ),
     }
 
 
@@ -740,7 +1097,11 @@ def _default_greeting_payload() -> dict[str, Any]:
     }
 
 
-def _session_payload(server_runtime: LocalControllerServer) -> dict[str, Any]:
+def _session_payload(
+    server_runtime: LocalControllerServer,
+    *,
+    principal: RemotePrincipal | None = None,
+) -> dict[str, Any]:
     runtime = _runtime(server_runtime.controller)
     return {
         "ok": True,
@@ -749,15 +1110,37 @@ def _session_payload(server_runtime: LocalControllerServer) -> dict[str, Any]:
         "active_run_id": server_runtime.session.active_run_id,
         "action_running": bool(runtime.get("action_running", False)),
         "pending_approval_available": bool(runtime.get("pending_approval_available", False)),
+        "remote_mode": server_runtime.remote_access is not None,
+        "principal": {
+            "kind": principal.kind if principal is not None else "unknown",
+            "scope": principal.scope if principal is not None else None,
+            "device_id": principal.device_id if principal is not None else None,
+            "label": principal.label if principal is not None else None,
+        },
     }
 
 
-def _execution_profile_options_payload() -> dict[str, Any]:
+def _execution_profile_options_payload(
+    *,
+    server_runtime: LocalControllerServer | None = None,
+    principal: RemotePrincipal | None = None,
+) -> dict[str, Any]:
     options = execution_profile_options()
+    allowed_sandboxes = list(LOCAL_SERVER_PERMISSION_PRESET_VALUES)
+    if (
+        principal is not None
+        and principal.kind == "remote_device"
+        and (
+            server_runtime is None
+            or server_runtime.remote_access is None
+            or not server_runtime.remote_access.config.allow_full_access
+        )
+    ):
+        allowed_sandboxes.remove("danger-full-access")
     sandbox_options = [
         _option_payload(value, _sandbox_label(value), _sandbox_description(value))
         for value in options["sandbox_options"]
-        if value in LOCAL_SERVER_PERMISSION_PRESET_VALUES
+        if value in allowed_sandboxes
     ]
     model_options = [
         _option_payload(value, "Codex default" if value == CODEX_DEFAULT_SELECTION else value)
@@ -851,15 +1234,49 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the local controller JSON API server.")
     parser.add_argument("--host", default=LOCAL_SERVER_BIND_HOST, help="Bind host. Must be 127.0.0.1.")
     parser.add_argument("--port", type=int, default=LOCAL_SERVER_DEFAULT_PORT, help="Bind port. Use 0 for an OS-assigned port.")
+    parser.add_argument(
+        "--remote-base-url",
+        help="Opt in to remote mode behind Tailscale Serve, for example https://mac.tailnet.ts.net.",
+    )
+    parser.add_argument(
+        "--repository-root",
+        action="append",
+        default=[],
+        help="Directory containing repositories authorized for remote run starts. Repeatable.",
+    )
+    parser.add_argument(
+        "--allow-remote-full-access",
+        action="store_true",
+        help="Allow paired remote admins to request Full Access with a typed per-run confirmation.",
+    )
     args = parser.parse_args(argv)
     if args.host != LOCAL_SERVER_BIND_HOST:
         parser.exit(2, "error: local server host must be 127.0.0.1\n")
 
-    server = LocalControllerServer(host=args.host, port=args.port)
+    remote_config = None
+    if args.remote_base_url:
+        try:
+            remote_config = RemoteAccessConfig(
+                public_base_url=args.remote_base_url,
+                repository_roots=tuple(Path(value) for value in args.repository_root),
+                allow_full_access=args.allow_remote_full_access,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.repository_root or args.allow_remote_full_access:
+        parser.error("--repository-root and --allow-remote-full-access require --remote-base-url.")
+
+    server = LocalControllerServer(
+        host=args.host,
+        port=args.port,
+        remote_config=remote_config,
+    )
     try:
         server.start()
         print(f"Local controller server listening on http://{server.host}:{server.port}")
         print(f"Bootstrap URL: {server.bootstrap_url()}")
+        if server.remote_pairing_url() is not None:
+            print(f"Remote pairing URL: {server.remote_pairing_url()}")
         if server.thread is not None:
             while server.thread.is_alive():
                 server.thread.join(timeout=1)
