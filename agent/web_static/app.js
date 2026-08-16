@@ -35,7 +35,8 @@
   const elements = {};
   let controllerToken = "";
   let authenticated = false;
-  let remoteMode = false;
+  let remoteAccessEnabled = false;
+  let remoteDevice = false;
   let currentPrincipal = null;
   let pendingPairingCode = "";
   let pollingStopped = false;
@@ -243,12 +244,13 @@
       return false;
     }
     authenticated = true;
-    remoteMode = result.remote_mode === true;
+    remoteAccessEnabled = result.remote_mode === true;
     currentPrincipal = result.principal || null;
+    remoteDevice = Boolean(currentPrincipal && currentPrincipal.kind === "remote_device");
     elements["pairing-panel"].classList.add("hidden");
     elements["startup-panel"].classList.remove("remote-locked");
-    setConnectionState("connected", remoteMode ? "Remote connected" : "Connected");
-    if (remoteMode) {
+    setConnectionState("connected", remoteDevice ? "Remote connected" : "Connected");
+    if (remoteAccessEnabled) {
       await loadRepositoryCatalog();
       elements["remote-device-panel"].classList.remove("hidden");
       await refreshRemoteDevices();
@@ -302,7 +304,7 @@
   }
 
   async function refreshRemoteDevices() {
-    if (!authenticated || !remoteMode) {
+    if (!authenticated || !remoteAccessEnabled) {
       return;
     }
     setText(elements["remote-device-status"], "Loading...");
@@ -645,7 +647,7 @@
     updatePermissionPresetDescription();
     updateFullAccessConfirmation();
     updateControlState();
-    if (remoteMode) {
+    if (remoteDevice) {
       elements["full-access-confirmation"].focus();
     }
   }
@@ -654,7 +656,7 @@
     if (repositoryPickerRequestInFlight || !authenticated) {
       return;
     }
-    if (remoteMode) {
+    if (remoteDevice) {
       await loadRepositoryCatalog();
       elements["repository-catalog"].classList.remove("hidden");
       elements["repository-catalog"].focus();
@@ -1511,7 +1513,7 @@
     const optionsUnavailable = optionsRequestInFlight || !profileOptions;
     const invalidSelection = !profileSelectionValid();
     const fullAccessConfirmationMissing =
-      remoteMode &&
+      remoteDevice &&
       elements["sandbox-select"].value === "danger-full-access" &&
       elements["full-access-confirmation"].value.trim() !== "ENABLE FULL ACCESS";
     const requiredFieldsMissing =
@@ -1733,7 +1735,7 @@
   }
 
   function updateFullAccessConfirmation() {
-    const visible = remoteMode && elements["sandbox-select"].value === "danger-full-access";
+    const visible = remoteDevice && elements["sandbox-select"].value === "danger-full-access";
     elements["full-access-confirmation-label"].classList.toggle("hidden", !visible);
     elements["full-access-confirmation"].classList.toggle("hidden", !visible);
     if (!visible) {

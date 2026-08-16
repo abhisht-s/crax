@@ -395,6 +395,11 @@ _NAVIGATION_ACTION_DIAGNOSTIC_DEFAULTS = {
     "ui_changed_after_action": False,
     "destination_confirmed": False,
     "final_reresolution_status": "not_attempted",
+    "project_open_outcome": "",
+    "project_open_target_match_count": 0,
+    "project_open_truncated_by_node_limit": False,
+    "project_open_truncated_by_depth_limit": False,
+    "project_open_stability_status": "",
 }
 
 
@@ -421,6 +426,36 @@ def _navigation_action_diagnostics_from_open_result(result: dict) -> dict[str, A
     diagnostics["ui_changed_after_action"] = result.get("ui_changed_after_action") is True
     diagnostics["destination_confirmed"] = result.get("destination_confirmed") is True
     diagnostics["final_reresolution_status"] = str(result.get("final_reresolution_status") or "not_attempted")[:80]
+    project_result = result.get("project_open_result")
+    if not isinstance(project_result, dict):
+        project_result = {}
+    project_traversal = project_result.get("traversal")
+    if not isinstance(project_traversal, dict):
+        project_traversal = {}
+    diagnostics["project_open_outcome"] = str(
+        project_result.get("outcome") or result.get("project_open_outcome") or ""
+    )[:80]
+    diagnostics["project_open_target_match_count"] = max(
+        0,
+        int(
+            project_result.get("target_match_count")
+            or result.get("project_open_target_match_count")
+            or 0
+        ),
+    )
+    diagnostics["project_open_truncated_by_node_limit"] = bool(
+        project_traversal.get("truncated_by_node_limit")
+        or result.get("project_open_truncated_by_node_limit") is True
+    )
+    diagnostics["project_open_truncated_by_depth_limit"] = bool(
+        project_traversal.get("truncated_by_depth_limit")
+        or result.get("project_open_truncated_by_depth_limit") is True
+    )
+    diagnostics["project_open_stability_status"] = str(
+        project_result.get("activation_stability_status")
+        or result.get("project_open_stability_status")
+        or ""
+    )[:40]
     return diagnostics
 
 

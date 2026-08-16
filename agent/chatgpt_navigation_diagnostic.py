@@ -57,6 +57,10 @@ VALUE_LENGTH_ONLY_ROLES = {"AXTextArea", "AXTextField"}
 CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 LISTLIKE_ROLES = {"AXList", "AXTable", "AXOutline", "AXCollectionList", "AXSectionList"}
 LISTLIKE_SUBROLES = {"AXCollectionList", "AXSectionList"}
+ALTERNATE_SIDEBAR_SURFACE_ROLES = {"AXScrollArea", "AXGroup"}
+ALTERNATE_SIDEBAR_MAX_WINDOW_WIDTH_FRACTION = 0.5
+ALTERNATE_SIDEBAR_MAX_WIDTH = 520.0
+ALTERNATE_SIDEBAR_LEFT_EDGE_TOLERANCE = 80.0
 ROWLIKE_ROLES = {"AXButton", "AXGroup", "AXStaticText", "AXHeading", "AXLink"}
 SELECTION_ACTIONS = {"AXPress", "AXConfirm", "AXPick"}
 MENU_ONLY_ACTIONS = {"AXShowMenu", "AXShowContextMenu", "AXCancel"}
@@ -1402,8 +1406,86 @@ def _section_container_path(
     list_ancestor = _nearest_listlike_ancestor(snapshot.path, snapshots_by_path)
     if list_ancestor is not None:
         return list_ancestor.path
+    alternate_sidebar = _nearest_alternate_sidebar_surface_ancestor(snapshot.path, snapshots_by_path)
+    if alternate_sidebar is not None:
+        return alternate_sidebar.path
     parent = _parent_path(snapshot.path)
     return parent
+
+
+def _nearest_alternate_sidebar_surface_ancestor(
+    path: str,
+    snapshots_by_path: dict[str, AXElementSnapshot],
+) -> AXElementSnapshot | None:
+    """Resolve nested ChatGPT sidebar wrappers without broadening globally."""
+
+    for ancestor_path in _ancestor_paths(path):
+        ancestor = snapshots_by_path.get(ancestor_path)
+        if ancestor is None or ancestor.role not in ALTERNATE_SIDEBAR_SURFACE_ROLES:
+            continue
+        if _alternate_sidebar_surface_supported(ancestor, snapshots_by_path):
+            return ancestor
+    return None
+
+
+def _alternate_sidebar_surface_supported(
+    surface: AXElementSnapshot,
+    snapshots_by_path: dict[str, AXElementSnapshot],
+) -> bool:
+    surface_frame = _frame_tuple(surface.frame)
+    window = snapshots_by_path.get("W")
+    window_frame = _frame_tuple(window.frame if window is not None else None)
+    if not _frame_is_valid(surface_frame) or not _frame_is_valid(window_frame):
+        return False
+    if not _frame_contains_with_tolerance(window_frame, surface_frame, FRAME_CONTAINMENT_TOLERANCE):
+        return False
+
+    surface_x, _surface_y, surface_width, _surface_height = surface_frame
+    window_x, _window_y, window_width, _window_height = window_frame
+    max_width = min(
+        ALTERNATE_SIDEBAR_MAX_WIDTH,
+        window_width * ALTERNATE_SIDEBAR_MAX_WINDOW_WIDTH_FRACTION,
+    )
+    if surface_width > max_width:
+        return False
+    if abs(surface_x - window_x) > ALTERNATE_SIDEBAR_LEFT_EDGE_TOLERANCE:
+        return False
+
+    metadata = _navigation_metadata_text(surface).casefold()
+    if "sidebar" in metadata or "navigation" in metadata:
+        return True
+
+    labels = _alternate_sidebar_navigation_labels(surface.path, snapshots_by_path)
+    section_labels = labels.intersection({"projects", "history", "recents", "recent chats", "chats"})
+    return "projects" in section_labels and len(section_labels) >= 2
+
+
+def _alternate_sidebar_navigation_labels(
+    surface_path: str,
+    snapshots_by_path: dict[str, AXElementSnapshot],
+) -> set[str]:
+    prefix = surface_path + "."
+    recognized = {
+        "projects",
+        "history",
+        "recents",
+        "recent chats",
+        "chats",
+        "new chat",
+        "new project",
+        "search",
+        "library",
+        "gpts",
+    }
+    labels: set[str] = set()
+    for snapshot in snapshots_by_path.values():
+        if not snapshot.path.startswith(prefix):
+            continue
+        for value in (snapshot.title, snapshot.description, snapshot.value, snapshot.identifier):
+            normalized = _normalized_label(value).casefold()
+            if normalized in recognized:
+                labels.add(normalized)
+    return labels
 
 
 def _row_path_under_container(path: str, container_path: str) -> str:
@@ -4925,10 +5007,17 @@ def _base_project_chat_open_result(project_title: str, chat_title: str, app_name
 
 
 def _project_chat_open_project_summary(project_result: dict) -> dict:
+    traversal = project_result.get("traversal") or {}
     return {
         "ok": bool(project_result.get("ok")),
         "outcome": project_result.get("outcome") or "",
         "chosen_method": project_result.get("chosen_method") or "",
+        "target_match_count": max(0, int(project_result.get("target_match_count") or 0)),
+        "activation_stability_status": str((project_result.get("activation_stability") or {}).get("status") or ""),
+        "traversal": {
+            "truncated_by_node_limit": bool(traversal.get("truncated_by_node_limit")),
+            "truncated_by_depth_limit": bool(traversal.get("truncated_by_depth_limit")),
+        },
         "visible_chat_count": int(project_result.get("visible_chat_count") or 0),
         "post_action_confirmed": bool(project_result.get("post_action_confirmed")),
         "error": project_result.get("error") or "",
@@ -7473,6 +7562,8 @@ def _base_autonomous_open_result(kind: str, title: str, app_name: str, confirm_o
         "process_resolution_method": None,
         "activation_result": {},
         "activation_stability": {},
+        "traversal": {},
+        "target_match_count": 0,
         "target": {},
         "title_frame": _frame_geometry_report(None),
         "row_frame": _frame_geometry_report(None),
@@ -7598,7 +7689,14 @@ def _autonomous_destination_plan(
 ) -> dict:
     classified = classify_navigation_snapshots(snapshots, stats, window_metadata, include_visible_navigation_titles=True)
     matches = _matching_visible_destination_candidates(classified, kind, requested_title)
-    base = {"status": "ready", "error": "", "snapshots": snapshots, "classified": classified, "window_metadata": window_metadata}
+    base = {
+        "status": "ready",
+        "error": "",
+        "snapshots": snapshots,
+        "classified": classified,
+        "window_metadata": window_metadata,
+        "target_match_count": len(matches),
+    }
     if not matches:
         return {**base, "status": "target_absent", "error": "No exactly matching visible sidebar destination was found."}
     if len(matches) > 1:
@@ -7755,7 +7853,10 @@ def _autonomous_plan_result(plan: dict) -> dict:
     scope = plan.get("scope") or {}
     title_snapshot = plan.get("title_snapshot")
     row_snapshot = plan.get("row_snapshot")
+    classified = plan.get("classified") or {}
     return {
+        "traversal": classified.get("traversal") or {},
+        "target_match_count": max(0, int(plan.get("target_match_count") or 0)),
         "target": {
             "kind": kind_from_candidate(candidate),
             "title": candidate.get("exact_title") or "",

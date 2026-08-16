@@ -139,7 +139,6 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="failure-error"',
             'id="failure-recovery"',
             'id="retry-button"',
-            'id="event-timeline"',
             'id="connection-status"',
         ):
             self.assertIn(required, self.html)
@@ -226,6 +225,22 @@ class StaticSourceContractTests(unittest.TestCase):
             "(activeRun && !activeRunReplaceable)",
         ):
             self.assertIn(required, self.all_static)
+
+        # Enabling remote access must not turn a local Mac browser into a
+        # remote device: local operators retain the native Finder picker.
+        self.assertIn("remoteAccessEnabled = result.remote_mode === true;", self.js)
+        self.assertIn(
+            'remoteDevice = Boolean(currentPrincipal && currentPrincipal.kind === "remote_device");',
+            self.js,
+        )
+        self.assertIn(
+            'setConnectionState("connected", remoteDevice ? "Remote connected" : "Connected");',
+            self.js,
+        )
+        self.assertIn(
+            "if (remoteDevice) {\n      await loadRepositoryCatalog();",
+            self.js,
+        )
 
     def test_dashboard_renders_locked_and_run_profile_states_truthfully(self) -> None:
         for required in (

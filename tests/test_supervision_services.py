@@ -1500,6 +1500,11 @@ class NavigationBeforeGateTests(unittest.TestCase):
                 "ui_changed_after_action",
                 "destination_confirmed",
                 "final_reresolution_status",
+                "project_open_outcome",
+                "project_open_target_match_count",
+                "project_open_truncated_by_node_limit",
+                "project_open_truncated_by_depth_limit",
+                "project_open_stability_status",
             },
         )
         self.assertFalse(diagnostics["destination_confirmed"])
@@ -1756,6 +1761,29 @@ class NavigationBeforeGateTests(unittest.TestCase):
         self.assertEqual(instrumented.navigation_action_diagnostics["selected_relation"], "row_node")
         self.assertEqual(instrumented.navigation_action_diagnostics["ax_error_code"], 0)
         self.assertFalse(instrumented.navigation_action_diagnostics["ui_changed_after_action"])
+
+        project_failure = _navigation_attempt_from_open_result(
+            {
+                "ok": False,
+                "outcome": "project_open_failed",
+                "chat_open_action_posted": False,
+                "project_open_result": {
+                    "outcome": "target_absent",
+                    "target_match_count": 0,
+                    "activation_stability_status": "stable",
+                    "traversal": {
+                        "truncated_by_node_limit": True,
+                        "truncated_by_depth_limit": False,
+                    },
+                },
+            }
+        )
+        project_diagnostics = project_failure.navigation_action_diagnostics
+        self.assertEqual(project_diagnostics["project_open_outcome"], "target_absent")
+        self.assertEqual(project_diagnostics["project_open_target_match_count"], 0)
+        self.assertTrue(project_diagnostics["project_open_truncated_by_node_limit"])
+        self.assertFalse(project_diagnostics["project_open_truncated_by_depth_limit"])
+        self.assertEqual(project_diagnostics["project_open_stability_status"], "stable")
 
         # Action never posted -> genuine navigation failure, stays fail-closed.
         for outcome in ("project_open_failed", "chat_row_not_interactable", "click_posting_failed"):

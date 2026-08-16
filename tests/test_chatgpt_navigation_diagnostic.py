@@ -349,6 +349,26 @@ def _sectioned_sidebar_snapshots() -> list[nav.AXElementSnapshot]:
     ]
 
 
+def _nested_scrollarea_sidebar_snapshots(*, sidebar_evidence: bool = True) -> list[nav.AXElementSnapshot]:
+    return [
+        nav.AXElementSnapshot(path="W", depth=0, role="AXWindow", title="ChatGPT", frame=(0, 0, 1200, 900)),
+        nav.AXElementSnapshot(
+            path="W.1",
+            depth=1,
+            role="AXScrollArea",
+            identifier="sidebar" if sidebar_evidence else "",
+            frame=(0, 0, 280 if sidebar_evidence else 1200, 900),
+        ),
+        nav.AXElementSnapshot(path="W.1.1", depth=2, role="AXGroup", frame=(0, 50, 280, 32)),
+        nav.AXElementSnapshot(path="W.1.1.1", depth=3, role="AXHeading", value="Projects", frame=(12, 56, 240, 24)),
+        nav.AXElementSnapshot(path="W.1.2", depth=2, role="AXGroup", actions=("AXPress",), enabled=True, frame=(10, 92, 250, 34)),
+        nav.AXElementSnapshot(path="W.1.2.1", depth=3, role="AXStaticText", value="PTG Assistant", enabled=True, frame=(22, 100, 160, 18)),
+        nav.AXElementSnapshot(path="W.1.3", depth=2, role="AXGroup", frame=(0, 142, 280, 32)),
+        nav.AXElementSnapshot(path="W.1.3.1", depth=3, role="AXHeading", value="Recents", frame=(12, 148, 240, 24)),
+        nav.AXElementSnapshot(path="W.1.4", depth=2, role="AXButton", title="Agent Loop Notes", actions=("AXPress",), enabled=True, frame=(10, 180, 250, 34)),
+    ]
+
+
 def _post_selected_sidebar_snapshots(title: str = "Markdown Formatting Guide") -> list[nav.AXElementSnapshot]:
     snapshots = _sectioned_sidebar_snapshots()
     return [
@@ -1294,6 +1314,29 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertNotIn("New project", project_titles)
         self.assertNotIn("Library", chat_titles | project_titles)
         self.assertNotIn("GPTs", chat_titles | project_titles)
+
+    def test_nested_scrollarea_sidebar_preserves_project_section_context(self) -> None:
+        result = nav.classify_navigation_snapshots(
+            _nested_scrollarea_sidebar_snapshots(),
+            include_visible_navigation_titles=True,
+        )
+
+        self.assertEqual(
+            [candidate["exact_title"] for candidate in result["visible_project_title_candidates"]],
+            ["PTG Assistant"],
+        )
+        self.assertEqual(
+            result["visible_project_title_candidates"][0]["nearest_list_container"]["path"],
+            "W.1",
+        )
+
+    def test_nested_wide_scrollarea_without_sidebar_evidence_remains_unclassified(self) -> None:
+        result = nav.classify_navigation_snapshots(
+            _nested_scrollarea_sidebar_snapshots(sidebar_evidence=False),
+            include_visible_navigation_titles=True,
+        )
+
+        self.assertEqual(result["visible_project_title_candidates"], [])
 
     def test_opt_in_keeps_long_composer_and_message_like_text_redacted(self) -> None:
         result = nav.classify_navigation_snapshots(
@@ -2506,6 +2549,36 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertEqual(partial["outcome"], "chat_not_currently_visible")
         self.assertEqual(preview["actions_performed"], [])
         self.assertEqual(partial["actions_performed"], [])
+
+    def test_project_chat_open_preserves_bounded_project_failure_diagnostics(self) -> None:
+        project_open = mock.Mock(
+            return_value={
+                "ok": False,
+                "outcome": "target_absent",
+                "target_match_count": 0,
+                "activation_stability": {"status": "stable"},
+                "traversal": {
+                    "truncated_by_node_limit": True,
+                    "truncated_by_depth_limit": False,
+                },
+                "error": "No exactly matching visible sidebar destination was found.",
+            }
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Push Notification Analytics Planning",
+                confirm_open_chat=True,
+                open_project_function=project_open,
+            )
+
+        self.assertEqual(result["outcome"], "project_open_failed")
+        self.assertEqual(result["project_open_result"]["outcome"], "target_absent")
+        self.assertEqual(result["project_open_result"]["target_match_count"], 0)
+        self.assertEqual(result["project_open_result"]["activation_stability_status"], "stable")
+        self.assertTrue(result["project_open_result"]["traversal"]["truncated_by_node_limit"])
+        self.assertFalse(result["project_open_result"]["traversal"]["truncated_by_depth_limit"])
 
     def test_project_chat_open_matches_exact_accessibility_row_text(self) -> None:
         with mock.patch.object(nav.sys, "platform", "darwin"):
@@ -5308,6 +5381,27 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertEqual(reader.actions, [])
         activation.assert_not_called()
         self.assertEqual(result["activation_result"]["error"], "skipped_dry_run")
+
+    def test_autonomous_dry_run_accepts_nested_scrollarea_sidebar_project(self) -> None:
+        snapshots = _nested_scrollarea_sidebar_snapshots()
+        reader = _AutonomousReader([snapshots] * 3, {"available": True, "path": "W.1.2.1"})
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_sidebar_destination(
+                kind="project",
+                title="PTG Assistant",
+                confirm_open_destination=False,
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "dry_run_ready")
+        self.assertEqual(result["chosen_method"], "axpress")
+        self.assertEqual(result["target_match_count"], 1)
+        self.assertEqual(result["actions_performed"], [])
 
     def test_autonomous_exact_title_missing_and_ambiguous_fail_closed(self) -> None:
         duplicate = _detailed_sidebar_snapshots() + [
