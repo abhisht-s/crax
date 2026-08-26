@@ -7445,14 +7445,24 @@ def _project_chat_post_action_inspection(
             "signals": [],
         }
     snapshots = stable["snapshots"]
+    ax_window_frame = stable.get("ax_window_frame") or _window_frame_from_metadata(
+        stable["window_metadata"],
+        snapshots,
+    )
     resolution = resolve_open_project_content_and_visible_chats(
         project_title,
         snapshots,
-        stable.get("ax_window_frame") or _window_frame_from_metadata(stable["window_metadata"], snapshots),
+        ax_window_frame,
         traversal_stats=stable["stats"],
         window_metadata=stable["window_metadata"],
     )
-    signals = _project_chat_verification_signals(snapshots, resolution, chat_title, pre_plan)
+    signals = _project_chat_verification_signals(
+        snapshots,
+        resolution,
+        chat_title,
+        pre_plan,
+        ax_window_frame=ax_window_frame,
+    )
     signal_types = {signal.get("type") for signal in signals}
     verification_state = "project_list_active" if resolution.get("status") == "visible_chats_found" else "conversation_or_non_list_view_active"
     confirmed = (
@@ -7481,6 +7491,8 @@ def _project_chat_verification_signals(
     resolution: dict,
     chat_title: str,
     pre_plan: dict,
+    *,
+    ax_window_frame: tuple[float, float, float, float] | None = None,
 ) -> list[dict]:
     signals: list[dict] = []
     snapshots_by_path = {snapshot.path: snapshot for snapshot in snapshots}
@@ -7500,7 +7512,10 @@ def _project_chat_verification_signals(
             continue
         if _path_in_or_under(snapshot.path, row_path) or _path_in_or_under(snapshot.path, list_path):
             continue
-        if snapshot.depth <= 8:
+        if snapshot.depth <= 8 or _frame_visibly_intersects(
+            _frame_tuple(snapshot.frame),
+            ax_window_frame,
+        ):
             signals.append({"type": "active_conversation_identity_outside_chat_list", "path": snapshot.path, "role": snapshot.role})
             break
     if _conversation_structure_present(snapshots, row_path, list_path):
@@ -7510,6 +7525,22 @@ def _project_chat_verification_signals(
     if _main_project_layout_materially_changed(resolution, pre_plan):
         signals.append({"type": "main_region_layout_materially_changed"})
     return signals
+
+
+def _frame_visibly_intersects(
+    frame: tuple[float, float, float, float] | None,
+    container: tuple[float, float, float, float] | None,
+) -> bool:
+    if not _frame_is_valid(frame) or not _frame_is_valid(container):
+        return False
+    x, y, width, height = frame
+    container_x, container_y, container_width, container_height = container
+    return bool(
+        x + width > container_x
+        and x < container_x + container_width
+        and y + height > container_y
+        and y < container_y + container_height
+    )
 
 
 def _path_in_or_under(path: str, ancestor: str) -> bool:

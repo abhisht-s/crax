@@ -818,6 +818,15 @@ def _evidence_summary_metadata(summary: Any) -> dict[str, Any]:
     return {}
 
 
+def _destination_gate_failure_fingerprint(
+    gate_result: DestinationGateResult,
+) -> tuple[str, str]:
+    return (
+        str(gate_result.reason_code or "destination_verification_unavailable"),
+        repr(_evidence_summary_metadata(gate_result.evidence_summary)),
+    )
+
+
 def _destination_gate_metadata(
     gate_result: DestinationGateResult,
     acquire_result: Any,
@@ -846,10 +855,18 @@ def _record_destination_gate_blocked_event(
     acquire_result: Any,
     *,
     navigation_summary: dict[str, Any] | None = None,
+    attempt_number: int | None = None,
+    max_attempts: int | None = None,
+    will_retry: bool = False,
     ledger: Any,
 ) -> dict[str, Any]:
     metadata = _destination_gate_metadata(gate_result, acquire_result)
     metadata["navigation"] = navigation_summary
+    if attempt_number is not None:
+        metadata["attempt_number"] = attempt_number
+    if max_attempts is not None:
+        metadata["max_attempts"] = max_attempts
+    metadata["will_retry"] = bool(will_retry)
     event_id = ledger.add_event(
         gate_result.run_id,
         CHATGPT_DESTINATION_GATE_BLOCKED_EVENT_TYPE,
@@ -1153,6 +1170,7 @@ def _run_chatgpt_handoff_transaction(
         handoff_attempts: list[dict[str, Any]] = []
         current_result: Any = None
         current_stage = str(plan.action)
+        previous_gate_failure_fingerprint: tuple[str, str] | None = None
 
         for attempt_number in range(1, max_attempts + 1):
             current_stage = str(plan.action)
@@ -1257,20 +1275,34 @@ def _run_chatgpt_handoff_transaction(
             if not _result_ok(gate_result) or getattr(gate_result, "state", None) != DESTINATION_VERIFIED_EXACT:
                 phase = HANDOFF_PHASE_VERIFICATION_FAILED
                 reason_code = gate_result.reason_code or "destination_verification_unavailable"
+                failure_fingerprint = _destination_gate_failure_fingerprint(gate_result)
+                repeated_deterministic_failure = (
+                    failure_fingerprint == previous_gate_failure_fingerprint
+                )
+                previous_gate_failure_fingerprint = failure_fingerprint
+                will_retry = bool(
+                    attempt_can_retry and not repeated_deterministic_failure
+                )
                 attempt_summary["stage"] = "verification"
                 attempt_summary["ok"] = False
                 attempt_summary["reason_code"] = reason_code
                 attempt_summary["navigation"] = navigation_summary
+                attempt_summary["repeated_deterministic_failure"] = (
+                    repeated_deterministic_failure
+                )
                 handoff_attempts.append(attempt_summary)
-                if attempt_can_retry:
-                    continue
                 gate_event = _record_destination_gate_blocked_event(
                     gate_result,
                     acquire_result,
                     navigation_summary=navigation_summary,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    will_retry=will_retry,
                     ledger=ledger,
                 )
                 events_written.append(gate_event)
+                if will_retry:
+                    continue
                 blocked_status = _mark_destination_gate_handoff_blocked(
                     run_id,
                     run,

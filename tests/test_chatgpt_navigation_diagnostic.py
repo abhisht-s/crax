@@ -2929,6 +2929,85 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertTrue(result["target_initially_visible"])
         self.assertIn(("W.1.4.1", "AXPress"), reader.actions)
 
+    def test_post_action_verification_accepts_deep_visible_conversation_title(self) -> None:
+        snapshots = [
+            nav.AXElementSnapshot(
+                path="W",
+                depth=0,
+                role="AXWindow",
+                title="ChatGPT",
+                frame=(0, 0, 1200, 900),
+            ),
+            nav.AXElementSnapshot(
+                path="W.1.1.3.1.1.1.2.1.1",
+                depth=9,
+                role="AXStaticText",
+                value="City-wise Restrictions",
+                frame=(320, 40, 500, 30),
+            ),
+            nav.AXElementSnapshot(
+                path="W.1.2",
+                depth=2,
+                role="AXTextArea",
+                title="Message ChatGPT",
+                frame=(320, 820, 620, 44),
+            ),
+        ]
+
+        signals = nav._project_chat_verification_signals(
+            snapshots,
+            {"status": "project_open_failed"},
+            "City-wise Restrictions",
+            {
+                "matched_chat_row": {"row_path": "W.old-row"},
+                "project_chat_resolution": {
+                    "chat_list_container": {"path": "W.old-list"}
+                },
+            },
+            ax_window_frame=(0, 0, 1200, 900),
+        )
+
+        self.assertIn(
+            "active_conversation_identity_outside_chat_list",
+            {signal["type"] for signal in signals},
+        )
+
+    def test_post_action_verification_rejects_deep_offscreen_conversation_title(self) -> None:
+        snapshots = [
+            nav.AXElementSnapshot(
+                path="W",
+                depth=0,
+                role="AXWindow",
+                title="ChatGPT",
+                frame=(0, 0, 1200, 900),
+            ),
+            nav.AXElementSnapshot(
+                path="W.1.1.3.1.1.1.2.1.1",
+                depth=9,
+                role="AXStaticText",
+                value="City-wise Restrictions",
+                frame=(320, -1985, 500, 30),
+            ),
+        ]
+
+        signals = nav._project_chat_verification_signals(
+            snapshots,
+            {"status": "project_open_failed"},
+            "City-wise Restrictions",
+            {
+                "matched_chat_row": {"row_path": "W.old-row"},
+                "project_chat_resolution": {
+                    "chat_list_container": {"path": "W.old-list"}
+                },
+            },
+            ax_window_frame=(0, 0, 1200, 900),
+        )
+
+        self.assertNotIn(
+            "active_conversation_identity_outside_chat_list",
+            {signal["type"] for signal in signals},
+        )
+
     def test_project_chat_open_reports_action_posted_when_open_action_is_pressed(self) -> None:
         # The structured chat_open_action_posted signal is emitted whenever the
         # open action is physically posted against the exact target row, which

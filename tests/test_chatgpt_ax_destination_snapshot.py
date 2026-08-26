@@ -86,6 +86,129 @@ class ChatGPTAXDestinationSnapshotAdapterTests(unittest.TestCase):
         self.assertEqual(snap.active_conversation_chat_title, CHAT_TITLE)
         self.assertEqual(snap.active_conversation_project_title, PROJECT_TITLE)
 
+    def test_active_conversation_identity_accepts_shallow_title_without_toolbar_actions(self) -> None:
+        nodes = (
+            AXDestinationNode(
+                path="W",
+                depth=0,
+                role="AXWindow",
+                title="ChatGPT",
+                frame=(200.0, 100.0, 1200.0, 900.0),
+            ),
+            AXDestinationNode(
+                path="W.2.1.3",
+                depth=3,
+                role="AXStaticText",
+                value=f"{CHAT_TITLE}, {PROJECT_TITLE}",
+                frame=(462.0, 112.0, 320.0, 30.0),
+            ),
+        )
+
+        snap = ax_snapshot_module._snapshot_from_observation(
+            _complete_observation(nodes=nodes)
+        )
+
+        self.assertEqual(snap.active_conversation_chat_title, CHAT_TITLE)
+        self.assertEqual(snap.active_conversation_project_title, PROJECT_TITLE)
+
+    def test_structural_identity_and_window_relative_composer_verify_exact_destination(self) -> None:
+        nodes = (
+            AXDestinationNode(
+                path="W",
+                depth=0,
+                role="AXWindow",
+                title="ChatGPT",
+                frame=(200.0, 100.0, 1200.0, 700.0),
+            ),
+            AXDestinationNode(
+                path="W.2.1.3",
+                depth=3,
+                role="AXStaticText",
+                value=f"{CHAT_TITLE}, {PROJECT_TITLE}",
+                frame=(462.0, 112.0, 320.0, 30.0),
+            ),
+            AXDestinationNode(
+                path="W.3",
+                depth=1,
+                role="AXTextArea",
+                enabled=True,
+                frame=(520.0, 720.0, 620.0, 44.0),
+            ),
+        )
+
+        snapshot = ax_snapshot_module._snapshot_from_observation(
+            _complete_observation(nodes=nodes)
+        )
+        result = _verify(snapshot)
+
+        self.assertTrue(snapshot.composer_available)
+        self.assertEqual(snapshot.composer_candidate_count, 1)
+        self.assertTrue(result.ok)
+
+    def test_structural_title_fallback_rejects_deep_or_offscreen_transcript_text(self) -> None:
+        nodes = (
+            AXDestinationNode(
+                path="W",
+                depth=0,
+                role="AXWindow",
+                title="ChatGPT",
+                frame=(200.0, 100.0, 1200.0, 900.0),
+            ),
+            AXDestinationNode(
+                path="W.1.1.3.1.1.1.2.1.1",
+                depth=9,
+                role="AXStaticText",
+                value=f"{CHAT_TITLE}, {PROJECT_TITLE}",
+                frame=(491.0, 118.0, 586.0, 40.0),
+            ),
+            AXDestinationNode(
+                path="W.1.1.3.1.1.1.2.1.2",
+                depth=4,
+                role="AXStaticText",
+                value=f"{CHAT_TITLE}, {PROJECT_TITLE}",
+                frame=(491.0, -1985.0, 586.0, 40.0),
+            ),
+        )
+
+        snap = ax_snapshot_module._snapshot_from_observation(
+            _complete_observation(nodes=nodes)
+        )
+
+        self.assertEqual(snap.active_conversation_chat_title, "")
+        self.assertEqual(snap.active_conversation_project_title, "")
+
+    def test_structural_title_fallback_rejects_ambiguous_top_window_identities(self) -> None:
+        nodes = (
+            AXDestinationNode(
+                path="W",
+                depth=0,
+                role="AXWindow",
+                title="ChatGPT",
+                frame=(0.0, 0.0, 1200.0, 900.0),
+            ),
+            AXDestinationNode(
+                path="W.2.1.1",
+                depth=3,
+                role="AXStaticText",
+                title=f"{CHAT_TITLE}, {PROJECT_TITLE}",
+                frame=(260.0, 20.0, 320.0, 30.0),
+            ),
+            AXDestinationNode(
+                path="W.2.1.2",
+                depth=3,
+                role="AXStaticText",
+                title="Other Chat, Other Project",
+                frame=(600.0, 20.0, 320.0, 30.0),
+            ),
+        )
+
+        snap = ax_snapshot_module._snapshot_from_observation(
+            _complete_observation(nodes=nodes)
+        )
+
+        self.assertEqual(snap.active_conversation_chat_title, "")
+        self.assertEqual(snap.active_conversation_project_title, "")
+
     def test_active_conversation_identity_ignores_non_titlebar_comma_labels(self) -> None:
         # A comma-bearing label that is not a window toolbar/title item (e.g. a
         # mid-content static text) must not be mistaken for the active identity.

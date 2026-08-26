@@ -968,7 +968,15 @@ class SupervisionStepServiceTests(unittest.TestCase):
             for event in ledger.added_events
             if event["event_type"] == "chatgpt_destination_gate_blocked_handoff"
         ]
-        self.assertEqual(len(blocked_events), 1)
+        self.assertEqual(len(blocked_events), 2)
+        self.assertEqual(
+            [event["metadata"]["attempt_number"] for event in blocked_events],
+            [1, 2],
+        )
+        self.assertEqual(
+            [event["metadata"]["will_retry"] for event in blocked_events],
+            [True, False],
+        )
         metadata = blocked_events[0]["metadata"]
         self.assertEqual(metadata["run_id"], "run-1")
         self.assertEqual(metadata["binding_project_title"], "Project Alpha")
@@ -1533,20 +1541,22 @@ class NavigationBeforeGateTests(unittest.TestCase):
         self.assertTrue(result.blocked)
         self.assertEqual(result.reason_code, "chat_not_active")
         self.assertEqual(result.run_status, "needs_review")
-        self.assertEqual(len(nav.calls), CHATGPT_HANDOFF_MAX_UI_ATTEMPTS)
+        self.assertEqual(len(nav.calls), 2)
         self.assertEqual(len(submit.calls), 0)
         self.assertEqual(len(capture.calls), 0)
         self.assertIn("navigate", ledger.operations)
         self.assertEqual(
             ledger.operations.count("read_only_destination_gate"),
-            CHATGPT_HANDOFF_MAX_UI_ATTEMPTS,
+            2,
         )
         self.assertIn("release_lease", ledger.operations)
         blocked = [
             e for e in ledger.added_events if e["event_type"] == "chatgpt_destination_gate_blocked_handoff"
         ]
-        self.assertEqual(len(blocked), 1)
+        self.assertEqual(len(blocked), 2)
         self.assertEqual(blocked[0]["metadata"]["navigation"]["ok"], True)
+        self.assertTrue(blocked[0]["metadata"]["will_retry"])
+        self.assertFalse(blocked[1]["metadata"]["will_retry"])
         self.assertEqual(self._phase_event(ledger)["metadata"]["handoff_phase"], "verification_failed")
 
     def test_navigation_runs_at_most_once_per_transaction(self) -> None:

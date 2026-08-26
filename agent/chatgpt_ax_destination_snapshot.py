@@ -38,6 +38,10 @@ SIDEBAR_MAX_X = 420
 MAIN_MIN_X = 260
 TOP_MAX_Y = 170
 BOTTOM_MIN_Y = 520
+WINDOW_TITLE_FALLBACK_MAX_DEPTH = 6
+WINDOW_TITLE_FALLBACK_TOP_TOLERANCE = 120.0
+WINDOW_TITLE_FALLBACK_MAX_TOP_OFFSET = 180.0
+WINDOW_TITLE_FALLBACK_MAX_HEIGHT = 120.0
 ACTIONABLE_ROLES = {
     "AXButton",
     "AXCell",
@@ -365,6 +369,7 @@ def _project_chats_list_confirmed(nodes: tuple[AXDestinationNode, ...]) -> bool:
 
 def _node_classes(nodes: tuple[AXDestinationNode, ...]) -> dict[str, frozenset[str]]:
     by_path = {node.path: node for node in nodes}
+    window_frame = by_path.get("W").frame if by_path.get("W") is not None else None
     children_by_parent: dict[str, list[AXDestinationNode]] = {}
     for node in nodes:
         parent_path = _parent_path(node.path)
@@ -381,7 +386,7 @@ def _node_classes(nodes: tuple[AXDestinationNode, ...]) -> dict[str, frozenset[s
             if sibling.path != node.path
         )
         text = _context_text(node)
-        frame_band = _frame_band(node.frame)
+        frame_band = _frame_band(node.frame, window_frame=window_frame)
         node_classes: set[str] = set()
 
         if node.role in GROUP_ROLES:
@@ -603,15 +608,32 @@ def _candidate_like(node: AXDestinationNode) -> bool:
     )
 
 
-def _frame_band(frame: tuple[float, float, float, float] | None) -> str:
+def _frame_band(
+    frame: tuple[float, float, float, float] | None,
+    *,
+    window_frame: tuple[float, float, float, float] | None = None,
+) -> str:
     if frame is None:
         return "unknown"
     x, y, width, height = frame
-    horizontal = "left" if x < SIDEBAR_MAX_X and width < 720 else "main"
-    if x >= MAIN_MIN_X and width >= 320:
+    relative_x = x
+    relative_y = y
+    window_height = 0.0
+    if window_frame is not None:
+        window_x, window_y, _window_width, window_height = window_frame
+        relative_x = x - window_x
+        relative_y = y - window_y
+    horizontal = "left" if relative_x < SIDEBAR_MAX_X and width < 720 else "main"
+    if relative_x >= MAIN_MIN_X and width >= 320:
         horizontal = "main"
-    vertical = "top" if y < TOP_MAX_Y else "middle"
-    if y >= BOTTOM_MIN_Y:
+    top_threshold = min(TOP_MAX_Y, window_height * 0.25) if window_height > 0 else TOP_MAX_Y
+    bottom_threshold = (
+        min(BOTTOM_MIN_Y, window_height * 0.65)
+        if window_height > 0
+        else BOTTOM_MIN_Y
+    )
+    vertical = "top" if relative_y < top_threshold else "middle"
+    if relative_y >= bottom_threshold:
         vertical = "bottom"
     return f"{vertical}-{horizontal}"
 
@@ -806,19 +828,88 @@ def _active_conversation_identity(
     non-empty parts. This is the authoritative active-destination identity.
     """
 
+    window = next(
+        (
+            node
+            for node in nodes
+            if node.path == "W" and node.role == "AXWindow"
+        ),
+        None,
+    )
+    window_frame = window.frame if window is not None else None
+    action_identified: list[tuple[str, str]] = []
+    structurally_identified: list[tuple[str, str]] = []
     for node in nodes:
-        if not _window_title_item(node):
+        identity = _conversation_identity_from_title_node(node)
+        if identity is None:
             continue
-        label = _compact_label(node.description) or _compact_label(node.title)
-        if not label or "," not in label:
-            continue
-        parts = [part.strip() for part in label.split(",")]
-        if len(parts) != 2:
-            continue
-        chat_title, project_title = parts[0], parts[1]
-        if chat_title and project_title:
-            return chat_title, project_title
+        if _window_title_item(node):
+            action_identified.append(identity)
+        elif _structural_window_title_item(node, window_frame):
+            structurally_identified.append(identity)
+
+    for candidates in (action_identified, structurally_identified):
+        unique = tuple(dict.fromkeys(candidates))
+        if len(unique) == 1:
+            return unique[0]
+        if len(unique) > 1:
+            return "", ""
     return "", ""
+
+
+def _conversation_identity_from_title_node(
+    node: AXDestinationNode,
+) -> tuple[str, str] | None:
+    label = (
+        _compact_label(node.description)
+        or _compact_label(node.title)
+        or _compact_label(node.value)
+    )
+    if not label or "," not in label:
+        return None
+    parts = [part.strip() for part in label.split(",")]
+    if len(parts) != 2 or not all(parts):
+        return None
+    return parts[0], parts[1]
+
+
+def _structural_window_title_item(
+    node: AXDestinationNode,
+    window_frame: tuple[float, float, float, float] | None,
+) -> bool:
+    """Recognize the current title item when toolbar actions are no longer exposed.
+
+    This covers builds that retain shallow, top-of-window title geometry while
+    omitting the toolbar-management actions used by older builds. The fallback
+    stays fail-closed: it requires one shallow title-like node with a valid frame
+    in the window's title band. Deep or far-offscreen transcript text is rejected.
+    """
+
+    if node.role not in {"AXButton", "AXStaticText", "AXHeading"}:
+        return False
+    if node.depth > WINDOW_TITLE_FALLBACK_MAX_DEPTH:
+        return False
+    if node.frame is None or window_frame is None:
+        return False
+    node_x, node_y, node_width, node_height = node.frame
+    window_x, window_y, window_width, window_height = window_frame
+    if (
+        node_width <= 0
+        or node_height <= 0
+        or window_width <= 0
+        or window_height <= 0
+        or node_height > WINDOW_TITLE_FALLBACK_MAX_HEIGHT
+    ):
+        return False
+    if node_x + node_width <= window_x or node_x >= window_x + window_width:
+        return False
+    return bool(
+        node_y >= window_y - WINDOW_TITLE_FALLBACK_TOP_TOLERANCE
+        and node_y <= window_y + min(
+            WINDOW_TITLE_FALLBACK_MAX_TOP_OFFSET,
+            window_height * 0.25,
+        )
+    )
 
 
 def _actionable(node: AXDestinationNode) -> bool:
