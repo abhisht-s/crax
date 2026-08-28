@@ -144,8 +144,8 @@ class StaticSourceContractTests(unittest.TestCase):
             self.assertIn(required, self.html)
 
         self.assertIn("Codex Permission Preset", self.html)
-        self.assertIn("<title>Agent Controller</title>", self.html)
-        self.assertIn("<h1>Agent Controller</h1>", self.html)
+        self.assertIn("<title>Crax</title>", self.html)
+        self.assertIn("<h1>Crax</h1>", self.html)
         self.assertIn('class="connection-label">Controller connection</p>', self.html)
         self.assertIn('class="panel disclosure-panel"', self.html)
         self.assertIn("Run details and controls", self.html)
