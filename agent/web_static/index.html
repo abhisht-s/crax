@@ -202,7 +202,16 @@
           <div><dt>Final message</dt><dd id="codex-live-final">Not available yet</dd></div>
           <div><dt>Latest issue</dt><dd id="codex-live-error">None</dd></div>
         </dl>
-        <ol id="codex-live-events" class="progress-events"></ol>
+        <div class="codex-live-columns">
+          <section class="codex-live-column" aria-labelledby="codex-commentary-heading">
+            <h3 id="codex-commentary-heading" class="codex-live-subheading">Commentary</h3>
+            <ol id="codex-live-events" class="progress-events"></ol>
+          </section>
+          <section class="codex-live-column codex-plan-column" aria-labelledby="codex-plan-heading">
+            <h3 id="codex-plan-heading" class="codex-live-subheading">Plan</h3>
+            <ol id="codex-live-plan" class="codex-plan"></ol>
+          </section>
+        </div>
       </section>
 
       <section id="approval-panel" class="panel hidden" aria-labelledby="approval-heading">

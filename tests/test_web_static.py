@@ -129,6 +129,7 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="codex-live-final"',
             'id="codex-live-error"',
             'id="codex-live-events"',
+            'id="codex-live-plan"',
             'id="approval-panel"',
             'id="approve-button"',
             'id="reject-button"',
@@ -385,6 +386,10 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn("renderCodexLiveProgress(runtime)", self.js)
         self.assertIn("codexSessionIdFromProgressEvent", self.js)
         self.assertIn("currentCodexSessionId", self.js)
+        self.assertIn("codexPlanFromProgressEvent", self.js)
+        self.assertIn("renderCodexPlan", self.js)
+        self.assertIn("currentCodexPlan", self.js)
+        self.assertIn("codex-live-columns", self.all_static)
         self.assertIn('event.kind === "assistant_commentary"', self.js)
         self.assertIn(".slice(-PROGRESS_EVENT_RENDER_LIMIT)", self.js)
         self.assertIn("Codex Working Notes", self.html)

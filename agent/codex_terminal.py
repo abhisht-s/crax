@@ -19,6 +19,8 @@ CODEX_JSON_PROGRESS_SOURCE = "codex_cli_jsonl"
 CODEX_PROGRESS_TITLE_LIMIT = 240
 CODEX_PROGRESS_SUMMARY_LIMIT = 1000
 CODEX_PROGRESS_METADATA_TEXT_LIMIT = 500
+CODEX_PLAN_ITEM_LIMIT = 20
+CODEX_PLAN_ITEM_TEXT_LIMIT = 240
 _ACTIVE_CODEX_PROCESSES: dict[str, subprocess.Popen] = {}
 _ACTIVE_CODEX_PROCESSES_LOCK = threading.Lock()
 
@@ -155,6 +157,13 @@ def _json_value_summary(event: dict[str, Any]) -> dict[str, object]:
         item_type = item.get("type") or item.get("kind")
         if isinstance(item_type, str):
             summary["item_type"] = _bounded_text(item_type, 120)
+            if item_type.strip().lower() == "todo_list":
+                plan_items = _todo_list_items(item)
+                if plan_items is not None:
+                    summary["plan_items"] = plan_items
+                    summary["plan_items_truncated"] = len(item.get("items", [])) > len(
+                        plan_items
+                    )
     tool_name = _nested_dict_value(event, "tool_name") or _nested_dict_value(event, "tool")
     if isinstance(tool_name, str):
         summary["tool_name"] = _safe_identifier(tool_name)
@@ -168,6 +177,22 @@ def _json_value_summary(event: dict[str, Any]) -> dict[str, object]:
     if error is not None:
         summary["error"] = _bounded_text(error, CODEX_PROGRESS_METADATA_TEXT_LIMIT)
     return summary
+
+
+def _todo_list_items(item: dict[str, Any]) -> list[dict[str, object]] | None:
+    raw_items = item.get("items")
+    if not isinstance(raw_items, list):
+        return None
+    plan_items: list[dict[str, object]] = []
+    for raw_item in raw_items[:CODEX_PLAN_ITEM_LIMIT]:
+        if not isinstance(raw_item, dict):
+            continue
+        label = _bounded_text(raw_item.get("text"), CODEX_PLAN_ITEM_TEXT_LIMIT)
+        completed = raw_item.get("completed")
+        if label is None or not isinstance(completed, bool):
+            continue
+        plan_items.append({"label": label, "completed": completed})
+    return plan_items
 
 
 def _file_change_summary(event: dict[str, Any]) -> dict[str, object]:

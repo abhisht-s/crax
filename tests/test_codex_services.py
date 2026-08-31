@@ -236,6 +236,35 @@ def _temporary_real_ledger():
 
 
 class CodexTerminalTimeoutTests(unittest.TestCase):
+    def test_todo_list_event_preserves_bounded_plan_items(self) -> None:
+        event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "item.updated",
+                    "item": {
+                        "id": "item-1",
+                        "type": "todo_list",
+                        "items": [
+                            {"text": "Inspect the narrow seam", "completed": True},
+                            {"text": "Run focused tests", "completed": False},
+                        ],
+                    },
+                }
+            )
+        )
+
+        summary = event["metadata"]["value_summary"]
+        self.assertEqual(summary["item_type"], "todo_list")
+        self.assertEqual(
+            summary["plan_items"],
+            [
+                {"label": "Inspect the narrow seam", "completed": True},
+                {"label": "Run focused tests", "completed": False},
+            ],
+        )
+        self.assertFalse(summary["plan_items_truncated"])
+        self.assertNotIn('"text"', json.dumps(event["metadata"], sort_keys=True))
+
     def test_thread_started_event_preserves_codex_session_id(self) -> None:
         session_id = "01a05837-1cb2-76b0-852f-6a104eb1f07c"
         event = codex_terminal.normalize_codex_jsonl_event(
@@ -748,6 +777,39 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         self.assertEqual(
             events[0]["metadata"]["value_summary"]["codex_session_id"],
             session_id,
+        )
+
+    def test_real_ledger_preserves_codex_plan_items(self) -> None:
+        progress_event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "item.updated",
+                    "item": {
+                        "id": "item-1",
+                        "type": "todo_list",
+                        "items": [
+                            {"text": "Inspect the narrow seam", "completed": True},
+                            {"text": "Run focused tests", "completed": False},
+                        ],
+                    },
+                }
+            )
+        )
+        with _temporary_real_ledger():
+            run_id = ledger_module.create_run("Task")
+            ledger_module.add_codex_progress_event(
+                run_id,
+                "inv-plan",
+                progress_event,
+            )
+            events = ledger_module.list_codex_progress_events(run_id)
+
+        self.assertEqual(
+            events[0]["metadata"]["value_summary"]["plan_items"],
+            [
+                {"label": "Inspect the narrow seam", "completed": True},
+                {"label": "Run focused tests", "completed": False},
+            ],
         )
 
     def test_controller_profile_default_model_launches_without_model_arg(self) -> None:

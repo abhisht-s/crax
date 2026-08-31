@@ -530,6 +530,26 @@ select:focus-visible {
   margin: 0.65rem 1rem 0;
 }
 
+.codex-live-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr);
+  margin-top: 0.55rem;
+  border-top: 1px solid var(--border);
+}
+
+.codex-live-column {
+  min-width: 0;
+}
+
+.codex-live-column + .codex-live-column {
+  border-left: 1px solid var(--border);
+}
+
+.codex-live-subheading {
+  margin: 0;
+  padding: 0.55rem 1rem 0;
+}
+
 .progress-events {
   list-style: none;
   padding: 0.5rem 1rem 1rem;
@@ -569,6 +589,45 @@ select:focus-visible {
   border-radius: 0;
   padding: 0.2rem 0 0.2rem 0.75rem;
   background: transparent;
+}
+
+.codex-plan {
+  list-style: none;
+  padding: 0.5rem 1rem 1rem;
+  margin: 0.25rem 0 0;
+  display: grid;
+  gap: 0.35rem;
+  max-height: 28rem;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.codex-plan-item {
+  display: grid;
+  grid-template-columns: 1rem minmax(0, 1fr);
+  gap: 0.45rem;
+  align-items: start;
+  color: var(--text);
+}
+
+.codex-plan-marker {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.codex-plan-item.completed .codex-plan-marker {
+  color: var(--ok);
+}
+
+.codex-plan-item.completed .codex-plan-label {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.codex-plan-empty {
+  color: var(--muted);
 }
 
 .hidden {
@@ -622,6 +681,20 @@ select:focus-visible {
 
   .disclosure-panel summary {
     padding: 0.9rem;
+  }
+
+  .codex-live-columns {
+    display: block;
+  }
+
+  .codex-live-column + .codex-live-column {
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .progress-events,
+  .codex-plan {
+    max-height: none;
   }
 
   .connection-panel {

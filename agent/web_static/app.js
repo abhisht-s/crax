@@ -61,6 +61,7 @@
   let progressAfterSequence = 0;
   let progressRunId = "";
   let currentCodexSessionId = "";
+  let currentCodexPlan = [];
   let progressStreamController = null;
   let progressStreamActive = false;
   let progressPollTimer = null;
@@ -145,6 +146,7 @@
       "codex-live-final",
       "codex-live-error",
       "codex-live-events",
+      "codex-live-plan",
       "approval-panel",
       "approval-kind",
       "approve-button",
@@ -923,6 +925,7 @@
     progressEvents = [];
     progressAfterSequence = 0;
     currentCodexSessionId = "";
+    currentCodexPlan = [];
   }
 
   function startProgressStream() {
@@ -1098,10 +1101,15 @@
     }
     if (event.kind === "process_started") {
       currentCodexSessionId = "";
+      currentCodexPlan = [];
     }
     const sessionId = codexSessionIdFromProgressEvent(event);
     if (sessionId) {
       currentCodexSessionId = sessionId;
+    }
+    const plan = codexPlanFromProgressEvent(event);
+    if (plan !== null) {
+      currentCodexPlan = plan;
     }
     progressEvents.push(event);
     if (sequence) {
@@ -1123,6 +1131,23 @@
       ? metadata.value_summary
       : {};
     return typeof summary.codex_session_id === "string" ? summary.codex_session_id : "";
+  }
+
+  function codexPlanFromProgressEvent(event) {
+    const metadata = event && event.metadata && typeof event.metadata === "object"
+      ? event.metadata
+      : {};
+    const summary = metadata.value_summary && typeof metadata.value_summary === "object"
+      ? metadata.value_summary
+      : {};
+    if (summary.item_type !== "todo_list" || !Array.isArray(summary.plan_items)) {
+      return null;
+    }
+    return summary.plan_items
+      .filter(
+        (item) => item && typeof item.label === "string" && typeof item.completed === "boolean",
+      )
+      .map((item) => ({ label: item.label, completed: item.completed }));
   }
 
   function renderState(payload) {
@@ -1323,6 +1348,7 @@
     const issue = latestIssueProgressEvent();
     setText(elements["codex-live-error"], issue ? progressEventLabel(issue) : "None");
     renderProgressEvents();
+    renderCodexPlan();
   }
 
   function renderProgressEvents() {
@@ -1348,6 +1374,38 @@
       setText(message, event.summary);
 
       item.append(message);
+      list.append(item);
+    }
+  }
+
+  function renderCodexPlan() {
+    const list = elements["codex-live-plan"];
+    list.replaceChildren();
+    if (!currentCodexPlan.length) {
+      const item = document.createElement("li");
+      item.className = "codex-plan-empty";
+      setText(item, progressRunId ? "No plan published yet." : "No active run.");
+      list.append(item);
+      return;
+    }
+    for (const planItem of currentCodexPlan) {
+      const item = document.createElement("li");
+      item.className = planItem.completed ? "codex-plan-item completed" : "codex-plan-item";
+      item.setAttribute(
+        "aria-label",
+        `${planItem.completed ? "Completed" : "Pending"}: ${planItem.label}`,
+      );
+
+      const marker = document.createElement("span");
+      marker.className = "codex-plan-marker";
+      marker.setAttribute("aria-hidden", "true");
+      setText(marker, planItem.completed ? "✓" : "○");
+
+      const label = document.createElement("span");
+      label.className = "codex-plan-label";
+      setText(label, planItem.label);
+
+      item.append(marker, label);
       list.append(item);
     }
   }
