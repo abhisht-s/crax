@@ -126,6 +126,7 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="codex-live-panel"',
             'id="codex-live-state"',
             'id="codex-live-session-id"',
+            'id="codex-live-quota-wait"',
             'id="codex-live-final"',
             'id="codex-live-error"',
             'id="codex-live-events"',
@@ -191,6 +192,9 @@ class StaticSourceContractTests(unittest.TestCase):
             "failure_event_id: failureEventId",
             "model.latest_failure",
             "renderFailure(model, runtime)",
+            'elements["codex-live-quota-wait"]',
+            "model.quota_wait",
+            "Waiting until ${quotaWait.resume_at} to resume ${threadId}",
             "Paused — ready for manual retry",
             "Paused — manual review required",
             "Retry unavailable — review required",
@@ -383,7 +387,7 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn('requestJson("POST", "/api/chatgpt-ui-lease/release-stale", payload)', self.js)
         self.assertIn('requestJson("GET", `/api/runs/current/progress?after_sequence=${cursor}`)', self.js)
         self.assertIn('fetch(`/api/runs/current/events?after_sequence=${cursor}`', self.js)
-        self.assertIn("renderCodexLiveProgress(runtime)", self.js)
+        self.assertIn("renderCodexLiveProgress(runtime, model)", self.js)
         self.assertIn("codexSessionIdFromProgressEvent", self.js)
         self.assertIn("currentCodexSessionId", self.js)
         self.assertIn("codexPlanFromProgressEvent", self.js)

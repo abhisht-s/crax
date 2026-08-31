@@ -362,6 +362,53 @@ class SupervisePlannerTests(unittest.TestCase):
                 self.assertEqual(plan.action, SuperviseAction.STOP)
                 self.assertEqual(plan.reason, reason)
 
+    def test_usage_limit_progress_error_does_not_change_nonzero_exit_stop(self) -> None:
+        events = [
+            self.event(
+                "codex_progress_event",
+                {
+                    "schema_version": 1,
+                    "codex_invocation_id": "codex-invocation-quota",
+                    "kind": "error",
+                    "status": "failed",
+                    "title": "Codex error",
+                    "summary": "Codex emitted error.",
+                    "metadata": {
+                        "value_summary": {
+                            "error": (
+                                "You've hit your usage limit. Try again at 7:52 AM."
+                            )
+                        }
+                    },
+                },
+            ),
+            self.codex_finished(exit_code=1),
+            self.supervision(),
+        ]
+        plan = detect_next_supervise_action(self.run_record(), events, self.repo_path)
+        self.assertEqual(plan.action, SuperviseAction.STOP)
+        self.assertEqual(plan.reason, "codex_nonzero_exit")
+
+    def test_active_quota_wait_stops_with_waiting_for_quota_reset(self) -> None:
+        events = [
+            self.event(
+                "codex_quota_wait_scheduled",
+                {
+                    "thread_id": "01a05837-1cb2-76b0-852f-6a104eb1f07c",
+                    "resume_at": "2026-08-30T02:22:00+00:00",
+                },
+            ),
+            self.codex_finished(exit_code=1),
+            self.supervision(),
+        ]
+        plan = detect_next_supervise_action(
+            self.run_record("running"),
+            events,
+            self.repo_path,
+        )
+        self.assertEqual(plan.action, SuperviseAction.STOP)
+        self.assertEqual(plan.reason, "waiting_for_quota_reset")
+
     def test_needs_review_and_approval_required_stop(self) -> None:
         cases = [
             (self.run_record("needs_review"), self.base_completed_events(), "needs_review"),

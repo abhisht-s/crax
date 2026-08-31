@@ -12,6 +12,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import ledger as default_ledger
+from agent.codex_account_limits import fetch_account_rate_limits_resets_at
+from agent.codex_quota_resume_services import execute_codex_quota_resume_service
+from agent.codex_quota_wait import (
+    CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
+    CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+    active_quota_wait,
+    decide_quota_wait,
+    looks_like_usage_limit,
+    quota_wait_fields,
+)
 from agent.codex_terminal import terminate_codex_run
 from agent.initial_codex_run_services import execute_initial_direct_codex_run_service
 from agent.run_services import (
@@ -53,6 +63,7 @@ LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX = "starting_initial_codex"
 LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION = "running_routine_action"
 LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL = "waiting_for_approval"
 LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY = "waiting_for_retry"
+LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET = "waiting_for_quota_reset"
 LOCAL_CONTROLLER_STATE_BLOCKED = "blocked"
 LOCAL_CONTROLLER_STATE_FAILED = "failed"
 LOCAL_CONTROLLER_STATE_COMPLETED = "completed"
@@ -183,6 +194,7 @@ class LocalControllerReadModel:
     controller_runtime: dict[str, Any]
     configuration_complete: bool
     latest_failure: dict[str, Any] | None = None
+    quota_wait: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +271,9 @@ class LocalController:
         read_model_builder: Callable[..., LocalControllerReadModel] | None = None,
         supervision_step: Callable[..., Any] = run_supervision_step_service,
         initial_run_executor: Callable[..., Any] | None = None,
+        quota_resume_executor: Callable[..., Any] | None = None,
+        quota_wait_now: Callable[[], datetime] | None = None,
+        rate_limits_reader: Callable[..., datetime | None] | None = None,
     ) -> None:
         restore_persisted_session = session is None
         self.session = session or LocalControllerSession()
@@ -278,6 +293,13 @@ class LocalController:
         self.last_exception_summary: dict[str, Any] | None = None
         self.automatic_burst_count = 0
         self.automatic_burst_reason: str | None = None
+        self._quota_wait: dict[str, Any] | None = None
+        self._quota_wait_timer: threading.Timer | None = None
+        self.quota_wait_now = quota_wait_now or (lambda: datetime.now(UTC))
+        self.rate_limits_reader = rate_limits_reader or fetch_account_rate_limits_resets_at
+        self.quota_resume_executor = quota_resume_executor or (
+            lambda **kwargs: execute_codex_quota_resume_service(**kwargs, ledger=self.ledger)
+        )
         if restore_persisted_session:
             self._restore_persisted_session()
 
@@ -473,6 +495,14 @@ class LocalController:
                     run_id=run_id,
                     controller_state=self.session.controller_state,
                 )
+            if self.session.controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="waiting_for_quota_reset",
+                    error_message="Codex is waiting for the usage-limit reset before resuming.",
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                )
             if self.session.controller_state in LOCAL_CONTROLLER_TERMINAL_STATES:
                 return LocalControllerOperationResult(
                     ok=False,
@@ -547,11 +577,43 @@ class LocalController:
                     error_message="No active run is available.",
                     controller_state=self.session.controller_state,
                 )
+            waiting_for_quota = (
+                self.session.controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET
+            )
             self.cancel_requested.set()
             self.session.pending_approval = None
             self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
             self.automatic_burst_reason = "operator_cancelled"
+            if waiting_for_quota:
+                self._cancel_quota_wait_timer_locked()
+                self._quota_wait = None
             self._persist_session_locked()
+
+        if waiting_for_quota:
+            self.ledger.add_event(
+                run_id,
+                CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
+                "Cancelled Codex usage-limit wait before resume.",
+                {
+                    "source": LOCAL_CONTROLLER_SOURCE,
+                    "controller_mode": LOCAL_CONTROLLER_MODE,
+                },
+            )
+            try:
+                self.ledger.update_run_status(
+                    run_id,
+                    RunStatus.NEEDS_REVIEW,
+                    error="Codex usage-limit wait cancelled by operator.",
+                )
+            except (AttributeError, TypeError):
+                pass
+            return LocalControllerOperationResult(
+                ok=True,
+                reason_code="quota_wait_cancelled",
+                run_id=run_id,
+                controller_state=LOCAL_CONTROLLER_STATE_BLOCKED,
+                read_model=self.get_current_state(run_id).read_model,
+            )
 
         termination = terminate_codex_run(run_id)
         self.ledger.add_event(
@@ -981,6 +1043,13 @@ class LocalController:
             with self._lock:
                 self.last_action_result_summary = summary
             if not _result_ok(result):
+                if self._maybe_schedule_quota_wait(
+                    run_id,
+                    result,
+                    repository_path=repository_path,
+                    sandbox=sandbox,
+                ):
+                    return
                 self._pause_for_action_failure(
                     run_id,
                     action_key="initial_codex",
@@ -1238,6 +1307,9 @@ class LocalController:
             if self.cancel_requested.is_set():
                 return
             read_model = self._build_read_model(run_id)
+            if read_model.planner_reason_code == "waiting_for_quota_reset":
+                self._commit_state_from_read_model(read_model, allow_pending_snapshot=False)
+                return
             if read_model.requires_human_approval:
                 self._store_pending_approval(read_model)
                 return
@@ -1285,6 +1357,13 @@ class LocalController:
                 or not _result_ok(result)
             ):
                 if getattr(result, "blocked", False) or not _result_ok(result):
+                    if self._maybe_schedule_quota_wait(
+                        run_id,
+                        result,
+                        repository_path=read_model.repository_path,
+                        sandbox=read_model.sandbox,
+                    ):
+                        return
                     self._pause_for_action_failure(
                         run_id,
                         action_key=read_model.planner_action or "routine_progress",
@@ -1312,6 +1391,8 @@ class LocalController:
         with self._lock:
             if read_model.completed:
                 self.session.controller_state = LOCAL_CONTROLLER_STATE_COMPLETED
+            elif read_model.planner_reason_code == "waiting_for_quota_reset":
+                self.session.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET
             elif read_model.blocked or read_model.terminal:
                 self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
             else:
@@ -1366,6 +1447,150 @@ class LocalController:
             self.current_action_started_at = None
             self._persist_session_locked()
 
+    def _maybe_schedule_quota_wait(
+        self,
+        run_id: str,
+        result: Any,
+        *,
+        repository_path: str | None = None,
+        sandbox: str | None = None,
+    ) -> bool:
+        events = self.ledger.list_events(run_id)
+        error_message = str(getattr(result, "error_message", "") or "")
+        if error_message and not looks_like_usage_limit(error_message):
+            return False
+        clock = self.quota_wait_now()
+        probe = decide_quota_wait(events, now=clock)
+        if probe.reason_code in {"not_usage_limit", "quota_wait_limit_reached", "usage_limit_without_thread_id"}:
+            return False
+        rpc_time = None
+        try:
+            rpc_time = self.rate_limits_reader(now=clock)
+        except TypeError:
+            rpc_time = self.rate_limits_reader()
+        except Exception:
+            rpc_time = None
+        decision = decide_quota_wait(events, now=clock, rate_limits_resets_at=rpc_time)
+        if not decision.scheduled:
+            return False
+        recovered_repo, recovered_sandbox, _reason = _recover_run_configuration(events)
+        repo_path = repository_path or recovered_repo
+        sandbox_value = sandbox or recovered_sandbox or "read-only"
+        if not repo_path:
+            return False
+        try:
+            self.ledger.update_run_status(run_id, RunStatus.RUNNING)
+        except (AttributeError, TypeError):
+            pass
+        metadata = {
+            "thread_id": decision.thread_id,
+            "resets_at": decision.resets_at,
+            "resume_at": decision.resume_at,
+            "source": decision.source,
+            "invocation_id": decision.invocation_id,
+            "repository_path": repo_path,
+            "sandbox": sandbox_value,
+            "error_text": decision.error_text,
+        }
+        event = self.ledger.add_event(
+            run_id,
+            CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+            "Waiting for Codex usage-limit reset before resuming the same session.",
+            metadata,
+        )
+        fields = quota_wait_fields(event) or {
+            "thread_id": decision.thread_id,
+            "resume_at": decision.resume_at,
+            "resets_at": decision.resets_at,
+            "source": decision.source,
+            "invocation_id": decision.invocation_id,
+            "repository_path": repo_path,
+            "sandbox": sandbox_value,
+            "status": "waiting",
+        }
+        with self._lock:
+            self._quota_wait = fields
+            self.session.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET
+            self._arm_quota_wait_timer_locked(str(fields["resume_at"]))
+            self._persist_session_locked()
+        return True
+
+    def _arm_quota_wait_timer_locked(self, resume_at_iso: str) -> None:
+        self._cancel_quota_wait_timer_locked()
+        resume_at = _parse_iso_datetime(resume_at_iso)
+        clock = self.quota_wait_now()
+        delay = 0.0
+        if resume_at is not None:
+            delay = max(0.0, (resume_at - clock).total_seconds())
+        run_id = self.session.active_run_id
+        timer = threading.Timer(delay, self._quota_wait_timer_fired, args=(run_id,))
+        timer.daemon = True
+        self._quota_wait_timer = timer
+        timer.start()
+
+    def _cancel_quota_wait_timer_locked(self) -> None:
+        timer = self._quota_wait_timer
+        self._quota_wait_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _quota_wait_timer_fired(self, run_id: str | None) -> None:
+        with self._lock:
+            if run_id is None or self.session.active_run_id != run_id:
+                return
+            if self.session.controller_state != LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET:
+                return
+            if self.action_running:
+                return
+            self._quota_wait_timer = None
+            self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            self._mark_action_running_locked("quota_resume")
+            worker = self._new_worker(self._quota_resume_worker, run_id)
+            self.current_worker = worker
+        worker.start()
+
+    def _quota_resume_worker(self, run_id: str) -> None:
+        try:
+            result = self.quota_resume_executor(run_id=run_id, now=self.quota_wait_now())
+            if self.cancel_requested.is_set():
+                return
+            if not _result_ok(result):
+                events = self.ledger.list_events(run_id)
+                previous_wait = None
+                for event in reversed(events):
+                    if event.get("event_type") == CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE:
+                        previous_wait = quota_wait_fields(event)
+                        break
+                recovered_repo, recovered_sandbox, _reason = _recover_run_configuration(events)
+                if self._maybe_schedule_quota_wait(
+                    run_id,
+                    result,
+                    repository_path=(previous_wait or {}).get("repository_path") or recovered_repo,
+                    sandbox=(previous_wait or {}).get("sandbox") or recovered_sandbox,
+                ):
+                    return
+                run = self.ledger.get_run(run_id)
+                self._pause_for_action_failure(
+                    run_id,
+                    action_key="quota_resume",
+                    result=result,
+                    run_status_before_action=(
+                        str(run.get("status") or "") if isinstance(run, dict) else None
+                    ),
+                    source="quota_resume",
+                    retry_context=previous_wait or {},
+                )
+                return
+            self._automatic_progress_loop(run_id, starting_burst_count=0)
+        except Exception as exc:
+            self._record_worker_exception(
+                exc,
+                run_id=run_id,
+                action_key="quota_resume",
+            )
+        finally:
+            self._clear_action_running()
+
     def _persist_session_locked(self) -> None:
         writer = getattr(self.ledger, "save_local_controller_snapshot", None)
         if not callable(writer):
@@ -1377,6 +1602,7 @@ class LocalController:
                     "active_run_id": self.session.active_run_id,
                     "controller_state": self.session.controller_state,
                     "pending_approval": pending,
+                    "quota_wait": self._quota_wait,
                 }
             )
         except Exception:
@@ -1414,6 +1640,7 @@ class LocalController:
             LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION,
             LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL,
             LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY,
+            LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET,
             LOCAL_CONTROLLER_STATE_BLOCKED,
             LOCAL_CONTROLLER_STATE_FAILED,
             LOCAL_CONTROLLER_STATE_COMPLETED,
@@ -1434,6 +1661,20 @@ class LocalController:
         self.session.active_run_id = active_run_id
         self.session.controller_state = str(controller_state)
         self.session.pending_approval = pending
+        wait_fields = quota_wait_fields(active_quota_wait(self.ledger.list_events(active_run_id)))
+        snapshot_wait = snapshot.get("quota_wait")
+        if wait_fields is None and isinstance(snapshot_wait, dict):
+            thread_id = str(snapshot_wait.get("thread_id") or "").strip()
+            resume_at = str(snapshot_wait.get("resume_at") or "").strip()
+            if thread_id and resume_at:
+                wait_fields = snapshot_wait
+        self._quota_wait = wait_fields
+        if controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET:
+            if wait_fields is None:
+                self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                self._quota_wait = None
+            elif active_status == RunStatus.RUNNING.value:
+                self._arm_quota_wait_timer_locked(str(wait_fields["resume_at"]))
 
     def _pause_for_action_failure(
         self,
@@ -1989,6 +2230,7 @@ def build_local_controller_read_model(
         controller_runtime=_controller_runtime(session),
         configuration_complete=configuration_complete,
         latest_failure=latest_failure,
+        quota_wait=quota_wait_fields(active_quota_wait(events)),
     )
 
 
@@ -2432,12 +2674,13 @@ def _terminal_flags(
 
     completed = action == SuperviseAction.STOP and reason == "extracted_prompt_already_run"
     idle_waiting_initial = status == "created" and action == SuperviseAction.STOP
+    waiting_for_quota = action == SuperviseAction.STOP and reason == "waiting_for_quota_reset"
     terminal = status in {"failed", "rejected"} or (
-        action == SuperviseAction.STOP and not idle_waiting_initial
+        action == SuperviseAction.STOP and not idle_waiting_initial and not waiting_for_quota
     )
     blocked = not completed and (
         status in {"failed", "rejected", "needs_review", "waiting_for_approval"}
-        or (action == SuperviseAction.STOP and not idle_waiting_initial)
+        or (action == SuperviseAction.STOP and not idle_waiting_initial and not waiting_for_quota)
     )
     return terminal, blocked, completed
 
@@ -2462,12 +2705,15 @@ def _current_stage(
     if requires_approval:
         return "waiting_for_approval"
     status = str(run.get("status") or "")
+    reason = str(getattr(plan, "reason", "") or "")
     if status == "created":
         return "idle"
     if blocked:
         if status == "needs_review":
             return "review_required"
         return "blocked"
+    if reason == "waiting_for_quota_reset":
+        return "waiting_for_quota_reset"
     if routine_available:
         return "routine_action_available"
     if plan is not None and plan.action == SuperviseAction.STOP:
@@ -2774,6 +3020,16 @@ def _string_or_none(value: Any) -> str | None:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _result_ok(result: Any) -> bool:

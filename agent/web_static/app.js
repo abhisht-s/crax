@@ -143,6 +143,7 @@
       "actionable-error",
       "codex-live-state",
       "codex-live-session-id",
+      "codex-live-quota-wait",
       "codex-live-final",
       "codex-live-error",
       "codex-live-events",
@@ -1171,7 +1172,7 @@
     setText(elements["actionable-error"], valueOrNone(model && model.actionable_error_message));
 
     ensureProgressTransport(rawActiveRunId);
-    renderCodexLiveProgress(runtime);
+    renderCodexLiveProgress(runtime, model);
     renderApproval(model, runtime);
     renderProgress(model, runtime);
     renderFailure(model, runtime);
@@ -1323,7 +1324,7 @@
     ].join("|");
   }
 
-  function renderCodexLiveProgress(runtime) {
+  function renderCodexLiveProgress(runtime, model) {
     const latest = progressEvents.length ? progressEvents[progressEvents.length - 1] : null;
     const label = codexLiveLabel(latest, runtime || {});
     setText(elements["codex-live-state"], label.text);
@@ -1332,6 +1333,18 @@
       elements["codex-live-session-id"],
       currentCodexSessionId || (progressRunId ? "Not available yet" : "None"),
     );
+    const quotaWait = model && model.quota_wait && typeof model.quota_wait === "object"
+      ? model.quota_wait
+      : null;
+    if (quotaWait && quotaWait.resume_at) {
+      const threadId = quotaWait.thread_id || "same session";
+      setText(
+        elements["codex-live-quota-wait"],
+        `Waiting until ${quotaWait.resume_at} to resume ${threadId}`,
+      );
+    } else {
+      setText(elements["codex-live-quota-wait"], "None");
+    }
 
     const finalEvent = latestProgressEventOfKind("final_message_available");
     if (finalEvent) {

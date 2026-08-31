@@ -5,6 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from agent.codex_quota_wait import active_quota_wait
 from agent.codex_terminal import ALLOWED_CODEX_SANDBOXES
 from agent.continuation_policy import can_continue_run
 from agent.prompt_extraction import (
@@ -72,6 +73,10 @@ def detect_next_supervise_action(
 
     if run is None:
         return _stop("run_missing", "Run not found.", repo_path_text, sandbox)
+
+    wait_stop = _quota_wait_stop(run, events, repo_path_text, sandbox)
+    if wait_stop is not None:
+        return wait_stop
 
     status = str(run.get("status") or "")
     status_stop = _status_stop(status, repo_path_text, sandbox)
@@ -357,6 +362,32 @@ def _validate_repo_path(repo_path: str, sandbox: str) -> SupervisePlan | None:
     if not path.is_dir():
         return _stop("repo_not_directory", f"Repo path is not a directory: {repo_path}", repo_path, sandbox)
     return None
+
+
+def _quota_wait_stop(
+    run: dict,
+    events: list[dict],
+    repo_path: str,
+    sandbox: str,
+) -> SupervisePlan | None:
+    wait_event = active_quota_wait(events)
+    if wait_event is None:
+        return None
+    status = str(run.get("status") or "")
+    event_ids = {}
+    wait_id = wait_event.get("id")
+    try:
+        event_ids["codex_quota_wait_scheduled"] = int(wait_id)
+    except (TypeError, ValueError):
+        pass
+    return _stop(
+        "waiting_for_quota_reset",
+        "Codex usage limit reset is pending. Waiting to resume the same session.",
+        repo_path,
+        sandbox,
+        status=status,
+        event_ids=event_ids,
+    )
 
 
 def _status_stop(status: str, repo_path: str, sandbox: str) -> SupervisePlan | None:

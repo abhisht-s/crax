@@ -110,10 +110,29 @@ At a high level, `detect_next_supervise_action` chooses one of these
 - `ask_run_prompt`
 
 The planner checks, in order, repository/sandbox validity, run existence,
-blocking statuses, latest Codex result validity, incomplete extracted-prompt
+an active Codex quota wait (`waiting_for_quota_reset`), blocking statuses,
+latest Codex result validity, incomplete extracted-prompt
 runs, required diagnostics/supervision decision, continuation eligibility,
 ChatGPT submission state, response capture state, extracted prompt validity,
 sentinel format, and whether the extracted prompt has already run.
+
+## Codex quota wait (dashboard / local controller)
+
+This wait path is implemented for the localhost dashboard controller. It is not
+a new `RunStatus` and it does not change CLI `codex-run` auto-supervise.
+
+When Codex exec fails, the controller schedules a wait only if
+`decide_quota_wait(...).scheduled` is true: usage-limit error text, Codex
+`thread_id`, and a future reset time. The run status is restored to `running`,
+a `codex_quota_wait_scheduled` event is recorded, and a timer resumes the same
+thread with `codex exec resume`. Incomplete signals keep the previous path:
+post-Codex governance `needs_review` plus controller `blocked` /
+`local_controller_action_failed`.
+
+While a wait is active, the planner returns `STOP` with
+`waiting_for_quota_reset`. That reason is not blocked, not terminal, and not
+completed. Operator cancel during the wait writes `codex_quota_wait_cancelled`
+and returns to `needs_review` plus controller `blocked`.
 
 `run_supervision_step` executes the selected action. For ChatGPT handoff work,
 the implementation records bounded phase labels such as:

@@ -291,6 +291,7 @@ def execute_codex_direct_service(
     validation_result_builder: Callable[[str, str, str, str], dict[str, Any]] = _default_validation_result_builder,
     monotonic_clock: Callable[[], float] = time.monotonic,
     hash_function: Callable[[str], str] = _default_hash_text,
+    resume_session_id: str | None = None,
 ) -> CodexDirectExecutionResult:
     del confirm_full_access
     event_ledger = ledger if ledger is not None else ledger_module
@@ -328,6 +329,8 @@ def execute_codex_direct_service(
         started_metadata["json_stream"] = True
     if model != CODEX_DEFAULT_SELECTION:
         started_metadata["model"] = model
+    if resume_session_id:
+        started_metadata["resume_session_id"] = resume_session_id
     started_event_id = _event_id(
         event_ledger.add_event(
             run_id,
@@ -347,6 +350,8 @@ def execute_codex_direct_service(
         }
         if model != CODEX_DEFAULT_SELECTION:
             runner_kwargs["model"] = model
+        if resume_session_id:
+            runner_kwargs["resume_session_id"] = resume_session_id
         if codex_invocation_id is not None:
             runner_kwargs["json_stream"] = True
             runner_kwargs["codex_invocation_id"] = codex_invocation_id

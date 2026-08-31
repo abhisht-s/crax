@@ -626,6 +626,7 @@ def run_codex_exec(
     json_stream: bool = False,
     codex_invocation_id: str | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    resume_session_id: str | None = None,
 ) -> dict:
     codex_path = shutil.which("codex")
     if repo_path is None:
@@ -639,6 +640,7 @@ def run_codex_exec(
         else _default_final_message_path(run_id)
     )
     model_text = CODEX_DEFAULT_SELECTION if model is None else str(model).strip()
+    resume_id = _safe_identifier(str(resume_session_id).strip(), 120) if resume_session_id else None
     command = [
         "codex",
         "exec",
@@ -652,13 +654,31 @@ def run_codex_exec(
         command.extend(["-s", sandbox])
     if model_text != CODEX_DEFAULT_SELECTION:
         command.extend(["-m", model_text])
+    if resume_id:
+        command.append("resume")
     command.extend(
         [
             "--output-last-message",
             str(resolved_final_message_path),
-            prompt,
         ]
     )
+    if resume_id:
+        command.extend([resume_id, prompt])
+    else:
+        command.append(prompt)
+
+    tracked_session_id: dict[str, str | None] = {"value": None}
+    original_progress = progress_callback
+
+    def progress_callback(event: dict[str, object]) -> None:
+        metadata = event.get("metadata")
+        if isinstance(metadata, dict):
+            summary = metadata.get("value_summary")
+            if isinstance(summary, dict):
+                session_id = summary.get("codex_session_id")
+                if isinstance(session_id, str) and session_id.strip():
+                    tracked_session_id["value"] = session_id.strip()
+        _emit_progress(original_progress, event)
 
     validation_error = None
     if sandbox not in ALLOWED_CODEX_SANDBOXES:
@@ -865,6 +885,16 @@ def run_codex_exec(
         "validation_error": None,
         **result,
         **final_message,
+        **(
+            {"resume_session_id": resume_id}
+            if resume_id
+            else {}
+        ),
+        **(
+            {"codex_session_id": tracked_session_id["value"]}
+            if tracked_session_id["value"]
+            else {}
+        ),
     }
 
 

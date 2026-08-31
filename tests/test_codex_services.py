@@ -554,6 +554,46 @@ class CodexTerminalTimeoutTests(unittest.TestCase):
         self.assertEqual(result["final_message"], "done")
         self.assertNotIn("--json", run.call_args.args[0])
 
+    def test_run_codex_exec_resume_session_id_inserts_resume_and_keeps_default_argv(self) -> None:
+        completed = subprocess.CompletedProcess(args=["codex"], returncode=0, stdout="done\n", stderr="")
+        thread_id = "01a05837-1cb2-76b0-852f-6a104eb1f07c"
+
+        def run_side_effect(command, **_kwargs):
+            final_path = Path(command[command.index("--output-last-message") + 1])
+            final_path.write_text("done", encoding="utf-8")
+            return completed
+
+        with (
+            tempfile.TemporaryDirectory() as repo,
+            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
+            mock.patch.object(codex_terminal.subprocess, "run", side_effect=run_side_effect) as run,
+        ):
+            default_result = codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                sandbox="read-only",
+            )
+            resume_result = codex_terminal.run_codex_exec(
+                "Prompt",
+                repo_path=repo,
+                sandbox="read-only",
+                resume_session_id=thread_id,
+            )
+
+        default_command = run.call_args_list[0].args[0]
+        resume_command = run.call_args_list[1].args[0]
+        self.assertEqual(default_command[:2], ["codex", "exec"])
+        self.assertNotIn("resume", default_command)
+        self.assertNotIn("--last", default_command)
+        self.assertNotIn("--last", resume_command)
+        resume_index = resume_command.index("resume")
+        output_index = resume_command.index("--output-last-message")
+        self.assertLess(resume_index, output_index)
+        self.assertEqual(resume_command[output_index + 2], thread_id)
+        self.assertEqual(resume_command[-1], "Prompt")
+        self.assertEqual(default_result["exit_code"], 0)
+        self.assertEqual(resume_result["resume_session_id"], thread_id)
+
     def test_subprocess_timeout_exception_keeps_historical_timed_out_result_shape(self) -> None:
         with (
             tempfile.TemporaryDirectory() as repo,
@@ -621,6 +661,7 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         self.assertEqual(result.stdout_length, len(stdout))
         self.assertEqual(result.stderr_length, len(stderr))
         self.assertIs(result.raw_process_result, raw)
+        self.assertNotIn("resume_session_id", runner.calls[0][1])
 
         self.assertEqual([event["event_type"] for event in ledger.events], ["codex_exec_started", "codex_exec_finished"])
         self.assertEqual(ledger.events[0]["message"], "Running Codex exec.")
@@ -640,6 +681,34 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         self.assertNotIn("stdout_length", ledger.events[1]["metadata"])
         self.assertNotIn("duration_seconds", ledger.events[1]["metadata"])
         self.assertEqual(ledger.status_updates, [])
+
+    def test_resume_session_id_is_passed_only_when_set(self) -> None:
+        ledger = FakeLedger()
+        raw = _raw_result()
+        runner = RecordingRunner(raw)
+
+        result = execute_codex_direct_service(
+            "run-1",
+            "Say exactly: hello",
+            "/tmp/repo",
+            "read-only",
+            300,
+            {"confidence": "low"},
+            ledger=ledger,
+            codex_runner=runner,
+            monotonic_clock=StepClock([10.0, 12.5]),
+            resume_session_id="01a05837-1cb2-76b0-852f-6a104eb1f07c",
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            runner.calls[0][1]["resume_session_id"],
+            "01a05837-1cb2-76b0-852f-6a104eb1f07c",
+        )
+        self.assertEqual(
+            ledger.events[0]["metadata"]["resume_session_id"],
+            "01a05837-1cb2-76b0-852f-6a104eb1f07c",
+        )
 
     def test_runner_call_and_command_metadata_match_existing_contract(self) -> None:
         ledger = FakeLedger()
