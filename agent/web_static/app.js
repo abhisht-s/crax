@@ -60,6 +60,7 @@
   let progressEvents = [];
   let progressAfterSequence = 0;
   let progressRunId = "";
+  let currentCodexSessionId = "";
   let progressStreamController = null;
   let progressStreamActive = false;
   let progressPollTimer = null;
@@ -140,6 +141,7 @@
       "planner-reason",
       "actionable-error",
       "codex-live-state",
+      "codex-live-session-id",
       "codex-live-final",
       "codex-live-error",
       "codex-live-events",
@@ -920,6 +922,7 @@
     progressRunId = runId;
     progressEvents = [];
     progressAfterSequence = 0;
+    currentCodexSessionId = "";
   }
 
   function startProgressStream() {
@@ -1093,6 +1096,13 @@
     if (sequence && progressEvents.some((item) => item.sequence === sequence)) {
       return;
     }
+    if (event.kind === "process_started") {
+      currentCodexSessionId = "";
+    }
+    const sessionId = codexSessionIdFromProgressEvent(event);
+    if (sessionId) {
+      currentCodexSessionId = sessionId;
+    }
     progressEvents.push(event);
     if (sequence) {
       progressAfterSequence = Math.max(progressAfterSequence, sequence);
@@ -1100,6 +1110,19 @@
     if (progressEvents.length > PROGRESS_EVENT_MEMORY_LIMIT) {
       progressEvents = progressEvents.slice(-PROGRESS_EVENT_MEMORY_LIMIT);
     }
+  }
+
+  function codexSessionIdFromProgressEvent(event) {
+    const metadata = event && event.metadata && typeof event.metadata === "object"
+      ? event.metadata
+      : {};
+    if (metadata.event_type !== "thread.started") {
+      return "";
+    }
+    const summary = metadata.value_summary && typeof metadata.value_summary === "object"
+      ? metadata.value_summary
+      : {};
+    return typeof summary.codex_session_id === "string" ? summary.codex_session_id : "";
   }
 
   function renderState(payload) {
@@ -1280,6 +1303,10 @@
     const label = codexLiveLabel(latest, runtime || {});
     setText(elements["codex-live-state"], label.text);
     elements["codex-live-state"].className = `status-badge ${label.className}`;
+    setText(
+      elements["codex-live-session-id"],
+      currentCodexSessionId || (progressRunId ? "Not available yet" : "None"),
+    );
 
     const finalEvent = latestProgressEventOfKind("final_message_available");
     if (finalEvent) {

@@ -236,6 +236,23 @@ def _temporary_real_ledger():
 
 
 class CodexTerminalTimeoutTests(unittest.TestCase):
+    def test_thread_started_event_preserves_codex_session_id(self) -> None:
+        session_id = "01a05837-1cb2-76b0-852f-6a104eb1f07c"
+        event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": session_id,
+                }
+            )
+        )
+
+        self.assertEqual(event["kind"], "codex_json_event")
+        self.assertEqual(
+            event["metadata"]["value_summary"]["codex_session_id"],
+            session_id,
+        )
+
     def test_agent_message_json_event_becomes_bounded_assistant_commentary(self) -> None:
         event = codex_terminal.normalize_codex_jsonl_event(
             json.dumps(
@@ -708,6 +725,30 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         self.assertEqual(stored["kind"], "assistant_commentary")
         self.assertEqual(events[0]["kind"], "assistant_commentary")
         self.assertEqual(events[0]["summary"], "I found a stable seam and am checking it now.")
+
+    def test_real_ledger_preserves_codex_session_id(self) -> None:
+        session_id = "01a05837-1cb2-76b0-852f-6a104eb1f07c"
+        progress_event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "thread.started",
+                    "thread_id": session_id,
+                }
+            )
+        )
+        with _temporary_real_ledger():
+            run_id = ledger_module.create_run("Task")
+            ledger_module.add_codex_progress_event(
+                run_id,
+                "inv-session",
+                progress_event,
+            )
+            events = ledger_module.list_codex_progress_events(run_id)
+
+        self.assertEqual(
+            events[0]["metadata"]["value_summary"]["codex_session_id"],
+            session_id,
+        )
 
     def test_controller_profile_default_model_launches_without_model_arg(self) -> None:
         ledger = FakeLedger(

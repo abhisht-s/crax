@@ -139,6 +139,12 @@ def _json_value_summary(event: dict[str, Any]) -> dict[str, object]:
     summary: dict[str, object] = {}
     event_type = _json_event_type(event)
     summary["event_type"] = event_type
+    if event_type == "thread.started":
+        thread_id = event.get("thread_id")
+        if isinstance(thread_id, str):
+            codex_session_id = _safe_identifier(thread_id, 120)
+            if codex_session_id:
+                summary["codex_session_id"] = codex_session_id
     for key in ("id", "status", "exit_code", "duration_ms", "duration_seconds"):
         value = _nested_dict_value(event, key)
         if isinstance(value, (str, int, float, bool)) or value is None:

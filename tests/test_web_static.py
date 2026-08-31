@@ -125,6 +125,7 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="lease-release-button"',
             'id="codex-live-panel"',
             'id="codex-live-state"',
+            'id="codex-live-session-id"',
             'id="codex-live-final"',
             'id="codex-live-error"',
             'id="codex-live-events"',
@@ -382,6 +383,8 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn('requestJson("GET", `/api/runs/current/progress?after_sequence=${cursor}`)', self.js)
         self.assertIn('fetch(`/api/runs/current/events?after_sequence=${cursor}`', self.js)
         self.assertIn("renderCodexLiveProgress(runtime)", self.js)
+        self.assertIn("codexSessionIdFromProgressEvent", self.js)
+        self.assertIn("currentCodexSessionId", self.js)
         self.assertIn('event.kind === "assistant_commentary"', self.js)
         self.assertIn(".slice(-PROGRESS_EVENT_RENDER_LIMIT)", self.js)
         self.assertIn("Codex Working Notes", self.html)
