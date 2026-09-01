@@ -20,6 +20,8 @@ from agent.codex_quota_wait import (
     active_quota_wait,
     decide_quota_wait,
     looks_like_usage_limit,
+    quota_wait_client_message,
+    quota_wait_count,
     quota_wait_fields,
 )
 from agent.codex_terminal import terminate_codex_run
@@ -1456,9 +1458,14 @@ class LocalController:
         sandbox: str | None = None,
     ) -> bool:
         events = self.ledger.list_events(run_id)
-        error_message = str(getattr(result, "error_message", "") or "")
-        if error_message and not looks_like_usage_limit(error_message):
-            return False
+        # Result.error_message is often the missing final-message artifact, not
+        # the usage-limit text from JSONL. Only use it as a veto after a wait
+        # has already been scheduled, so a later generic resume failure does
+        # not reuse stale usage-limit progress.
+        if quota_wait_count(events) > 0:
+            error_message = str(getattr(result, "error_message", "") or "")
+            if error_message and not looks_like_usage_limit(error_message):
+                return False
         clock = self.quota_wait_now()
         probe = decide_quota_wait(events, now=clock)
         if probe.reason_code in {"not_usage_limit", "quota_wait_limit_reached", "usage_limit_without_thread_id"}:
@@ -2198,6 +2205,14 @@ def build_local_controller_read_model(
         requires_approval=requires_approval,
         latest_failure=latest_failure,
     )
+    quota_wait = quota_wait_fields(active_quota_wait(events))
+    if quota_wait is not None:
+        quota_wait = {
+            **quota_wait,
+            "message": quota_wait_client_message(str(quota_wait["resume_at"])),
+        }
+        if latest_failure is None:
+            error_message = quota_wait["message"]
 
     return LocalControllerReadModel(
         run_id=run_id,
@@ -2230,7 +2245,7 @@ def build_local_controller_read_model(
         controller_runtime=_controller_runtime(session),
         configuration_complete=configuration_complete,
         latest_failure=latest_failure,
-        quota_wait=quota_wait_fields(active_quota_wait(events)),
+        quota_wait=quota_wait,
     )
 
 

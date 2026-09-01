@@ -174,9 +174,22 @@ def _json_value_summary(event: dict[str, Any]) -> dict[str, object]:
     if files:
         summary["file_changes"] = files
     error = _nested_dict_value(event, "error") or _nested_dict_value(event, "error_message")
-    if error is not None:
-        summary["error"] = _bounded_text(error, CODEX_PROGRESS_METADATA_TEXT_LIMIT)
+    error_text = _error_object_text(error)
+    if error_text is not None:
+        summary["error"] = error_text
     return summary
+
+
+def _error_object_text(error: object) -> str | None:
+    if error is None:
+        return None
+    if isinstance(error, dict):
+        nested = error.get("message")
+        if nested is None:
+            nested = error.get("error")
+        if nested is not None and nested is not error:
+            return _error_object_text(nested)
+    return _bounded_text(error, CODEX_PROGRESS_METADATA_TEXT_LIMIT)
 
 
 def _todo_list_items(item: dict[str, Any]) -> list[dict[str, object]] | None:

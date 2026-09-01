@@ -282,6 +282,26 @@ class CodexTerminalTimeoutTests(unittest.TestCase):
             session_id,
         )
 
+    def test_turn_failed_event_extracts_nested_usage_limit_message(self) -> None:
+        message = (
+            "You've hit your usage limit. Upgrade to Pro, visit "
+            "chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at 5:13 AM."
+        )
+        event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": {"message": message},
+                }
+            )
+        )
+
+        self.assertEqual(event["kind"], "error")
+        error = event["metadata"]["value_summary"]["error"]
+        self.assertEqual(error, message)
+        self.assertNotIn("{'message':", error)
+
     def test_agent_message_json_event_becomes_bounded_assistant_commentary(self) -> None:
         event = codex_terminal.normalize_codex_jsonl_event(
             json.dumps(

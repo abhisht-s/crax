@@ -1326,7 +1326,7 @@
 
   function renderCodexLiveProgress(runtime, model) {
     const latest = progressEvents.length ? progressEvents[progressEvents.length - 1] : null;
-    const label = codexLiveLabel(latest, runtime || {});
+    const label = codexLiveLabel(latest, runtime || {}, model);
     setText(elements["codex-live-state"], label.text);
     elements["codex-live-state"].className = `status-badge ${label.className}`;
     setText(
@@ -1337,11 +1337,7 @@
       ? model.quota_wait
       : null;
     if (quotaWait && quotaWait.resume_at) {
-      const threadId = quotaWait.thread_id || "same session";
-      setText(
-        elements["codex-live-quota-wait"],
-        `Waiting until ${quotaWait.resume_at} to resume ${threadId}`,
-      );
+      setText(elements["codex-live-quota-wait"], quotaWaitClientMessage(quotaWait));
     } else {
       setText(elements["codex-live-quota-wait"], "None");
     }
@@ -1359,7 +1355,10 @@
     }
 
     const issue = latestIssueProgressEvent();
-    setText(elements["codex-live-error"], issue ? progressEventLabel(issue) : "None");
+    setText(
+      elements["codex-live-error"],
+      quotaWait ? "None" : (issue ? progressEventLabel(issue) : "None"),
+    );
     renderProgressEvents();
     renderCodexPlan();
   }
@@ -1423,7 +1422,30 @@
     }
   }
 
-  function codexLiveLabel(latest, runtime) {
+  function quotaWaitClientMessage(quotaWait) {
+    const until = Date.parse(quotaWait && quotaWait.resume_at ? quotaWait.resume_at : "");
+    if (Number.isFinite(until)) {
+      const remainingMs = until - Date.now();
+      if (remainingMs <= 0) {
+        return "Codex limits ran out. Resuming shortly.";
+      }
+      const totalMinutes = Math.ceil(remainingMs / 60000);
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      const hh = String(hours).padStart(2, "0");
+      const mm = String(minutes).padStart(2, "0");
+      return `Codex limits ran out. Reset in ${hh}:${mm} hours`;
+    }
+    if (quotaWait && typeof quotaWait.message === "string" && quotaWait.message.trim()) {
+      return quotaWait.message;
+    }
+    return "Codex limits ran out. Waiting for reset.";
+  }
+
+  function codexLiveLabel(latest, runtime, model) {
+    if (model && model.quota_wait && model.quota_wait.resume_at) {
+      return { text: "Waiting for Codex reset", className: "status-warn" };
+    }
     if (!progressRunId) {
       return { text: "No active run", className: "status-muted" };
     }

@@ -11,6 +11,7 @@ from agent.codex_quota_wait import (
     CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
     active_quota_wait,
     decide_quota_wait,
+    quota_wait_client_message,
     parse_try_again_at,
 )
 from agent.ledger import CODEX_PROGRESS_EVENT_TYPE
@@ -20,6 +21,7 @@ USAGE_LIMIT_ERROR = (
     "You've hit your usage limit. Upgrade to Pro, visit "
     "chatgpt.com/codex/settings/usage to purchase more credits or try again at 7:52 AM."
 )
+TURN_FAILED_DICT_REPR_ERROR = str({"message": USAGE_LIMIT_ERROR})
 SESSION_ID = "01a05837-1cb2-76b0-852f-6a104eb1f07c"
 INVOCATION_ID = "codex-invocation-quota"
 
@@ -28,7 +30,7 @@ def _progress_event(
     *,
     kind: str,
     invocation_id: str = INVOCATION_ID,
-    error: str | None = None,
+    error: object | None = None,
     session_id: str | None = None,
     event_id: int = 1,
 ) -> dict:
@@ -164,6 +166,46 @@ class CodexQuotaWaitDecisionTests(unittest.TestCase):
         )
         self.assertFalse(decision.scheduled)
         self.assertEqual(decision.reason_code, "not_usage_limit")
+
+    def test_turn_failed_dict_repr_error_still_schedules(self) -> None:
+        tz = datetime.now().astimezone().tzinfo
+        now = datetime(2026, 8, 31, 1, 39, tzinfo=tz)
+        events = [
+            _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=1),
+            _progress_event(kind="error", error=TURN_FAILED_DICT_REPR_ERROR, event_id=2),
+        ]
+        decision = decide_quota_wait(events, now=now)
+        self.assertTrue(decision.scheduled)
+        self.assertEqual(decision.thread_id, SESSION_ID)
+        self.assertEqual(decision.source, "error_text")
+
+    def test_nested_error_message_object_still_schedules(self) -> None:
+        tz = datetime.now().astimezone().tzinfo
+        now = datetime(2026, 8, 30, 6, 39, tzinfo=tz)
+        events = [
+            _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=1),
+            _progress_event(kind="error", error={"message": USAGE_LIMIT_ERROR}, event_id=2),
+        ]
+        decision = decide_quota_wait(events, now=now)
+        self.assertTrue(decision.scheduled)
+        self.assertEqual(decision.thread_id, SESSION_ID)
+
+
+class CodexQuotaWaitMessageTests(unittest.TestCase):
+    def test_client_message_uses_remaining_duration_not_a_clock(self) -> None:
+        now = datetime(2026, 8, 30, 6, 39, tzinfo=timezone.utc)
+        resume_at = (now + timedelta(hours=2, minutes=4, seconds=1)).isoformat()
+        self.assertEqual(
+            quota_wait_client_message(resume_at, now=now),
+            "Codex limits ran out. Reset in 02:05 hours",
+        )
+
+    def test_client_message_when_resume_is_due(self) -> None:
+        now = datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            quota_wait_client_message(now.isoformat(), now=now),
+            "Codex limits ran out. Resuming shortly.",
+        )
 
 
 class CodexQuotaWaitHelpersTests(unittest.TestCase):

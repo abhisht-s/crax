@@ -5,7 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from agent.codex_quota_wait import active_quota_wait
+from agent.codex_quota_wait import active_quota_wait, quota_wait_client_message, quota_wait_fields
 from agent.codex_terminal import ALLOWED_CODEX_SANDBOXES
 from agent.continuation_policy import can_continue_run
 from agent.prompt_extraction import (
@@ -380,9 +380,15 @@ def _quota_wait_stop(
         event_ids["codex_quota_wait_scheduled"] = int(wait_id)
     except (TypeError, ValueError):
         pass
+    fields = quota_wait_fields(wait_event)
+    message = (
+        quota_wait_client_message(str(fields["resume_at"]))
+        if fields is not None
+        else "Codex limits ran out. Waiting for reset."
+    )
     return _stop(
         "waiting_for_quota_reset",
-        "Codex usage limit reset is pending. Waiting to resume the same session.",
+        message,
         repo_path,
         sandbox,
         status=status,

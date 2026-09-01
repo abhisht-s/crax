@@ -1948,6 +1948,140 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             if timer is not None:
                 timer.cancel()
 
+    def test_usage_limit_wait_schedules_when_result_error_is_final_message_artifact(self) -> None:
+        from tests.test_codex_quota_wait import (
+            SESSION_ID,
+            TURN_FAILED_DICT_REPR_ERROR,
+            _progress_event,
+        )
+
+        tz = datetime.now().astimezone().tzinfo
+        clock = datetime(2026, 8, 30, 6, 39, tzinfo=tz)
+        routine = _model(action="ask_run_prompt", routine=True, stage="routine_action_available")
+        ledger = FakeLedger(
+            _run(RunStatus.NEEDS_REVIEW.value),
+            [
+                _controller_event("/tmp", event_id=1),
+                _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=2),
+                _progress_event(kind="error", error=TURN_FAILED_DICT_REPR_ERROR, event_id=3),
+            ],
+        )
+        controller = LocalController(
+            session=LocalControllerSession(active_run_id="run-1"),
+            ledger=ledger,
+            read_model_builder=ReadModelSequence(routine, routine, routine),
+            supervision_step=StepRecorder(
+                FakeStepResult(
+                    ok=False,
+                    reason_code="extracted_codex_prompt_run_failed",
+                    error_message="Codex final-message artifact was not written.",
+                    blocked=True,
+                    action_executed=True,
+                    planner_action="ask_run_prompt",
+                    next_state_hint="blocked",
+                    run_status="needs_review",
+                )
+            ),
+            quota_wait_now=lambda: clock,
+            rate_limits_reader=lambda **_kwargs: None,
+            quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("quota resume must not run during wait-only tests")
+            ),
+        )
+
+        try:
+            controller.request_automatic_progress()
+            controller.current_worker.join(1)
+
+            self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
+            self.assertEqual(ledger.run["status"], RunStatus.RUNNING.value)
+            self.assertFalse(
+                any(event["event_type"] == "local_controller_action_failed" for event in ledger.added_events)
+            )
+            wait_events = [
+                event
+                for event in ledger.added_events
+                if event["event_type"] == "codex_quota_wait_scheduled"
+            ]
+            self.assertEqual(len(wait_events), 1)
+        finally:
+            timer = controller._quota_wait_timer
+            if timer is not None:
+                timer.cancel()
+
+    def test_initial_codex_usage_limit_waits_despite_missing_final_message(self) -> None:
+        from tests.test_codex_quota_wait import (
+            SESSION_ID,
+            TURN_FAILED_DICT_REPR_ERROR,
+            _progress_event,
+        )
+
+        tz = datetime.now().astimezone().tzinfo
+        clock = datetime(2026, 8, 30, 6, 39, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as repo:
+            ledger = FakeLedger()
+
+            def initial_executor(**_kwargs):
+                ledger.events.extend(
+                    [
+                        _progress_event(
+                            kind="codex_json_event",
+                            session_id=SESSION_ID,
+                            event_id=20,
+                        ),
+                        _progress_event(
+                            kind="error",
+                            error=TURN_FAILED_DICT_REPR_ERROR,
+                            event_id=21,
+                        ),
+                    ]
+                )
+                return InitialRunExecutionResult(
+                    ok=False,
+                    reason_code="codex_nonzero_exit",
+                    error_message="Codex final-message artifact was not written.",
+                )
+
+            controller = LocalController(
+                ledger=ledger,
+                initial_run_executor=initial_executor,
+                quota_wait_now=lambda: clock,
+                rate_limits_reader=lambda **_kwargs: None,
+                quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("quota resume must not run during wait-only tests")
+                ),
+            )
+            try:
+                result = controller.start_run(
+                    repository_path=repo,
+                    initial_instruction="Task",
+                    project_title="Project",
+                    chat_title="Chat",
+                    sandbox="read-only",
+                )
+                self.assertTrue(result.ok)
+                controller.current_worker.join(1)
+
+                self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
+                self.assertEqual(ledger.run["status"], RunStatus.RUNNING.value)
+                self.assertFalse(
+                    any(
+                        event["event_type"] == "local_controller_action_failed"
+                        for event in ledger.added_events
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        event["event_type"] == "codex_quota_wait_scheduled"
+                        for event in ledger.added_events
+                    )
+                )
+            finally:
+                timer = controller._quota_wait_timer
+                if timer is not None:
+                    timer.cancel()
+
     def test_cancel_during_quota_wait_returns_to_needs_review_and_blocked(self) -> None:
         from tests.test_codex_quota_wait import SESSION_ID, USAGE_LIMIT_ERROR, _progress_event
 

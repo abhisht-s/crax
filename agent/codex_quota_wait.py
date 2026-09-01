@@ -129,6 +129,27 @@ def quota_wait_fields(event: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def quota_wait_client_message(resume_at: str, *, now: datetime | None = None) -> str:
+    """Format remaining wait as a duration so the dashboard does not show time zones."""
+    parsed = _parse_iso(resume_at)
+    if parsed is None:
+        return "Codex limits ran out. Waiting for reset."
+    remaining_seconds = (parsed - _aware_now(now)).total_seconds()
+    if remaining_seconds <= 0:
+        return "Codex limits ran out. Resuming shortly."
+    total_minutes = int((remaining_seconds + 59) // 60)
+    hours, minutes = divmod(total_minutes, 60)
+    return f"Codex limits ran out. Reset in {hours:02d}:{minutes:02d} hours"
+
+
+def _parse_iso(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return _aware_now(parsed)
+
+
 def active_quota_wait(events: list[dict[str, Any]]) -> dict[str, Any] | None:
     scheduled: dict[str, Any] | None = None
     for event in events:
@@ -217,14 +238,29 @@ def _progress_error_text(payload: dict[str, Any]) -> str:
     if isinstance(nested, dict):
         summary = nested.get("value_summary")
         if isinstance(summary, dict):
-            error = summary.get("error")
-            if isinstance(error, str) and error.strip():
-                return error.strip()
+            extracted = _flatten_error_text(summary.get("error"))
+            if extracted:
+                return extracted
     for key in ("summary", "title"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _flatten_error_text(error: object) -> str:
+    if isinstance(error, dict):
+        nested = error.get("message")
+        if nested is None:
+            nested = error.get("error")
+        if nested is not None and nested is not error:
+            return _flatten_error_text(nested)
+        return str(error).strip()
+    if isinstance(error, str):
+        return error.strip()
+    if error is None:
+        return ""
+    return str(error).strip()
 
 
 def looks_like_usage_limit(text: str) -> bool:
