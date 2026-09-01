@@ -66,6 +66,8 @@ LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION = "running_routine_action"
 LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL = "waiting_for_approval"
 LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY = "waiting_for_retry"
 LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET = "waiting_for_quota_reset"
+CODEX_QUOTA_WAIT_TIMER_SLICE_SECONDS = 30.0
+CODEX_QUOTA_WAIT_ACTION_RETRY_SECONDS = 1.0
 LOCAL_CONTROLLER_STATE_BLOCKED = "blocked"
 LOCAL_CONTROLLER_STATE_FAILED = "failed"
 LOCAL_CONTROLLER_STATE_COMPLETED = "completed"
@@ -933,6 +935,7 @@ class LocalController:
         )
 
     def get_current_state(self, run_id: str | None = None) -> LocalControllerOperationResult:
+        self._maybe_start_due_quota_resume()
         with self._lock:
             active_run_id = self.session.active_run_id
             target_run_id = run_id or active_run_id
@@ -1522,13 +1525,22 @@ class LocalController:
             self._persist_session_locked()
         return True
 
-    def _arm_quota_wait_timer_locked(self, resume_at_iso: str) -> None:
+    def _arm_quota_wait_timer_locked(
+        self,
+        resume_at_iso: str,
+        *,
+        delay_override: float | None = None,
+    ) -> None:
         self._cancel_quota_wait_timer_locked()
-        resume_at = _parse_iso_datetime(resume_at_iso)
-        clock = self.quota_wait_now()
-        delay = 0.0
-        if resume_at is not None:
-            delay = max(0.0, (resume_at - clock).total_seconds())
+        if delay_override is None:
+            resume_at = _parse_iso_datetime(resume_at_iso)
+            clock = self.quota_wait_now()
+            delay = 0.0
+            if resume_at is not None:
+                delay = max(0.0, (resume_at - clock).total_seconds())
+            delay = min(delay, CODEX_QUOTA_WAIT_TIMER_SLICE_SECONDS)
+        else:
+            delay = max(0.0, float(delay_override))
         run_id = self.session.active_run_id
         timer = threading.Timer(delay, self._quota_wait_timer_fired, args=(run_id,))
         timer.daemon = True
@@ -1541,20 +1553,65 @@ class LocalController:
         if timer is not None:
             timer.cancel()
 
+    def _quota_wait_context_matches_locked(self, run_id: str | None) -> bool:
+        return (
+            run_id is not None
+            and self.session.active_run_id == run_id
+            and self.session.controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET
+            and isinstance(self._quota_wait, dict)
+            and str(self._quota_wait.get("resume_at") or "").strip() != ""
+        )
+
+    def _begin_quota_resume_locked(self, run_id: str) -> threading.Thread:
+        self._cancel_quota_wait_timer_locked()
+        self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+        self._mark_action_running_locked("quota_resume")
+        worker = self._new_worker(self._quota_resume_worker, run_id)
+        self.current_worker = worker
+        return worker
+
     def _quota_wait_timer_fired(self, run_id: str | None) -> None:
+        worker = None
         with self._lock:
-            if run_id is None or self.session.active_run_id != run_id:
+            if not self._quota_wait_context_matches_locked(run_id):
                 return
-            if self.session.controller_state != LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET:
+            wait = self._quota_wait or {}
+            resume_at = _parse_iso_datetime(str(wait.get("resume_at") or ""))
+            clock = self.quota_wait_now()
+            if resume_at is not None and clock < resume_at:
+                self._arm_quota_wait_timer_locked(str(wait["resume_at"]))
                 return
             if self.action_running:
+                self._arm_quota_wait_timer_locked(
+                    str(wait["resume_at"]),
+                    delay_override=CODEX_QUOTA_WAIT_ACTION_RETRY_SECONDS,
+                )
                 return
-            self._quota_wait_timer = None
-            self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
-            self._mark_action_running_locked("quota_resume")
-            worker = self._new_worker(self._quota_resume_worker, run_id)
-            self.current_worker = worker
-        worker.start()
+            worker = self._begin_quota_resume_locked(str(run_id))
+        if worker is not None:
+            worker.start()
+
+    def _maybe_start_due_quota_resume(self) -> None:
+        worker = None
+        with self._lock:
+            run_id = self.session.active_run_id
+            if not self._quota_wait_context_matches_locked(run_id):
+                return
+            wait = self._quota_wait or {}
+            resume_at = _parse_iso_datetime(str(wait.get("resume_at") or ""))
+            clock = self.quota_wait_now()
+            if resume_at is None or clock < resume_at:
+                return
+            if self.action_running:
+                if self._quota_wait_timer is None:
+                    self._arm_quota_wait_timer_locked(
+                        str(wait["resume_at"]),
+                        delay_override=CODEX_QUOTA_WAIT_ACTION_RETRY_SECONDS,
+                    )
+                return
+            worker = self._begin_quota_resume_locked(str(run_id))
+        if worker is not None:
+            worker.start()
 
     def _quota_resume_worker(self, run_id: str) -> None:
         try:
