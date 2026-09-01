@@ -298,9 +298,29 @@ class CodexTerminalTimeoutTests(unittest.TestCase):
         )
 
         self.assertEqual(event["kind"], "error")
+        self.assertEqual(event["summary"], message)
         error = event["metadata"]["value_summary"]["error"]
         self.assertEqual(error, message)
         self.assertNotIn("{'message':", error)
+
+    def test_error_event_message_field_is_extracted_as_usage_limit_text(self) -> None:
+        message = (
+            "You've hit your usage limit. Upgrade to Pro, visit "
+            "chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at 2:06 AM."
+        )
+        event = codex_terminal.normalize_codex_jsonl_event(
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": message,
+                }
+            )
+        )
+
+        self.assertEqual(event["kind"], "error")
+        self.assertEqual(event["summary"], message)
+        self.assertEqual(event["metadata"]["value_summary"]["error"], message)
 
     def test_agent_message_json_event_becomes_bounded_assistant_commentary(self) -> None:
         event = codex_terminal.normalize_codex_jsonl_event(

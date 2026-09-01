@@ -194,6 +194,7 @@ class StaticSourceContractTests(unittest.TestCase):
             "renderFailure(model, runtime)",
             'elements["codex-live-quota-wait"]',
             "quotaWaitClientMessage(quotaWait)",
+            "quotaResumeIsLive(runtime)",
             "Codex limits ran out. Reset in ${hh}:${mm} hours",
             "Waiting for Codex reset",
             "Paused — ready for manual retry",
@@ -230,6 +231,10 @@ class StaticSourceContractTests(unittest.TestCase):
             'elements["sandbox-select"].value = "danger-full-access"',
             '"needs_review",',
             "(activeRun && !activeRunReplaceable)",
+            'runtime.controller_state === "blocked"',
+            "Boolean(model && model.completed)",
+            "REPLACEABLE_RUN_STATUSES.has(model.run_status)",
+            "typeof valueSummary.error === \"string\"",
         ):
             self.assertIn(required, self.all_static)
 

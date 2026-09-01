@@ -1693,6 +1693,68 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             executor.release.set()
             controller.current_worker.join(1)
 
+    def test_blocked_running_ledger_run_is_replaced_by_new_start(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            executor = BlockingInitialExecutor()
+            ledger = FakeLedger(_run(RunStatus.RUNNING.value))
+            ledger._next_run_number = 2
+            session = LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="blocked",
+            )
+            controller = LocalController(
+                session=session,
+                ledger=ledger,
+                initial_run_executor=executor,
+            )
+
+            result = controller.start_run(
+                repository_path=repo,
+                initial_instruction="New task",
+                project_title="Project",
+                chat_title="Chat",
+                sandbox="read-only",
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.run_id, "run-2")
+            self.assertEqual(ledger.create_run_calls, ["New task"])
+            abandoned = [
+                call for call in ledger.update_run_status_calls if call["run_id"] == "run-1"
+            ]
+            self.assertEqual(len(abandoned), 1)
+            self.assertEqual(abandoned[0]["status"], RunStatus.FAILED)
+            self.assertIn("abandoned", str(abandoned[0]["error"]).lower())
+            self.assertTrue(executor.entered.wait(1))
+            executor.release.set()
+            controller.current_worker.join(1)
+
+    def test_blocked_run_stays_guarded_while_an_action_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            ledger = FakeLedger(_run(RunStatus.RUNNING.value))
+            session = LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="blocked",
+            )
+            controller = LocalController(
+                session=session,
+                ledger=ledger,
+                initial_run_executor=BlockingInitialExecutor(),
+            )
+            controller.action_running = True
+
+            result = controller.start_run(
+                repository_path=repo,
+                initial_instruction="New task",
+                project_title="Project",
+                chat_title="Chat",
+                sandbox="read-only",
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason_code, "active_run_exists")
+            self.assertEqual(ledger.create_run_calls, [])
+
     def test_initial_worker_is_async_and_uses_safe_executor_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as repo:
             executor = BlockingInitialExecutor()
@@ -2082,6 +2144,122 @@ class LocalControllerStateMachineTests(unittest.TestCase):
                 if timer is not None:
                     timer.cancel()
 
+    def test_initial_codex_usage_limit_waits_when_governance_ok(self) -> None:
+        from tests.test_codex_quota_wait import (
+            SESSION_ID,
+            USAGE_LIMIT_ERROR,
+            _progress_event,
+        )
+
+        tz = datetime.now().astimezone().tzinfo
+        clock = datetime(2026, 8, 30, 6, 39, tzinfo=tz)
+
+        with tempfile.TemporaryDirectory() as repo:
+            ledger = FakeLedger()
+
+            def initial_executor(**_kwargs):
+                ledger.events.extend(
+                    [
+                        _progress_event(
+                            kind="codex_json_event",
+                            session_id=SESSION_ID,
+                            event_id=20,
+                        ),
+                        _progress_event(
+                            kind="error",
+                            error=USAGE_LIMIT_ERROR,
+                            event_id=21,
+                        ),
+                    ]
+                )
+                return InitialRunExecutionResult(
+                    ok=True,
+                    reason_code="codex_nonzero_exit",
+                    error_message=None,
+                )
+
+            controller = LocalController(
+                ledger=ledger,
+                initial_run_executor=initial_executor,
+                quota_wait_now=lambda: clock,
+                rate_limits_reader=lambda **_kwargs: None,
+                quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("quota resume must not run during wait-only tests")
+                ),
+            )
+            try:
+                result = controller.start_run(
+                    repository_path=repo,
+                    initial_instruction="Task",
+                    project_title="Project",
+                    chat_title="Chat",
+                    sandbox="read-only",
+                )
+                self.assertTrue(result.ok)
+                controller.current_worker.join(1)
+
+                self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
+                self.assertEqual(ledger.run["status"], RunStatus.RUNNING.value)
+                self.assertFalse(
+                    any(
+                        event["event_type"] == "local_controller_action_failed"
+                        for event in ledger.added_events
+                    )
+                )
+                self.assertTrue(
+                    any(
+                        event["event_type"] == "codex_quota_wait_scheduled"
+                        for event in ledger.added_events
+                    )
+                )
+            finally:
+                timer = controller._quota_wait_timer
+                if timer is not None:
+                    timer.cancel()
+
+    def test_blocked_state_catch_up_schedules_quota_wait_from_progress(self) -> None:
+        from tests.test_codex_quota_wait import SESSION_ID, USAGE_LIMIT_ERROR, _progress_event
+
+        tz = datetime.now().astimezone().tzinfo
+        clock = datetime(2026, 8, 30, 6, 39, tzinfo=tz)
+        with tempfile.TemporaryDirectory() as repo:
+            ledger = FakeLedger(
+                _run(RunStatus.NEEDS_REVIEW.value),
+                [
+                    _controller_event(repo, event_id=1),
+                    _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=2),
+                    _progress_event(kind="error", error=USAGE_LIMIT_ERROR, event_id=3),
+                ],
+            )
+            controller = LocalController(
+                session=LocalControllerSession(
+                    active_run_id="run-1",
+                    controller_state="blocked",
+                ),
+                ledger=ledger,
+                quota_wait_now=lambda: clock,
+                rate_limits_reader=lambda **_kwargs: None,
+                quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("quota resume must not run during wait-only tests")
+                ),
+            )
+            try:
+                result = controller.get_current_state()
+                self.assertTrue(result.ok)
+                self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
+                self.assertTrue(
+                    any(
+                        event["event_type"] == "codex_quota_wait_scheduled"
+                        for event in ledger.added_events
+                    )
+                )
+                self.assertIsNotNone(result.read_model)
+                self.assertIsNotNone(result.read_model.quota_wait)
+            finally:
+                timer = controller._quota_wait_timer
+                if timer is not None:
+                    timer.cancel()
+
     def test_cancel_during_quota_wait_returns_to_needs_review_and_blocked(self) -> None:
         from tests.test_codex_quota_wait import SESSION_ID, USAGE_LIMIT_ERROR, _progress_event
 
@@ -2178,6 +2356,31 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             timer = controller._quota_wait_timer
             if timer is not None:
                 timer.cancel()
+
+    def test_read_model_drops_quota_wait_once_resume_starts(self) -> None:
+        from tests.test_codex_quota_wait import SESSION_ID
+
+        resume_at = datetime(2026, 9, 1, 14, 58, tzinfo=timezone.utc).isoformat()
+        ledger = FakeLedger(
+            _run(RunStatus.RUNNING.value),
+            [
+                _event(
+                    1,
+                    "codex_quota_wait_scheduled",
+                    {
+                        "thread_id": SESSION_ID,
+                        "resume_at": resume_at,
+                        "resets_at": resume_at,
+                        "repository_path": "/tmp",
+                        "sandbox": "read-only",
+                    },
+                ),
+                _event(2, "codex_quota_resume_started", {"thread_id": SESSION_ID}),
+            ],
+        )
+        model = build_local_controller_read_model("run-1", ledger=ledger)
+        self.assertIsNone(model.quota_wait)
+        self.assertNotEqual(model.planner_reason_code, "waiting_for_quota_reset")
 
     def test_quota_wait_timer_uses_short_wall_clock_slices(self) -> None:
         from tests.test_codex_quota_wait import SESSION_ID

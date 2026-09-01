@@ -159,6 +159,7 @@ def active_quota_wait(events: list[dict[str, Any]]) -> dict[str, Any] | None:
             continue
         if event_type in {
             CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
+            CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE,
             CODEX_QUOTA_RESUME_FINISHED_EVENT_TYPE,
         }:
             scheduled = None

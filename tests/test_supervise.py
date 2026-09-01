@@ -409,6 +409,26 @@ class SupervisePlannerTests(unittest.TestCase):
         self.assertEqual(plan.action, SuperviseAction.STOP)
         self.assertEqual(plan.reason, "waiting_for_quota_reset")
 
+    def test_quota_resume_started_does_not_keep_waiting_stop(self) -> None:
+        events = [
+            self.event(
+                "codex_quota_wait_scheduled",
+                {
+                    "thread_id": "01a05837-1cb2-76b0-852f-6a104eb1f07c",
+                    "resume_at": "2026-08-30T02:22:00+00:00",
+                },
+            ),
+            self.event("codex_quota_resume_started", {"thread_id": "01a05837-1cb2-76b0-852f-6a104eb1f07c"}),
+            self.codex_finished(exit_code=1),
+            self.supervision(),
+        ]
+        plan = detect_next_supervise_action(
+            self.run_record("running"),
+            events,
+            self.repo_path,
+        )
+        self.assertNotEqual(plan.reason, "waiting_for_quota_reset")
+
     def test_needs_review_and_approval_required_stop(self) -> None:
         cases = [
             (self.run_record("needs_review"), self.base_completed_events(), "needs_review"),

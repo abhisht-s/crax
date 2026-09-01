@@ -1336,7 +1336,8 @@
     const quotaWait = model && model.quota_wait && typeof model.quota_wait === "object"
       ? model.quota_wait
       : null;
-    if (quotaWait && quotaWait.resume_at) {
+    const quotaResumeLive = quotaResumeIsLive(runtime);
+    if (quotaWait && quotaWait.resume_at && !quotaResumeLive) {
       setText(elements["codex-live-quota-wait"], quotaWaitClientMessage(quotaWait));
     } else {
       setText(elements["codex-live-quota-wait"], "None");
@@ -1357,7 +1358,7 @@
     const issue = latestIssueProgressEvent();
     setText(
       elements["codex-live-error"],
-      quotaWait ? "None" : (issue ? progressEventLabel(issue) : "None"),
+      quotaWait && !quotaResumeLive ? "None" : (issue ? progressEventLabel(issue) : "None"),
     );
     renderProgressEvents();
     renderCodexPlan();
@@ -1422,6 +1423,14 @@
     }
   }
 
+  function quotaResumeIsLive(runtime) {
+    return Boolean(
+      runtime &&
+        (runtime.current_action_kind === "quota_resume" ||
+          (runtime.action_running && runtime.controller_state === "running_routine_action")),
+    );
+  }
+
   function quotaWaitClientMessage(quotaWait) {
     const until = Date.parse(quotaWait && quotaWait.resume_at ? quotaWait.resume_at : "");
     if (Number.isFinite(until)) {
@@ -1443,7 +1452,12 @@
   }
 
   function codexLiveLabel(latest, runtime, model) {
-    if (model && model.quota_wait && model.quota_wait.resume_at) {
+    if (
+      model &&
+      model.quota_wait &&
+      model.quota_wait.resume_at &&
+      !quotaResumeIsLive(runtime)
+    ) {
       return { text: "Waiting for Codex reset", className: "status-warn" };
     }
     if (!progressRunId) {
@@ -1493,7 +1507,17 @@
       return "Unknown progress event";
     }
     const title = valueOrNone(event.title);
-    const summary = event.summary ? `: ${event.summary}` : "";
+    const metadata = event.metadata && typeof event.metadata === "object" ? event.metadata : {};
+    const valueSummary =
+      metadata.value_summary && typeof metadata.value_summary === "object"
+        ? metadata.value_summary
+        : {};
+    const nestedError =
+      typeof valueSummary.error === "string" && valueSummary.error.trim()
+        ? valueSummary.error.trim()
+        : "";
+    const summaryText = nestedError || event.summary;
+    const summary = summaryText ? `: ${summaryText}` : "";
     return `${title}${summary}`;
   }
 
@@ -1628,7 +1652,13 @@
       activeRun &&
       !running &&
       model &&
-      REPLACEABLE_RUN_STATUSES.has(model.run_status),
+      (
+        REPLACEABLE_RUN_STATUSES.has(model.run_status) ||
+        runtime.controller_state === "blocked" ||
+        runtime.controller_state === "waiting_for_retry" ||
+        runtime.controller_state === "failed" ||
+        runtime.controller_state === "completed"
+      ),
     );
     const optionsUnavailable = optionsRequestInFlight || !profileOptions;
     const invalidSelection = !profileSelectionValid();
@@ -1668,7 +1698,11 @@
     elements["full-access-confirmation"].disabled = disableInputs;
     elements["start-button"].disabled = disableStart;
     elements["cancel-run-button"].disabled =
-      !authenticated || !activeRun || cancelRequestInFlight || Boolean(model && model.terminal);
+      !authenticated ||
+      !activeRun ||
+      cancelRequestInFlight ||
+      Boolean(model && model.completed) ||
+      Boolean(model && REPLACEABLE_RUN_STATUSES.has(model.run_status));
 
     if (model) {
       renderApproval(model, runtime);

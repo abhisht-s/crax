@@ -6,6 +6,7 @@ import unittest
 
 from agent.codex_quota_wait import (
     CODEX_QUOTA_RESUME_DELAY_SECONDS,
+    CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE,
     CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
     CODEX_QUOTA_WAIT_LIMIT,
     CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
@@ -224,6 +225,13 @@ class CodexQuotaWaitHelpersTests(unittest.TestCase):
         active = active_quota_wait(events)
         self.assertIsNotNone(active)
         self.assertEqual(active["id"], 2)
+
+    def test_active_wait_clears_when_resume_starts(self) -> None:
+        events = [
+            {"id": 1, "event_type": CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE, "metadata": {}},
+            {"id": 2, "event_type": CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE, "metadata": {}},
+        ]
+        self.assertIsNone(active_quota_wait(events))
 
 
 if __name__ == "__main__":

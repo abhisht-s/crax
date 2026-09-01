@@ -76,6 +76,12 @@ LOCAL_CONTROLLER_TERMINAL_STATES = (
     LOCAL_CONTROLLER_STATE_FAILED,
     LOCAL_CONTROLLER_STATE_COMPLETED,
 )
+LOCAL_CONTROLLER_REPLACEABLE_RUN_STATUSES = {
+    RunStatus.COMPLETED.value,
+    RunStatus.FAILED.value,
+    RunStatus.NEEDS_REVIEW.value,
+    RunStatus.REJECTED.value,
+}
 LOCAL_CONTROLLER_INITIAL_CODEX_TIMEOUT_SECONDS: float | None = None
 LOCAL_CONTROLLER_ACTION_FAILED_EVENT_TYPE = "local_controller_action_failed"
 LOCAL_CONTROLLER_ACTION_FAILED_MESSAGE = "Controller action paused after failure."
@@ -341,6 +347,8 @@ class LocalController:
                 controller_state=self.session.controller_state,
             )
 
+        replaced_run_id: str | None = None
+        replaced_status = ""
         with self._lock:
             if self.session.active_run_id is not None:
                 active_run_id = self.session.active_run_id
@@ -350,16 +358,7 @@ class LocalController:
                     if isinstance(active_run, dict)
                     else ""
                 )
-                if (
-                    self.action_running
-                    or active_status
-                    not in {
-                        RunStatus.COMPLETED.value,
-                        RunStatus.FAILED.value,
-                        RunStatus.NEEDS_REVIEW.value,
-                        RunStatus.REJECTED.value,
-                    }
-                ):
+                if not self._active_run_is_replaceable_locked(active_status):
                     return LocalControllerOperationResult(
                         ok=False,
                         reason_code="active_run_exists",
@@ -367,6 +366,8 @@ class LocalController:
                         run_id=active_run_id,
                         controller_state=self.session.controller_state,
                     )
+                replaced_run_id = active_run_id
+                replaced_status = active_status
                 self.session.active_run_id = None
                 self.session.pending_approval = None
                 self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
@@ -388,6 +389,11 @@ class LocalController:
             run_id = start_result.run_id
             if run_id is None:
                 raise ValueError("start_local_controller_run returned no run_id")
+            if (
+                replaced_run_id is not None
+                and replaced_status not in LOCAL_CONTROLLER_REPLACEABLE_RUN_STATUSES
+            ):
+                self._abandon_replaced_run(replaced_run_id)
             self.session.controller_state = LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX
             self.session.pending_approval = None
             self.cancel_requested.clear()
@@ -417,6 +423,28 @@ class LocalController:
             read_model=self.get_current_state(run_id).read_model,
             metadata={"start_event_type": LOCAL_CONTROLLER_RUN_STARTED_EVENT_TYPE},
         )
+
+    def _active_run_is_replaceable_locked(self, active_status: str) -> bool:
+        if self.action_running:
+            return False
+        if active_status in LOCAL_CONTROLLER_REPLACEABLE_RUN_STATUSES:
+            return True
+        return self.session.controller_state in {
+            LOCAL_CONTROLLER_STATE_BLOCKED,
+            LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY,
+            LOCAL_CONTROLLER_STATE_FAILED,
+            LOCAL_CONTROLLER_STATE_COMPLETED,
+        }
+
+    def _abandon_replaced_run(self, run_id: str) -> None:
+        try:
+            self.ledger.update_run_status(
+                run_id,
+                RunStatus.FAILED,
+                error="Previous controller run was abandoned so a new run could start.",
+            )
+        except (AttributeError, TypeError):
+            pass
 
     def submit_approval_decision(self, decision: str) -> LocalControllerOperationResult:
         if decision not in {"approved", "rejected"}:
@@ -935,6 +963,7 @@ class LocalController:
         )
 
     def get_current_state(self, run_id: str | None = None) -> LocalControllerOperationResult:
+        self._maybe_catch_up_quota_wait()
         self._maybe_start_due_quota_resume()
         with self._lock:
             active_run_id = self.session.active_run_id
@@ -1047,14 +1076,14 @@ class LocalController:
             summary = _action_result_summary(result, "initial_run")
             with self._lock:
                 self.last_action_result_summary = summary
+            if self._maybe_schedule_quota_wait(
+                run_id,
+                result,
+                repository_path=repository_path,
+                sandbox=sandbox,
+            ):
+                return
             if not _result_ok(result):
-                if self._maybe_schedule_quota_wait(
-                    run_id,
-                    result,
-                    repository_path=repository_path,
-                    sandbox=sandbox,
-                ):
-                    return
                 self._pause_for_action_failure(
                     run_id,
                     action_key="initial_codex",
@@ -1319,6 +1348,17 @@ class LocalController:
                 self._store_pending_approval(read_model)
                 return
             if read_model.completed or read_model.blocked or read_model.terminal:
+                if (read_model.blocked or read_model.terminal) and not read_model.completed:
+                    if self._maybe_schedule_quota_wait(
+                        run_id,
+                        _controller_failure_result(
+                            str(read_model.planner_reason_code or "blocked"),
+                            str(read_model.actionable_error_message or ""),
+                        ),
+                        repository_path=read_model.repository_path,
+                        sandbox=read_model.sandbox,
+                    ):
+                        return
                 self._commit_state_from_read_model(read_model, allow_pending_snapshot=False)
                 return
             if not read_model.routine_action_available:
@@ -1452,6 +1492,23 @@ class LocalController:
             self.current_action_started_at = None
             self._persist_session_locked()
 
+    def _maybe_catch_up_quota_wait(self) -> None:
+        with self._lock:
+            if self.action_running:
+                return
+            run_id = self.session.active_run_id
+            if run_id is None:
+                return
+            if self.session.controller_state != LOCAL_CONTROLLER_STATE_BLOCKED:
+                return
+        events = self.ledger.list_events(run_id)
+        if quota_wait_count(events) > 0:
+            return
+        self._maybe_schedule_quota_wait(
+            run_id,
+            _controller_failure_result("quota_wait_catch_up", ""),
+        )
+
     def _maybe_schedule_quota_wait(
         self,
         run_id: str,
@@ -1461,6 +1518,8 @@ class LocalController:
         sandbox: str | None = None,
     ) -> bool:
         events = self.ledger.list_events(run_id)
+        if active_quota_wait(events) is not None:
+            return False
         # Result.error_message is often the missing final-message artifact, not
         # the usage-limit text from JSONL. Only use it as a veto after a wait
         # has already been scheduled, so a later generic resume failure does
@@ -1564,8 +1623,10 @@ class LocalController:
 
     def _begin_quota_resume_locked(self, run_id: str) -> threading.Thread:
         self._cancel_quota_wait_timer_locked()
+        self._quota_wait = None
         self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
         self._mark_action_running_locked("quota_resume")
+        self._persist_session_locked()
         worker = self._new_worker(self._quota_resume_worker, run_id)
         self.current_worker = worker
         return worker

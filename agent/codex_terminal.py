@@ -174,6 +174,8 @@ def _json_value_summary(event: dict[str, Any]) -> dict[str, object]:
     if files:
         summary["file_changes"] = files
     error = _nested_dict_value(event, "error") or _nested_dict_value(event, "error_message")
+    if error is None and "error" in event_type.lower():
+        error = event.get("message")
     error_text = _error_object_text(error)
     if error_text is not None:
         summary["error"] = error_text
@@ -324,11 +326,17 @@ def normalize_codex_jsonl_event(line: str) -> dict[str, object]:
             metadata=metadata,
         )
     if any(marker in lowered for marker in ("error", "failed", "failure")):
+        error = (
+            _nested_dict_value(parsed, "error")
+            or _nested_dict_value(parsed, "error_message")
+            or parsed.get("message")
+        )
+        error_text = _error_object_text(error)
         return _progress_event(
             kind="error",
             status="failed",
             title="Codex error",
-            summary=f"Codex emitted {event_type}.",
+            summary=error_text or f"Codex emitted {event_type}.",
             metadata=metadata,
         )
     if command is not None or "command" in lowered or "exec" in lowered:
