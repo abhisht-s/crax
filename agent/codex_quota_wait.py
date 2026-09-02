@@ -13,7 +13,6 @@ CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE = "codex_quota_wait_cancelled"
 CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE = "codex_quota_resume_started"
 CODEX_QUOTA_RESUME_FINISHED_EVENT_TYPE = "codex_quota_resume_finished"
 CODEX_QUOTA_RESUME_DELAY_SECONDS = 60
-CODEX_QUOTA_WAIT_LIMIT = 3
 CODEX_QUOTA_RESUME_PROMPT = (
     "The previous turn ended because the Codex usage limit reset. "
     "Continue from the last incomplete work. Do not restart from scratch."
@@ -54,14 +53,12 @@ def decide_quota_wait(
     Codex-failure behavior.
     """
     clock = _aware_now(now)
-    if quota_wait_count(events) >= CODEX_QUOTA_WAIT_LIMIT:
-        return QuotaWaitDecision(
-            scheduled=False,
-            reason_code="quota_wait_limit_reached",
-        )
     progress = [_progress_payload(event) for event in events]
     progress = [item for item in progress if item is not None]
-    error_text, invocation_id = _latest_usage_limit_error(progress)
+    error_text, invocation_id = _latest_usage_limit_error(
+        progress,
+        exclude_invocation_ids=_waited_invocation_ids(events),
+    )
     if error_text is None:
         return QuotaWaitDecision(
             scheduled=False,
@@ -98,14 +95,6 @@ def decide_quota_wait(
         error_text=error_text,
         invocation_id=invocation_id,
         source=source,
-    )
-
-
-def quota_wait_count(events: list[dict[str, Any]]) -> int:
-    return sum(
-        1
-        for event in events
-        if event.get("event_type") == CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE
     )
 
 
@@ -202,9 +191,23 @@ def parse_try_again_at(error_text: str, *, now: datetime) -> datetime | None:
     return candidate.astimezone(UTC)
 
 
+def _waited_invocation_ids(events: list[dict[str, Any]]) -> set[str]:
+    waited: set[str] = set()
+    for event in events:
+        if event.get("event_type") != CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE:
+            continue
+        invocation_id = str(_metadata(event).get("invocation_id") or "").strip()
+        if invocation_id:
+            waited.add(invocation_id)
+    return waited
+
+
 def _latest_usage_limit_error(
     progress: list[dict[str, Any]],
+    *,
+    exclude_invocation_ids: set[str] | None = None,
 ) -> tuple[str | None, str | None]:
+    excluded = exclude_invocation_ids or set()
     for payload in reversed(progress):
         if str(payload.get("kind") or "") != "error":
             continue
@@ -212,6 +215,8 @@ def _latest_usage_limit_error(
         if not _looks_like_usage_limit(error_text):
             return None, None
         invocation_id = str(payload.get("codex_invocation_id") or "").strip() or None
+        if invocation_id and invocation_id in excluded:
+            continue
         return error_text, invocation_id
     return None, None
 

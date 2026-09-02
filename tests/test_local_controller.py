@@ -2260,6 +2260,87 @@ class LocalControllerStateMachineTests(unittest.TestCase):
                 if timer is not None:
                     timer.cancel()
 
+    def test_blocked_catch_up_schedules_wait_for_new_invocation_after_prior_wait(self) -> None:
+        from tests.test_codex_quota_wait import (
+            CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE,
+            CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+            INVOCATION_ID,
+            SESSION_ID,
+            USAGE_LIMIT_ERROR,
+            _progress_event,
+        )
+
+        later_limit = (
+            "You've hit your usage limit. Upgrade to Pro, visit "
+            "chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:00 PM."
+        )
+        second_invocation = "codex-invocation-resume-2"
+        tz = datetime.now().astimezone().tzinfo
+        clock = datetime(2026, 8, 30, 8, 0, tzinfo=tz)
+        with tempfile.TemporaryDirectory() as repo:
+            resolved = str(Path(repo).expanduser().resolve(strict=False))
+            ledger = FakeLedger(
+                _run(RunStatus.NEEDS_REVIEW.value),
+                [
+                    _controller_event(repo, event_id=1),
+                    _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=2),
+                    _progress_event(kind="error", error=USAGE_LIMIT_ERROR, event_id=3),
+                    _event(
+                        4,
+                        CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+                        {
+                            "thread_id": SESSION_ID,
+                            "resume_at": "2026-08-30T07:53:00+00:00",
+                            "invocation_id": INVOCATION_ID,
+                            "repository_path": resolved,
+                            "sandbox": "read-only",
+                        },
+                    ),
+                    _event(5, CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE, {"thread_id": SESSION_ID}),
+                    _progress_event(
+                        kind="codex_json_event",
+                        session_id=SESSION_ID,
+                        invocation_id=second_invocation,
+                        event_id=6,
+                    ),
+                    _progress_event(
+                        kind="error",
+                        error=later_limit,
+                        invocation_id=second_invocation,
+                        event_id=7,
+                    ),
+                ],
+            )
+            controller = LocalController(
+                session=LocalControllerSession(
+                    active_run_id="run-1",
+                    controller_state="blocked",
+                ),
+                ledger=ledger,
+                quota_wait_now=lambda: clock,
+                rate_limits_reader=lambda **_kwargs: None,
+                quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("quota resume must not run during wait-only tests")
+                ),
+            )
+            try:
+                result = controller.get_current_state()
+                self.assertTrue(result.ok)
+                self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
+                wait_events = [
+                    event
+                    for event in ledger.added_events
+                    if event["event_type"] == "codex_quota_wait_scheduled"
+                ]
+                self.assertEqual(len(wait_events), 1)
+                self.assertEqual(wait_events[0]["metadata"]["invocation_id"], second_invocation)
+                self.assertIsNotNone(result.read_model)
+                self.assertIsNotNone(result.read_model.quota_wait)
+            finally:
+                timer = controller._quota_wait_timer
+                if timer is not None:
+                    timer.cancel()
+
     def test_cancel_during_quota_wait_returns_to_needs_review_and_blocked(self) -> None:
         from tests.test_codex_quota_wait import SESSION_ID, USAGE_LIMIT_ERROR, _progress_event
 
@@ -2356,6 +2437,18 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             timer = controller._quota_wait_timer
             if timer is not None:
                 timer.cancel()
+
+    def test_snapshot_restore_keeps_needs_review_blocked_run(self) -> None:
+        ledger = FakeLedger(_run(RunStatus.NEEDS_REVIEW.value))
+        ledger.snapshot = {
+            "active_run_id": "run-1",
+            "controller_state": "blocked",
+            "pending_approval": None,
+            "quota_wait": None,
+        }
+        controller = LocalController(ledger=ledger)
+        self.assertEqual(controller.session.active_run_id, "run-1")
+        self.assertEqual(controller.session.controller_state, "blocked")
 
     def test_read_model_drops_quota_wait_once_resume_starts(self) -> None:
         from tests.test_codex_quota_wait import SESSION_ID
@@ -2534,6 +2627,9 @@ class LocalControllerStateMachineTests(unittest.TestCase):
 
         def resume_executor(**kwargs):
             resume_calls.append(kwargs)
+            ledger.events.append(
+                _event(39, "codex_quota_resume_started", {"thread_id": SESSION_ID})
+            )
             return FakeStepResult(
                 ok=False,
                 reason_code="extracted_codex_prompt_run_failed",
@@ -2581,6 +2677,109 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             self.assertTrue(
                 any(event["event_type"] == "local_controller_action_failed" for event in ledger.added_events)
             )
+        finally:
+            timer = controller._quota_wait_timer
+            if timer is not None:
+                timer.cancel()
+
+    def test_quota_resume_usage_limit_schedules_another_wait(self) -> None:
+        from tests.test_codex_quota_wait import SESSION_ID, USAGE_LIMIT_ERROR, _progress_event
+
+        later_limit = (
+            "You've hit your usage limit. Upgrade to Pro, visit "
+            "chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:00 PM."
+        )
+        second_invocation = "codex-invocation-resume-2"
+        tz = datetime.now().astimezone().tzinfo
+        clock = {"now": datetime(2026, 8, 30, 6, 39, tzinfo=tz)}
+        routine = _model(action="ask_run_prompt", routine=True, stage="routine_action_available")
+        ledger = FakeLedger(
+            _run(RunStatus.NEEDS_REVIEW.value),
+            [
+                _controller_event("/tmp", event_id=1),
+                _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=2),
+                _progress_event(kind="error", error=USAGE_LIMIT_ERROR, event_id=3),
+            ],
+        )
+        resume_calls: list[dict] = []
+
+        def resume_executor(**kwargs):
+            resume_calls.append(kwargs)
+            ledger.events.extend(
+                [
+                    _event(
+                        39,
+                        "codex_quota_resume_started",
+                        {"thread_id": SESSION_ID},
+                    ),
+                    _progress_event(
+                        kind="codex_json_event",
+                        session_id=SESSION_ID,
+                        invocation_id=second_invocation,
+                        event_id=40,
+                    ),
+                    _progress_event(
+                        kind="error",
+                        error=later_limit,
+                        invocation_id=second_invocation,
+                        event_id=41,
+                    ),
+                ]
+            )
+            return FakeStepResult(
+                ok=False,
+                reason_code="codex_nonzero_exit",
+                error_message="Codex final-message artifact was not written.",
+                blocked=True,
+                action_executed=True,
+                planner_action="ask_run_prompt",
+                next_state_hint="blocked",
+                run_status="needs_review",
+            )
+
+        controller = LocalController(
+            session=LocalControllerSession(active_run_id="run-1"),
+            ledger=ledger,
+            read_model_builder=ReadModelSequence(routine, routine, routine),
+            supervision_step=StepRecorder(
+                FakeStepResult(
+                    ok=False,
+                    reason_code="extracted_codex_prompt_run_failed",
+                    error_message=USAGE_LIMIT_ERROR,
+                    blocked=True,
+                    action_executed=True,
+                    planner_action="ask_run_prompt",
+                    next_state_hint="blocked",
+                    run_status="needs_review",
+                )
+            ),
+            quota_wait_now=lambda: clock["now"],
+            rate_limits_reader=lambda **_kwargs: None,
+            quota_resume_executor=resume_executor,
+        )
+
+        try:
+            controller.request_automatic_progress()
+            controller.current_worker.join(1)
+            with controller._lock:
+                controller._cancel_quota_wait_timer_locked()
+            clock["now"] = datetime(2026, 8, 30, 8, 0, tzinfo=tz)
+            controller._quota_wait_timer_fired("run-1")
+            if controller.current_worker is not None:
+                controller.current_worker.join(2)
+
+            self.assertEqual(len(resume_calls), 1)
+            self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
+            self.assertFalse(
+                any(event["event_type"] == "local_controller_action_failed" for event in ledger.added_events)
+            )
+            wait_events = [
+                event
+                for event in ledger.added_events
+                if event["event_type"] == "codex_quota_wait_scheduled"
+            ]
+            self.assertEqual(len(wait_events), 2)
+            self.assertEqual(wait_events[-1]["metadata"]["invocation_id"], second_invocation)
         finally:
             timer = controller._quota_wait_timer
             if timer is not None:

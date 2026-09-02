@@ -19,9 +19,7 @@ from agent.codex_quota_wait import (
     CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
     active_quota_wait,
     decide_quota_wait,
-    looks_like_usage_limit,
     quota_wait_client_message,
-    quota_wait_count,
     quota_wait_fields,
 )
 from agent.codex_terminal import terminate_codex_run
@@ -1501,9 +1499,6 @@ class LocalController:
                 return
             if self.session.controller_state != LOCAL_CONTROLLER_STATE_BLOCKED:
                 return
-        events = self.ledger.list_events(run_id)
-        if quota_wait_count(events) > 0:
-            return
         self._maybe_schedule_quota_wait(
             run_id,
             _controller_failure_result("quota_wait_catch_up", ""),
@@ -1520,17 +1515,9 @@ class LocalController:
         events = self.ledger.list_events(run_id)
         if active_quota_wait(events) is not None:
             return False
-        # Result.error_message is often the missing final-message artifact, not
-        # the usage-limit text from JSONL. Only use it as a veto after a wait
-        # has already been scheduled, so a later generic resume failure does
-        # not reuse stale usage-limit progress.
-        if quota_wait_count(events) > 0:
-            error_message = str(getattr(result, "error_message", "") or "")
-            if error_message and not looks_like_usage_limit(error_message):
-                return False
         clock = self.quota_wait_now()
         probe = decide_quota_wait(events, now=clock)
-        if probe.reason_code in {"not_usage_limit", "quota_wait_limit_reached", "usage_limit_without_thread_id"}:
+        if probe.reason_code in {"not_usage_limit", "usage_limit_without_thread_id"}:
             return False
         rpc_time = None
         try:
@@ -1753,7 +1740,6 @@ class LocalController:
         if active_status in {
             RunStatus.COMPLETED.value,
             RunStatus.FAILED.value,
-            RunStatus.NEEDS_REVIEW.value,
             RunStatus.REJECTED.value,
         }:
             self._persist_session_locked()

@@ -8,7 +8,6 @@ from agent.codex_quota_wait import (
     CODEX_QUOTA_RESUME_DELAY_SECONDS,
     CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE,
     CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
-    CODEX_QUOTA_WAIT_LIMIT,
     CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
     active_quota_wait,
     decide_quota_wait,
@@ -141,20 +140,48 @@ class CodexQuotaWaitDecisionTests(unittest.TestCase):
             (rpc_reset + timedelta(seconds=CODEX_QUOTA_RESUME_DELAY_SECONDS)).isoformat(),
         )
 
-    def test_quota_wait_limit_is_not_scheduled(self) -> None:
-        events = [
-            _progress_event(kind="error", error=USAGE_LIMIT_ERROR, session_id=SESSION_ID, event_id=1),
-            *[
-                {"id": index, "event_type": CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE, "metadata": {}}
-                for index in range(2, 2 + CODEX_QUOTA_WAIT_LIMIT)
-            ],
+    def test_fourth_new_invocation_usage_limit_is_still_scheduled(self) -> None:
+        tz = datetime.now().astimezone().tzinfo
+        now = datetime(2026, 8, 30, 6, 39, tzinfo=tz)
+        events: list[dict] = [
+            _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=1),
         ]
-        decision = decide_quota_wait(
-            events,
-            now=datetime(2026, 8, 30, 6, 39, tzinfo=timezone.utc),
+        event_id = 2
+        for index in range(1, 4):
+            invocation_id = f"codex-invocation-{index}"
+            events.append(
+                _progress_event(
+                    kind="error",
+                    error=USAGE_LIMIT_ERROR,
+                    invocation_id=invocation_id,
+                    event_id=event_id,
+                )
+            )
+            event_id += 1
+            events.append(
+                {
+                    "id": event_id,
+                    "event_type": CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+                    "metadata": {
+                        "thread_id": SESSION_ID,
+                        "resume_at": "2026-08-30T08:00:00+00:00",
+                        "invocation_id": invocation_id,
+                    },
+                }
+            )
+            event_id += 1
+        events.append(
+            _progress_event(
+                kind="error",
+                error=USAGE_LIMIT_ERROR,
+                invocation_id="codex-invocation-4",
+                session_id=SESSION_ID,
+                event_id=event_id,
+            )
         )
-        self.assertFalse(decision.scheduled)
-        self.assertEqual(decision.reason_code, "quota_wait_limit_reached")
+        decision = decide_quota_wait(events, now=now)
+        self.assertTrue(decision.scheduled)
+        self.assertEqual(decision.invocation_id, "codex-invocation-4")
 
     def test_later_generic_error_does_not_reuse_older_usage_limit(self) -> None:
         events = [
@@ -190,6 +217,71 @@ class CodexQuotaWaitDecisionTests(unittest.TestCase):
         decision = decide_quota_wait(events, now=now)
         self.assertTrue(decision.scheduled)
         self.assertEqual(decision.thread_id, SESSION_ID)
+
+    def test_already_waited_invocation_is_not_scheduled_again(self) -> None:
+        events = [
+            _progress_event(kind="codex_json_event", session_id=SESSION_ID, event_id=1),
+            _progress_event(kind="error", error=USAGE_LIMIT_ERROR, event_id=2),
+            {
+                "id": 3,
+                "event_type": CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+                "metadata": {
+                    "thread_id": SESSION_ID,
+                    "resume_at": "2026-08-30T08:00:00+00:00",
+                    "invocation_id": INVOCATION_ID,
+                },
+            },
+        ]
+        decision = decide_quota_wait(
+            events,
+            now=datetime(2026, 8, 30, 6, 39, tzinfo=timezone.utc),
+        )
+        self.assertFalse(decision.scheduled)
+        self.assertEqual(decision.reason_code, "not_usage_limit")
+
+    def test_new_invocation_usage_limit_after_wait_is_scheduled(self) -> None:
+        tz = datetime.now().astimezone().tzinfo
+        now = datetime(2026, 8, 30, 6, 39, tzinfo=tz)
+        second_invocation = "codex-invocation-resume-2"
+        events = [
+            _progress_event(
+                kind="codex_json_event",
+                session_id=SESSION_ID,
+                invocation_id=INVOCATION_ID,
+                event_id=1,
+            ),
+            _progress_event(
+                kind="error",
+                error=USAGE_LIMIT_ERROR,
+                invocation_id=INVOCATION_ID,
+                event_id=2,
+            ),
+            {
+                "id": 3,
+                "event_type": CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+                "metadata": {
+                    "thread_id": SESSION_ID,
+                    "resume_at": "2026-08-30T08:00:00+00:00",
+                    "invocation_id": INVOCATION_ID,
+                },
+            },
+            {"id": 4, "event_type": CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE, "metadata": {}},
+            _progress_event(
+                kind="codex_json_event",
+                session_id=SESSION_ID,
+                invocation_id=second_invocation,
+                event_id=5,
+            ),
+            _progress_event(
+                kind="error",
+                error=USAGE_LIMIT_ERROR,
+                invocation_id=second_invocation,
+                event_id=6,
+            ),
+        ]
+        decision = decide_quota_wait(events, now=now)
+        self.assertTrue(decision.scheduled)
+        self.assertEqual(decision.invocation_id, second_invocation)
 
 
 class CodexQuotaWaitMessageTests(unittest.TestCase):
