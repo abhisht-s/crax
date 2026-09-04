@@ -133,7 +133,40 @@ class CodexQuotaResumeServiceTests(unittest.TestCase):
         self.assertEqual(result.reason_code, "quota_resume_not_due")
         self.assertEqual(raw.calls, [])
 
-    def test_missing_wait_does_not_start_a_fresh_exec(self) -> None:
+    def test_force_resume_before_due_calls_codex_with_continue_prompt(self) -> None:
+        now = datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc)
+        resume_at = (now + timedelta(hours=1)).isoformat()
+        ledger = FakeResumeLedger([_wait_event(resume_at=resume_at)])
+        raw = RecordingDirect(
+            SimpleNamespace(
+                ok=True,
+                reason_code="codex_exec_completed",
+                error_message=None,
+                exit_code=0,
+                raw_process_result={"exit_code": 0},
+            )
+        )
+        governance = RecordingGovernance()
+
+        result = execute_codex_quota_resume_service(
+            "run-1",
+            ledger=ledger,
+            now=now,
+            allow_before_due=True,
+            raw_execution_service=raw,
+            governance_service=governance,
+            git_snapshot_function=lambda path: {"repo_path": path},
+            invocation_state_function=lambda path: {"repo_path": path},
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(raw.calls[0]["prompt"], CODEX_QUOTA_RESUME_PROMPT)
+        self.assertEqual(raw.calls[0]["resume_session_id"], "thread-1")
+        started = next(
+            event for event in ledger.events if event["event_type"] == "codex_quota_resume_started"
+        )
+        self.assertTrue(started["metadata"]["forced"])
+        self.assertEqual(started["metadata"]["prompt"], CODEX_QUOTA_RESUME_PROMPT)
         raw = RecordingDirect(SimpleNamespace(ok=True))
         result = execute_codex_quota_resume_service(
             "run-1",

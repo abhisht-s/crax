@@ -530,6 +530,14 @@ select:focus-visible {
   margin: 0.65rem 1rem 0;
 }
 
+#codex-live-panel .quota-continue-row {
+  margin: 0.75rem 1rem 0;
+}
+
+#codex-live-panel .quota-continue-row + .form-note {
+  margin: 0.35rem 1rem 0;
+}
+
 .codex-live-columns {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(18rem, 1fr);

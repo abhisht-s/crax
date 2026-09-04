@@ -226,6 +226,19 @@ class RemoteHTTPTests(unittest.TestCase):
         self.assertEqual(status, 202, payload)
         self.assertEqual(self.controller.cancel_calls, 1)
 
+    def test_remote_control_can_force_quota_resume(self) -> None:
+        cookie = self.pair()
+
+        status, _, payload = self.request(
+            "POST",
+            "/api/runs/current/quota-resume",
+            {},
+            cookie=cookie,
+        )
+
+        self.assertEqual(status, 202, payload)
+        self.assertEqual(self.controller.quota_resume_calls, 1)
+
 
 class ControllerSnapshotTests(unittest.TestCase):
     def setUp(self) -> None:

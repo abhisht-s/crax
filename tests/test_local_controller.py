@@ -2389,6 +2389,101 @@ class LocalControllerStateMachineTests(unittest.TestCase):
         )
         self.assertIsNone(controller._quota_wait_timer)
 
+    def test_force_quota_resume_starts_before_due(self) -> None:
+        from tests.test_codex_quota_wait import SESSION_ID
+
+        clock = datetime(2026, 9, 1, 2, 19, tzinfo=timezone.utc)
+        resume_at = (clock + timedelta(hours=4)).isoformat()
+        resume_calls: list[dict] = []
+
+        def resume_executor(**kwargs):
+            resume_calls.append(kwargs)
+            return FakeStepResult(ok=True, reason_code="codex_exec_completed")
+
+        controller = LocalController(
+            session=LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="waiting_for_quota_reset",
+            ),
+            ledger=FakeLedger(_run(RunStatus.RUNNING.value)),
+            read_model_builder=ReadModelSequence(
+                _model(action="stop", reason="no_action", stage="idle"),
+            ),
+            quota_wait_now=lambda: clock,
+            quota_resume_executor=resume_executor,
+        )
+        try:
+            with controller._lock:
+                controller._quota_wait = {
+                    "thread_id": SESSION_ID,
+                    "resume_at": resume_at,
+                    "repository_path": "/tmp",
+                    "sandbox": "read-only",
+                }
+                controller._arm_quota_wait_timer_locked(resume_at)
+            result = controller.request_force_quota_resume()
+            if controller.current_worker is not None:
+                controller.current_worker.join(2)
+            self.assertTrue(result.ok)
+            self.assertEqual(result.reason_code, "quota_resume_worker_started")
+            self.assertEqual(len(resume_calls), 1)
+            self.assertEqual(resume_calls[0]["run_id"], "run-1")
+            self.assertTrue(resume_calls[0]["allow_before_due"])
+            self.assertIsNone(controller._quota_wait)
+            self.assertIsNone(controller._quota_wait_timer)
+        finally:
+            timer = controller._quota_wait_timer
+            if timer is not None:
+                timer.cancel()
+
+    def test_force_quota_resume_requires_active_wait(self) -> None:
+        controller = LocalController(
+            session=LocalControllerSession(active_run_id="run-1"),
+            ledger=FakeLedger(_run(RunStatus.RUNNING.value)),
+            read_model_builder=ReadModelSequence(
+                _model(action="stop", reason="no_action", stage="idle"),
+            ),
+            quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("resume must not run without an active wait")
+            ),
+        )
+        result = controller.request_force_quota_resume()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "quota_wait_not_active")
+
+    def test_force_quota_resume_blocked_when_action_running(self) -> None:
+        from tests.test_codex_quota_wait import SESSION_ID
+
+        clock = datetime(2026, 9, 1, 2, 19, tzinfo=timezone.utc)
+        resume_at = (clock + timedelta(hours=4)).isoformat()
+        controller = LocalController(
+            session=LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="waiting_for_quota_reset",
+            ),
+            ledger=FakeLedger(_run(RunStatus.RUNNING.value)),
+            quota_wait_now=lambda: clock,
+            quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("resume must not run while another action is running")
+            ),
+        )
+        try:
+            controller.action_running = True
+            controller._quota_wait = {
+                "thread_id": SESSION_ID,
+                "resume_at": resume_at,
+                "repository_path": "/tmp",
+                "sandbox": "read-only",
+            }
+            result = controller.request_force_quota_resume()
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason_code, "action_already_running")
+            self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
+        finally:
+            timer = controller._quota_wait_timer
+            if timer is not None:
+                timer.cancel()
+
     def test_snapshot_restore_rearms_quota_wait(self) -> None:
         from tests.test_codex_quota_wait import SESSION_ID
 
@@ -2549,6 +2644,7 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             if controller.current_worker is not None:
                 controller.current_worker.join(2)
             self.assertEqual(len(resume_calls), 1)
+            self.assertFalse(resume_calls[0].get("allow_before_due"))
         finally:
             timer = controller._quota_wait_timer
             if timer is not None:

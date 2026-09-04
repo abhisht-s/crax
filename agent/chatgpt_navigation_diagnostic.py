@@ -132,6 +132,7 @@ AUTONOMOUS_OPEN_STABILITY_SAMPLE_COUNT = 3
 AUTONOMOUS_OPEN_STABILITY_POLL_SECONDS = 0.12
 AUTONOMOUS_OPEN_SETTLE_SECONDS = 0.35
 AUTONOMOUS_OPEN_POST_ACTION_SETTLE_SECONDS = 0.5
+SIDEBAR_TOGGLE_SETTLE_SECONDS = 1.0
 AUTONOMOUS_OPEN_OUTCOMES = {
     "dry_run_ready",
     "destination_opened_via_axpress",
@@ -297,6 +298,20 @@ SAFE_GENERIC_LABEL_ALIASES = {
     "open sidebar": "Sidebar",
     "search chats": "Search",
     "search chatgpt": "Search",
+    "toggle sidebar": "Sidebar",
+}
+SIDEBAR_TOGGLE_CHROME_LABELS = {
+    "close sidebar",
+    "open sidebar",
+    "toggle sidebar",
+}
+SIDEBAR_LIST_SECTION_TITLES = {
+    "chats",
+    "history",
+    "projects",
+    "recent",
+    "recent chats",
+    "recents",
 }
 
 
@@ -4614,6 +4629,37 @@ def open_chatgpt_sidebar_destination(
         display_probe_factory or _CoreGraphicsDisplayProbe,
     )
     result.update(_autonomous_plan_result(plan))
+    if plan["status"] == "target_absent" and confirm_open_destination:
+        recovery = _press_collapsed_sidebar_toggle_if_needed(plan, reader, sleeper)
+        result["sidebar_toggle_recovery"] = _sidebar_toggle_recovery_report(recovery)
+        if recovery.get("pressed"):
+            result["actions_performed"].append({"path": recovery["target"]["path"], "action": "AXPress"})
+            stable = _stable_chatgpt_geometry_sample(
+                reader,
+                process.pid,
+                windowserver_probe_factory or _WindowServerBoundsProbe,
+                sample_count=AUTONOMOUS_OPEN_STABILITY_SAMPLE_COUNT,
+                sleep_function=sleeper,
+            )
+            result["activation_stability"] = _autonomous_stability_summary(stable)
+            if stable["status"] != "stable":
+                result.update(
+                    {
+                        "outcome": "unstable_chatgpt_ui",
+                        "error": stable.get("error") or "ChatGPT AX/window geometry did not stabilize after opening the sidebar.",
+                    }
+                )
+                return result
+            plan = _autonomous_destination_plan(
+                stable["snapshots"],
+                stable["stats"],
+                stable["window_metadata"],
+                kind,
+                requested_title,
+                stable["windowserver_bounds"],
+                display_probe_factory or _CoreGraphicsDisplayProbe,
+            )
+            result.update(_autonomous_plan_result(plan))
     if plan["status"] != "ready":
         result.update({"outcome": plan["status"], "error": plan.get("error", "")})
         return result
@@ -7707,6 +7753,77 @@ def _choose_windowserver_window_for_ax_frame(
             int(window.get("window_id") or 0),
         ),
     )[0]
+
+
+def _sidebar_destination_list_absent(classified: dict) -> bool:
+    for candidate in classified.get("visible_navigation_section_labels") or []:
+        title = _normalized_label(str(candidate.get("exact_title") or "")).lower()
+        if title in SIDEBAR_LIST_SECTION_TITLES:
+            return False
+    if classified.get("visible_project_title_candidates") or classified.get("visible_chat_title_candidates"):
+        return False
+    return True
+
+
+def _sidebar_toggle_chrome_label(snapshot: AXElementSnapshot) -> str:
+    for value in (snapshot.identifier, snapshot.title, snapshot.description, snapshot.value):
+        lowered = _normalized_label(value).lower()
+        if lowered in SIDEBAR_TOGGLE_CHROME_LABELS:
+            return lowered
+    return ""
+
+
+def _unique_sidebar_toggle_axpress_target(snapshots: list[AXElementSnapshot]) -> dict:
+    snapshots_by_path = {snapshot.path: snapshot for snapshot in snapshots}
+    matches = []
+    for snapshot in snapshots:
+        if snapshot.role != "AXButton" or snapshot.enabled is False:
+            continue
+        if "AXPress" not in _safe_actions(snapshot.actions):
+            continue
+        if not _sidebar_toggle_chrome_label(snapshot):
+            continue
+        parent = snapshots_by_path.get(_parent_path(snapshot.path) or "")
+        if parent is None or parent.role != "AXToolbar":
+            continue
+        matches.append(snapshot)
+    if len(matches) != 1:
+        return {}
+    chosen = matches[0]
+    return {
+        "path": chosen.path,
+        "role": chosen.role,
+        "label": _sidebar_toggle_chrome_label(chosen),
+        "actions": _safe_actions(chosen.actions),
+    }
+
+
+def _press_collapsed_sidebar_toggle_if_needed(plan: dict, reader: object, sleeper: object) -> dict:
+    classified = plan.get("classified") or {}
+    snapshots = plan.get("snapshots") or []
+    if not _sidebar_destination_list_absent(classified):
+        return {"attempted": False, "pressed": False, "reason": "sidebar_list_present", "target": {}, "error": ""}
+    target = _unique_sidebar_toggle_axpress_target(snapshots)
+    if not target.get("path"):
+        return {"attempted": False, "pressed": False, "reason": "toggle_not_uniquely_actionable", "target": {}, "error": ""}
+    try:
+        _invoke_reader_ax_action(reader, target["path"], "AXPress")
+    except Exception as exc:
+        return {"attempted": True, "pressed": False, "reason": "axpress_failed", "target": target, "error": str(exc)}
+    sleeper(min(SIDEBAR_TOGGLE_SETTLE_SECONDS, 2.0))
+    return {"attempted": True, "pressed": True, "reason": "pressed", "target": target, "error": ""}
+
+
+def _sidebar_toggle_recovery_report(recovery: dict) -> dict:
+    target = recovery.get("target") or {}
+    return {
+        "attempted": bool(recovery.get("attempted")),
+        "pressed": bool(recovery.get("pressed")),
+        "reason": str(recovery.get("reason") or ""),
+        "target_path": str(target.get("path") or ""),
+        "target_label": str(target.get("label") or ""),
+        "error": str(recovery.get("error") or ""),
+    }
 
 
 def _autonomous_destination_plan(

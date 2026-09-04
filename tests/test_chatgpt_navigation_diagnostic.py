@@ -389,6 +389,49 @@ def _post_selected_sidebar_snapshots(title: str = "Markdown Formatting Guide") -
     ]
 
 
+def _collapsed_sidebar_snapshots() -> list[nav.AXElementSnapshot]:
+    return [
+        nav.AXElementSnapshot(path="W", depth=0, role="AXWindow", title="ChatGPT", frame=(0, 0, 875, 1080)),
+        nav.AXElementSnapshot(path="W.1", depth=1, role="AXGroup", frame=(0, 52, 875, 1028)),
+        nav.AXElementSnapshot(path="W.1.1", depth=2, role="AXTextArea", title="Ask ChatGPT", frame=(40, 900, 780, 44)),
+        nav.AXElementSnapshot(path="W.2", depth=1, role="AXGroup", frame=(0, 0, 875, 52)),
+        nav.AXElementSnapshot(path="W.2.1", depth=2, role="AXToolbar", frame=(0, 0, 875, 52)),
+        nav.AXElementSnapshot(
+            path="W.2.1.1",
+            depth=3,
+            role="AXButton",
+            description="Toggle Sidebar",
+            actions=("AXPress",),
+            enabled=True,
+            frame=(6, 0, 43, 52),
+        ),
+        nav.AXElementSnapshot(
+            path="W.2.1.2",
+            depth=3,
+            role="AXButton",
+            description="New chat",
+            actions=("AXPress",),
+            enabled=True,
+            frame=(49, 0, 41, 52),
+        ),
+    ]
+
+
+def _detailed_sidebar_snapshots_with_toggle() -> list[nav.AXElementSnapshot]:
+    return _detailed_sidebar_snapshots() + [
+        nav.AXElementSnapshot(path="W.3", depth=1, role="AXToolbar", frame=(0, 0, 1200, 52)),
+        nav.AXElementSnapshot(
+            path="W.3.1",
+            depth=2,
+            role="AXButton",
+            description="Toggle Sidebar",
+            actions=("AXPress",),
+            enabled=True,
+            frame=(6, 0, 43, 52),
+        ),
+    ]
+
+
 def _detailed_sidebar_snapshots() -> list[nav.AXElementSnapshot]:
     return [
         nav.AXElementSnapshot(path="W", depth=0, role="AXWindow", title="ChatGPT", frame=(0, 0, 1200, 900)),
@@ -1228,6 +1271,29 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertIn("History", encoded)
         self.assertIn("Projects", encoded)
         self.assertIn("Sidebar", encoded)
+
+    def test_toggle_sidebar_alias_is_generic_chrome_not_a_destination_title(self) -> None:
+        snapshots = [
+            nav.AXElementSnapshot(path="W", depth=0, role="AXWindow", title="ChatGPT"),
+            nav.AXElementSnapshot(path="W.1", depth=1, role="AXToolbar"),
+            nav.AXElementSnapshot(
+                path="W.1.1",
+                depth=2,
+                role="AXButton",
+                description="Toggle Sidebar",
+                actions=("AXPress",),
+                enabled=True,
+            ),
+        ]
+
+        result = nav.classify_navigation_snapshots(snapshots, include_visible_navigation_titles=True)
+        encoded = json.dumps(result, sort_keys=True)
+
+        self.assertIn("Sidebar", encoded)
+        self.assertNotIn("Toggle Sidebar", encoded)
+        self.assertEqual(result["visible_project_title_candidates"], [])
+        self.assertEqual(result["visible_chat_title_candidates"], [])
+        self.assertEqual(nav._safe_literal("Toggle Sidebar"), "Sidebar")
 
     def test_large_arbitrary_text_never_appears_and_navigation_candidates_remain_visible(self) -> None:
         result = nav.classify_navigation_snapshots(_large_text_snapshots())
@@ -5513,6 +5579,171 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertEqual(ambiguous["outcome"], "target_ambiguous")
         self.assertEqual(missing["actions_performed"], [])
         self.assertEqual(ambiguous["actions_performed"], [])
+
+    def test_collapsed_sidebar_toggle_helpers_require_absent_list_and_unique_toolbar_button(self) -> None:
+        collapsed = _collapsed_sidebar_snapshots()
+        classified_collapsed = nav.classify_navigation_snapshots(
+            collapsed,
+            include_visible_navigation_titles=True,
+        )
+        classified_open = nav.classify_navigation_snapshots(
+            _detailed_sidebar_snapshots_with_toggle(),
+            include_visible_navigation_titles=True,
+        )
+        duplicate_toggle = collapsed + [
+            nav.AXElementSnapshot(
+                path="W.2.1.3",
+                depth=3,
+                role="AXButton",
+                description="Open sidebar",
+                actions=("AXPress",),
+                enabled=True,
+                frame=(90, 0, 43, 52),
+            )
+        ]
+        no_press = [
+            snapshot
+            if snapshot.path != "W.2.1.1"
+            else nav.AXElementSnapshot(
+                path=snapshot.path,
+                depth=snapshot.depth,
+                role=snapshot.role,
+                description=snapshot.description,
+                enabled=True,
+                actions=(),
+                frame=snapshot.frame,
+            )
+            for snapshot in collapsed
+        ]
+
+        self.assertTrue(nav._sidebar_destination_list_absent(classified_collapsed))
+        self.assertFalse(nav._sidebar_destination_list_absent(classified_open))
+        self.assertEqual(nav._unique_sidebar_toggle_axpress_target(collapsed)["path"], "W.2.1.1")
+        self.assertEqual(nav._unique_sidebar_toggle_axpress_target(collapsed)["label"], "toggle sidebar")
+        self.assertEqual(nav._unique_sidebar_toggle_axpress_target(duplicate_toggle), {})
+        self.assertEqual(nav._unique_sidebar_toggle_axpress_target(no_press), {})
+        self.assertEqual(nav._unique_sidebar_toggle_axpress_target(_detailed_sidebar_snapshots()), {})
+
+    def test_autonomous_open_presses_unique_toggle_when_sidebar_list_absent_then_retries_project_search(self) -> None:
+        reader = _AutonomousReader(
+            [_collapsed_sidebar_snapshots()] * 3
+            + [_detailed_sidebar_snapshots()] * 3
+            + [_project_visible_chats_snapshots()] * 2,
+            {"available": True, "path": "W.1.3.1"},
+        )
+        clicker = _ClickService()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_sidebar_destination(
+                kind="project",
+                title="PTG Assistant",
+                confirm_open_destination=True,
+                activation_function=lambda app_name: {
+                    "activated": True,
+                    "is_frontmost": True,
+                    "app_name": app_name,
+                    "frontmost_app": app_name,
+                    "error": "",
+                },
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                click_service_factory=_ClickFactory(clicker),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(
+                    _WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])
+                ),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "destination_opened_and_visible_chats_resolved")
+        self.assertEqual(result["sidebar_toggle_recovery"]["pressed"], True)
+        self.assertEqual(result["sidebar_toggle_recovery"]["reason"], "pressed")
+        self.assertEqual(result["sidebar_toggle_recovery"]["target_path"], "W.2.1.1")
+        self.assertEqual(reader.actions, [("W.2.1.1", "AXPress"), ("W.1.3.3", "AXPress")])
+        self.assertEqual(clicker.clicks, [])
+
+    def test_autonomous_open_does_not_toggle_when_sidebar_list_is_already_present(self) -> None:
+        reader = _AutonomousReader(
+            [_detailed_sidebar_snapshots_with_toggle()] * 3,
+            {"available": True, "path": ""},
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_sidebar_destination(
+                kind="project",
+                title="Not Visible",
+                confirm_open_destination=True,
+                activation_function=lambda app_name: {
+                    "activated": True,
+                    "is_frontmost": True,
+                    "app_name": app_name,
+                    "frontmost_app": app_name,
+                    "error": "",
+                },
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(
+                    _WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])
+                ),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(result["outcome"], "target_absent")
+        self.assertEqual(result["sidebar_toggle_recovery"]["pressed"], False)
+        self.assertEqual(result["sidebar_toggle_recovery"]["reason"], "sidebar_list_present")
+        self.assertEqual(result["actions_performed"], [])
+        self.assertEqual(reader.actions, [])
+
+    def test_autonomous_open_does_not_toggle_on_dry_run_or_without_unique_button(self) -> None:
+        dry_reader = _AutonomousReader([_collapsed_sidebar_snapshots()] * 3, {"available": True, "path": ""})
+        no_toggle = [
+            snapshot
+            for snapshot in _collapsed_sidebar_snapshots()
+            if snapshot.path != "W.2.1.1"
+        ]
+        live_reader = _AutonomousReader([no_toggle] * 3, {"available": True, "path": ""})
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            dry = nav.open_chatgpt_sidebar_destination(
+                kind="project",
+                title="PTG Assistant",
+                confirm_open_destination=False,
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(dry_reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(
+                    _WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])
+                ),
+                sleep_function=_SleepRecorder(),
+            )
+            missing_toggle = nav.open_chatgpt_sidebar_destination(
+                kind="project",
+                title="PTG Assistant",
+                confirm_open_destination=True,
+                activation_function=lambda app_name: {
+                    "activated": True,
+                    "is_frontmost": True,
+                    "app_name": app_name,
+                    "frontmost_app": app_name,
+                    "error": "",
+                },
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(live_reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(
+                    _WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])
+                ),
+                sleep_function=_SleepRecorder(),
+            )
+
+        self.assertEqual(dry["outcome"], "target_absent")
+        self.assertEqual(dry["actions_performed"], [])
+        self.assertNotIn("sidebar_toggle_recovery", dry)
+        self.assertEqual(missing_toggle["outcome"], "target_absent")
+        self.assertEqual(missing_toggle["sidebar_toggle_recovery"]["reason"], "toggle_not_uniquely_actionable")
+        self.assertFalse(missing_toggle["sidebar_toggle_recovery"]["pressed"])
+        self.assertEqual(live_reader.actions, [])
 
     def test_autonomous_prefers_axpress_when_present_and_requires_post_evidence(self) -> None:
         reader = _AutonomousReader(

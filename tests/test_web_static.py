@@ -195,6 +195,9 @@ class StaticSourceContractTests(unittest.TestCase):
             'elements["codex-live-quota-wait"]',
             "quotaWaitClientMessage(quotaWait)",
             "quotaResumeIsLive(runtime)",
+            'id="quota-force-continue-button"',
+            "Force continue",
+            'requestJson("POST", "/api/runs/current/quota-resume"',
             "Codex limits ran out. Reset in ${hh}:${mm} hours",
             "Waiting for Codex reset",
             "Paused — ready for manual retry",
@@ -373,6 +376,7 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertNotIn("https://", self.all_static)
         self.assertNotIn("http://", self.all_static)
         self.assertIn('requestJson("POST", "/api/runs/current/cancel"', self.js)
+        self.assertIn('requestJson("POST", "/api/runs/current/quota-resume"', self.js)
         self.assertNotIn("stdout", self.js.lower())
         self.assertNotIn("stderr", self.js.lower())
         self.assertNotIn("prompt_text", self.js)

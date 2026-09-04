@@ -748,6 +748,7 @@ POST /api/approval
 POST /api/tick
 POST /api/runs/current/retry
 POST /api/runs/current/cancel
+POST /api/runs/current/quota-resume
 POST /api/remote/revoke
 POST /api/remote/rotate
 POST /api/remote/pair

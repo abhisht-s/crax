@@ -395,6 +395,18 @@ def _make_handler(server_runtime: LocalControllerServer):
                 self._audit_remote_result(result)
                 self._write_operation_result(result, success_status=202)
                 return
+            if path == "/api/runs/current/quota-resume":
+                payload = self._read_json_body(
+                    LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                    require_object=True,
+                    allow_empty=True,
+                )
+                if payload:
+                    raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                result = server_runtime.controller.request_force_quota_resume()
+                self._audit_remote_result(result)
+                self._write_operation_result(result, success_status=202)
+                return
             if path == "/api/remote/devices/revoke":
                 payload = self._read_json_body(
                     LOCAL_SERVER_GENERIC_BODY_LIMIT,
@@ -749,6 +761,7 @@ def _required_scope(method: str, path: str) -> str:
         "/api/tick",
         "/api/runs/current/retry",
         "/api/runs/current/cancel",
+        "/api/runs/current/quota-resume",
     }:
         return "control"
     return "admin"
@@ -1033,6 +1046,7 @@ def _status_for_reason(reason: str, *, default_failure_status: int | None = None
         "active_chatgpt_ui_lease_mismatch",
         "chatgpt_ui_lease_not_active",
         "manual_stale_lease_run_status_mismatch",
+        "quota_wait_not_active",
     }:
         return 409 if default_failure_status is None else default_failure_status
     if reason in {

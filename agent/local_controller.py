@@ -673,6 +673,43 @@ class LocalController:
             metadata={"process_termination": termination},
         )
 
+    def request_force_quota_resume(self) -> LocalControllerOperationResult:
+        worker = None
+        with self._lock:
+            run_id = self.session.active_run_id
+            if run_id is None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="no_active_run",
+                    error_message="No active run is available.",
+                    controller_state=self.session.controller_state,
+                )
+            if self.action_running:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="action_already_running",
+                    error_message="A controller action is already running.",
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                )
+            if not self._quota_wait_context_matches_locked(run_id):
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="quota_wait_not_active",
+                    error_message="No active Codex usage-limit wait is available to continue.",
+                    run_id=run_id,
+                    controller_state=self.session.controller_state,
+                )
+            worker = self._begin_quota_resume_locked(run_id, force=True)
+        worker.start()
+        return LocalControllerOperationResult(
+            ok=True,
+            reason_code="quota_resume_worker_started",
+            run_id=run_id,
+            controller_state=self.session.controller_state,
+            read_model=self.get_current_state(run_id).read_model,
+        )
+
     def retry_failed_action(self, failure_event_id: int) -> LocalControllerOperationResult:
         if isinstance(failure_event_id, bool) or not isinstance(failure_event_id, int) or failure_event_id <= 0:
             return LocalControllerOperationResult(
@@ -1608,13 +1645,13 @@ class LocalController:
             and str(self._quota_wait.get("resume_at") or "").strip() != ""
         )
 
-    def _begin_quota_resume_locked(self, run_id: str) -> threading.Thread:
+    def _begin_quota_resume_locked(self, run_id: str, *, force: bool = False) -> threading.Thread:
         self._cancel_quota_wait_timer_locked()
         self._quota_wait = None
         self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
         self._mark_action_running_locked("quota_resume")
         self._persist_session_locked()
-        worker = self._new_worker(self._quota_resume_worker, run_id)
+        worker = self._new_worker(self._quota_resume_worker, run_id, force)
         self.current_worker = worker
         return worker
 
@@ -1661,9 +1698,13 @@ class LocalController:
         if worker is not None:
             worker.start()
 
-    def _quota_resume_worker(self, run_id: str) -> None:
+    def _quota_resume_worker(self, run_id: str, force: bool = False) -> None:
         try:
-            result = self.quota_resume_executor(run_id=run_id, now=self.quota_wait_now())
+            result = self.quota_resume_executor(
+                run_id=run_id,
+                now=self.quota_wait_now(),
+                allow_before_due=force,
+            )
             if self.cancel_requested.is_set():
                 return
             if not _result_ok(result):

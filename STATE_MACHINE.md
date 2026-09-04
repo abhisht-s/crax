@@ -132,7 +132,10 @@ post-Codex governance `needs_review` plus controller `blocked` /
 While a wait is active, the planner returns `STOP` with
 `waiting_for_quota_reset`. That reason is not blocked, not terminal, and not
 completed. Operator cancel during the wait writes `codex_quota_wait_cancelled`
-and returns to `needs_review` plus controller `blocked`.
+and returns to `needs_review` plus controller `blocked`. The dashboard
+**Force continue** control (`POST /api/runs/current/quota-resume`) starts the
+same `codex exec resume` with `CODEX_QUOTA_RESUME_PROMPT` without waiting for
+`resume_at`, for cases such as a Codex recharge.
 
 `run_supervision_step` executes the selected action. For ChatGPT handoff work,
 the implementation records bounded phase labels such as:

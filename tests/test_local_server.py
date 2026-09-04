@@ -35,6 +35,7 @@ class FakeController:
         self.tick_calls = 0
         self.retry_calls: list[int] = []
         self.cancel_calls = 0
+        self.quota_resume_calls = 0
         self.lease_status_calls = 0
         self.lease_release_calls: list[dict] = []
         self.progress_calls: list[dict] = []
@@ -44,6 +45,11 @@ class FakeController:
         self.tick_result = self._result(ok=True, reason="routine_worker_started", run_id="run-1")
         self.retry_result = self._result(ok=True, reason="retry_worker_started", run_id="run-1")
         self.cancel_result = self._result(ok=True, reason="cancel_requested", run_id="run-1")
+        self.quota_resume_result = self._result(
+            ok=True,
+            reason="quota_resume_worker_started",
+            run_id="run-1",
+        )
         self.progress_result = self._result(
             ok=True,
             reason="progress_loaded",
@@ -132,6 +138,10 @@ class FakeController:
     def request_cancel(self):
         self.cancel_calls += 1
         return self.cancel_result
+
+    def request_force_quota_resume(self):
+        self.quota_resume_calls += 1
+        return self.quota_resume_result
 
     def get_current_progress(self, *, after_sequence: int = 0, limit: int = 100):
         self.progress_calls.append({"after_sequence": after_sequence, "limit": limit})
@@ -672,6 +682,50 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
         self.assertEqual(payload["reason_code"], "no_routine_action_available")
 
         status, _headers, payload = self.request("POST", "/api/tick", body={"extra": True}, token=self.token)
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["reason_code"], "unexpected_request_fields")
+
+    def test_force_quota_resume_route(self) -> None:
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/quota-resume",
+            body={},
+            token=self.token,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["reason_code"], "quota_resume_worker_started")
+        self.assertEqual(self.controller.quota_resume_calls, 1)
+
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/quota-resume",
+            body=None,
+            token=self.token,
+            content_type=None,
+        )
+        self.assertEqual(status, 202)
+
+        self.controller.quota_resume_result = self.controller._result(
+            ok=False,
+            reason="quota_wait_not_active",
+            error="no wait",
+            run_id="run-1",
+        )
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/quota-resume",
+            body={},
+            token=self.token,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["reason_code"], "quota_wait_not_active")
+
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/quota-resume",
+            body={"extra": True},
+            token=self.token,
+        )
         self.assertEqual(status, 400)
         self.assertEqual(payload["reason_code"], "unexpected_request_fields")
 

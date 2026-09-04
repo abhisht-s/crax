@@ -53,6 +53,7 @@
   let tickRequestInFlight = false;
   let retryRequestInFlight = false;
   let cancelRequestInFlight = false;
+  let quotaContinueRequestInFlight = false;
   let leaseRequestInFlight = false;
   let leaseReleaseRequestInFlight = false;
   let currentLeasePayload = null;
@@ -144,6 +145,8 @@
       "codex-live-state",
       "codex-live-session-id",
       "codex-live-quota-wait",
+      "quota-force-continue-button",
+      "quota-force-continue-status",
       "codex-live-final",
       "codex-live-error",
       "codex-live-events",
@@ -219,6 +222,7 @@
     elements["tick-button"].addEventListener("click", onTick);
     elements["retry-button"].addEventListener("click", onRetry);
     elements["cancel-run-button"].addEventListener("click", onCancelRun);
+    elements["quota-force-continue-button"].addEventListener("click", onForceQuotaContinue);
     elements["lease-confirm-stale"].addEventListener("change", updateControlState);
     elements["lease-release-reason"].addEventListener("input", updateControlState);
     elements["lease-allow-owner-pid-alive"].addEventListener("change", updateControlState);
@@ -422,6 +426,10 @@
 
   async function requestCancel() {
     return requestJson("POST", "/api/runs/current/cancel", {});
+  }
+
+  async function requestForceQuotaResume() {
+    return requestJson("POST", "/api/runs/current/quota-resume", {});
   }
 
   async function getChatGPTUILease() {
@@ -829,6 +837,25 @@
     setText(
       elements["cancel-run-status"],
       result.ok ? "Stop requested." : safeMessage(result),
+    );
+    if (result.status !== 401) {
+      await forceRefresh();
+    }
+    updateControlState();
+  }
+
+  async function onForceQuotaContinue() {
+    if (quotaContinueRequestInFlight || !authenticated) {
+      return;
+    }
+    quotaContinueRequestInFlight = true;
+    updateControlState();
+    setText(elements["quota-force-continue-status"], "Resuming Codex...");
+    const result = await requestForceQuotaResume();
+    quotaContinueRequestInFlight = false;
+    setText(
+      elements["quota-force-continue-status"],
+      result.ok ? "Continue started." : safeMessage(result),
     );
     if (result.status !== 401) {
       await forceRefresh();
@@ -1703,6 +1730,17 @@
       cancelRequestInFlight ||
       Boolean(model && model.completed) ||
       Boolean(model && REPLACEABLE_RUN_STATUSES.has(model.run_status));
+    const quotaWaitActive = Boolean(
+      authenticated &&
+      model &&
+      model.quota_wait &&
+      model.quota_wait.resume_at &&
+      runtime.controller_state === "waiting_for_quota_reset" &&
+      !quotaResumeIsLive(runtime) &&
+      !running &&
+      !quotaContinueRequestInFlight,
+    );
+    elements["quota-force-continue-button"].disabled = !quotaWaitActive;
 
     if (model) {
       renderApproval(model, runtime);
@@ -1714,6 +1752,7 @@
       elements["tick-button"].disabled = true;
       elements["retry-button"].disabled = true;
       elements["cancel-run-button"].disabled = true;
+      elements["quota-force-continue-button"].disabled = true;
     }
     updateLeaseControlState();
   }
@@ -1763,6 +1802,7 @@
       "tick-button",
       "retry-button",
       "cancel-run-button",
+      "quota-force-continue-button",
       "lease-confirm-stale",
       "lease-release-reason",
       "lease-allow-owner-pid-alive",

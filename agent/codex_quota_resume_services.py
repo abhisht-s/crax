@@ -35,6 +35,7 @@ def execute_codex_quota_resume_service(
     *,
     ledger: Any = default_ledger,
     now: datetime | None = None,
+    allow_before_due: bool = False,
     raw_execution_service: Callable[..., Any] = execute_codex_direct_service,
     governance_service: Callable[..., Any] = apply_post_codex_governance_service,
     git_snapshot_function: Callable[[str], dict[str, Any]] = capture_git_snapshot,
@@ -53,7 +54,7 @@ def execute_codex_quota_resume_service(
 
     clock = now or datetime.now(UTC)
     resume_at = _parse_iso(fields["resume_at"])
-    if resume_at is None or clock < resume_at:
+    if not allow_before_due and (resume_at is None or clock < resume_at):
         return CodexQuotaResumeResult(
             ok=False,
             reason_code="quota_resume_not_due",
@@ -92,13 +93,18 @@ def execute_codex_quota_resume_service(
     started = ledger.add_event(
         run_id,
         CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE,
-        "Resuming Codex session after usage-limit reset.",
+        (
+            "Resuming Codex session after operator force continue."
+            if allow_before_due
+            else "Resuming Codex session after usage-limit reset."
+        ),
         {
             "thread_id": thread_id,
             "resume_at": fields["resume_at"],
             "repository_path": repo_path,
             "sandbox": sandbox,
             "prompt": prompt,
+            "forced": bool(allow_before_due),
         },
     )
 
