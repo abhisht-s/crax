@@ -17,6 +17,7 @@ from agent.codex_quota_resume_services import execute_codex_quota_resume_service
 from agent.codex_quota_wait import (
     CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
     CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+    CODEX_QUOTA_WAIT_STALE_EVENT_TYPE,
     active_quota_wait,
     decide_quota_wait,
     quota_wait_client_message,
@@ -91,6 +92,12 @@ LOCAL_CONTROLLER_RETRY_STATUS_RESTORED_EVENT_TYPE = "local_controller_retry_stat
 LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION = 1
 LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE = "local_controller_cancel_requested"
 LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE = "Operator requested cancellation."
+CODEX_QUOTA_WAIT_STALE_MESSAGE = (
+    "Codex usage-limit wait went stale after the local controller process exited."
+)
+CODEX_QUOTA_WAIT_STALE_RUN_ERROR = (
+    "Codex usage-limit wait went stale because the local controller process exited."
+)
 
 EVENT_METADATA_PREVIEW_LIMIT = 1200
 TEXT_METADATA_PREVIEW_LIMIT = 240
@@ -1810,23 +1817,49 @@ class LocalController:
             and pending is None
         ):
             controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+        wait_event = active_quota_wait(self.ledger.list_events(active_run_id))
+        snapshot_wait = snapshot.get("quota_wait")
+        has_snapshot_wait = (
+            isinstance(snapshot_wait, dict)
+            and str(snapshot_wait.get("thread_id") or "").strip() != ""
+            and str(snapshot_wait.get("resume_at") or "").strip() != ""
+        )
+        if (
+            wait_event is not None
+            or has_snapshot_wait
+            or controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET
+        ):
+            if wait_event is not None:
+                self._mark_quota_wait_stale(active_run_id)
+            self.session.active_run_id = None
+            self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+            self.session.pending_approval = None
+            self._quota_wait = None
+            self._persist_session_locked()
+            return
         self.session.active_run_id = active_run_id
         self.session.controller_state = str(controller_state)
         self.session.pending_approval = pending
-        wait_fields = quota_wait_fields(active_quota_wait(self.ledger.list_events(active_run_id)))
-        snapshot_wait = snapshot.get("quota_wait")
-        if wait_fields is None and isinstance(snapshot_wait, dict):
-            thread_id = str(snapshot_wait.get("thread_id") or "").strip()
-            resume_at = str(snapshot_wait.get("resume_at") or "").strip()
-            if thread_id and resume_at:
-                wait_fields = snapshot_wait
-        self._quota_wait = wait_fields
-        if controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_QUOTA_RESET:
-            if wait_fields is None:
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
-                self._quota_wait = None
-            elif active_status == RunStatus.RUNNING.value:
-                self._arm_quota_wait_timer_locked(str(wait_fields["resume_at"]))
+        self._quota_wait = None
+
+    def _mark_quota_wait_stale(self, run_id: str) -> None:
+        self.ledger.add_event(
+            run_id,
+            CODEX_QUOTA_WAIT_STALE_EVENT_TYPE,
+            CODEX_QUOTA_WAIT_STALE_MESSAGE,
+            {
+                "source": LOCAL_CONTROLLER_SOURCE,
+                "controller_mode": LOCAL_CONTROLLER_MODE,
+            },
+        )
+        try:
+            self.ledger.update_run_status(
+                run_id,
+                RunStatus.NEEDS_REVIEW,
+                error=CODEX_QUOTA_WAIT_STALE_RUN_ERROR,
+            )
+        except (AttributeError, TypeError):
+            pass
 
     def _pause_for_action_failure(
         self,

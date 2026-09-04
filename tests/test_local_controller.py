@@ -2484,7 +2484,8 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             if timer is not None:
                 timer.cancel()
 
-    def test_snapshot_restore_rearms_quota_wait(self) -> None:
+    def test_snapshot_restore_marks_quota_wait_stale_and_starts_idle(self) -> None:
+        from agent.codex_quota_wait import active_quota_wait
         from tests.test_codex_quota_wait import SESSION_ID
 
         clock = datetime(2026, 8, 30, 6, 39, tzinfo=timezone.utc)
@@ -2521,17 +2522,35 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             quota_wait_now=lambda: clock,
             rate_limits_reader=lambda **_kwargs: None,
             quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
-                AssertionError("resume must not run during restore test")
+                AssertionError("resume must not run after a stale wait restore")
             ),
         )
-        try:
-            self.assertEqual(controller.session.active_run_id, "run-1")
-            self.assertEqual(controller.session.controller_state, "waiting_for_quota_reset")
-            self.assertIsNotNone(controller._quota_wait_timer)
-        finally:
-            timer = controller._quota_wait_timer
-            if timer is not None:
-                timer.cancel()
+
+        self.assertIsNone(controller.session.active_run_id)
+        self.assertEqual(controller.session.controller_state, "idle")
+        self.assertIsNone(controller._quota_wait)
+        self.assertIsNone(controller._quota_wait_timer)
+        self.assertEqual(ledger.run["status"], RunStatus.NEEDS_REVIEW.value)
+        self.assertTrue(
+            any(event["event_type"] == "codex_quota_wait_stale" for event in ledger.added_events)
+        )
+        self.assertIsNone(active_quota_wait(ledger.events))
+        self.assertIsNone(ledger.snapshot.get("active_run_id"))
+        self.assertEqual(ledger.snapshot.get("controller_state"), "idle")
+
+        restarted = LocalController(
+            ledger=ledger,
+            quota_wait_now=lambda: clock,
+            quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("resume must not run on a later controller after stale wait")
+            ),
+        )
+        self.assertIsNone(restarted.session.active_run_id)
+        self.assertEqual(restarted.session.controller_state, "idle")
+        self.assertEqual(
+            len([event for event in ledger.events if event["event_type"] == "codex_quota_wait_stale"]),
+            1,
+        )
 
     def test_snapshot_restore_keeps_needs_review_blocked_run(self) -> None:
         ledger = FakeLedger(_run(RunStatus.NEEDS_REVIEW.value))

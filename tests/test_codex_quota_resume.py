@@ -167,6 +167,8 @@ class CodexQuotaResumeServiceTests(unittest.TestCase):
         )
         self.assertTrue(started["metadata"]["forced"])
         self.assertEqual(started["metadata"]["prompt"], CODEX_QUOTA_RESUME_PROMPT)
+
+    def test_missing_wait_does_not_start_a_fresh_exec(self) -> None:
         raw = RecordingDirect(SimpleNamespace(ok=True))
         result = execute_codex_quota_resume_service(
             "run-1",

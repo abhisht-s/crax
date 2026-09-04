@@ -137,6 +137,13 @@ and returns to `needs_review` plus controller `blocked`. The dashboard
 same `codex exec resume` with `CODEX_QUOTA_RESUME_PROMPT` without waiting for
 `resume_at`, for cases such as a Codex recharge.
 
+The wait timer lives only in the current `local_server` process. A new
+controller process does not resume it. Restore writes `codex_quota_wait_stale`,
+sets that leftover run to `needs_review`, and starts idle with no current run.
+Starting from the dashboard then creates a new Codex session instead of
+`codex exec resume` on the stale thread. Same-process waits, including across
+Mac sleep, are unchanged.
+
 `run_supervision_step` executes the selected action. For ChatGPT handoff work,
 the implementation records bounded phase labels such as:
 

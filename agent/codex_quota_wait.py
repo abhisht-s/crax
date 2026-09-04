@@ -10,6 +10,7 @@ from agent.ledger import CODEX_PROGRESS_ALLOWED_KINDS, CODEX_PROGRESS_EVENT_TYPE
 
 CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE = "codex_quota_wait_scheduled"
 CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE = "codex_quota_wait_cancelled"
+CODEX_QUOTA_WAIT_STALE_EVENT_TYPE = "codex_quota_wait_stale"
 CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE = "codex_quota_resume_started"
 CODEX_QUOTA_RESUME_FINISHED_EVENT_TYPE = "codex_quota_resume_finished"
 CODEX_QUOTA_RESUME_DELAY_SECONDS = 60
@@ -148,6 +149,7 @@ def active_quota_wait(events: list[dict[str, Any]]) -> dict[str, Any] | None:
             continue
         if event_type in {
             CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
+            CODEX_QUOTA_WAIT_STALE_EVENT_TYPE,
             CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE,
             CODEX_QUOTA_RESUME_FINISHED_EVENT_TYPE,
         }:

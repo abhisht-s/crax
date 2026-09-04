@@ -9,6 +9,7 @@ from agent.codex_quota_wait import (
     CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE,
     CODEX_QUOTA_WAIT_CANCELLED_EVENT_TYPE,
     CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
+    CODEX_QUOTA_WAIT_STALE_EVENT_TYPE,
     active_quota_wait,
     decide_quota_wait,
     quota_wait_client_message,
@@ -302,6 +303,13 @@ class CodexQuotaWaitMessageTests(unittest.TestCase):
 
 
 class CodexQuotaWaitHelpersTests(unittest.TestCase):
+    def test_active_wait_clears_after_stale(self) -> None:
+        events = [
+            {"id": 1, "event_type": CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE, "metadata": {}},
+            {"id": 2, "event_type": CODEX_QUOTA_WAIT_STALE_EVENT_TYPE, "metadata": {}},
+        ]
+        self.assertIsNone(active_quota_wait(events))
+
     def test_active_wait_clears_after_cancel(self) -> None:
         events = [
             {"id": 1, "event_type": CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE, "metadata": {}},
