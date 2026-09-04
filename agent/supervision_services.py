@@ -13,6 +13,11 @@ from agent.chatgpt_destination_gate import (
     destination_gate_failure,
 )
 from agent.chatgpt_ax_capture import DEFAULT_STABLE_SECONDS
+from agent.chatgpt_desktop_mutex import (
+    ChatGPTDesktopMutex,
+    ChatGPTDesktopMutexHold,
+    handoff_claim_owner_identifier,
+)
 from agent.chatgpt_services import (
     capture_chatgpt_response_service,
     extract_next_codex_prompt_service,
@@ -92,6 +97,18 @@ CHATGPT_DESTINATION_NAVIGATION_BLOCKED_STATUS_ERROR = (
     "before retry."
 )
 CHATGPT_HANDOFF_MAX_UI_ATTEMPTS = 5
+CHATGPT_HANDOFF_QUEUE_ENQUEUE_SOURCE = "supervision_handoff"
+CHATGPT_HANDOFF_YIELD_REASON_CODE = "chatgpt_handoff_yielded_retryable_ui_failure"
+CHATGPT_HANDOFF_SLICE_COMPLETED_REASON_CODE = "chatgpt_handoff_slice_completed"
+CHATGPT_WAIT_REASON_CODES = frozenset(
+    {
+        "chatgpt_ui_lease_already_held",
+        "chatgpt_desktop_mutex_already_held",
+        "chatgpt_handoff_queue_not_head",
+        "chatgpt_handoff_queue_head_already_claimed",
+        CHATGPT_HANDOFF_YIELD_REASON_CODE,
+    }
+)
 
 # Navigator outcomes that count as a confirmed chat open. Any other outcome is
 # treated as fail-closed navigation.
@@ -137,6 +154,7 @@ class SupervisionStepResult:
     terminal: bool = False
     completed: bool = False
     blocked: bool = False
+    waiting_for_chatgpt: bool = False
     reason_code: str | None = None
     error_message: str | None = None
     events_written: list[dict[str, Any]] = field(default_factory=list)
@@ -1005,15 +1023,17 @@ def _chatgpt_lease_denied_result(
         acquire_result,
         "chatgpt_ui_lease_already_held",
     )
+    waiting = reason_code == "chatgpt_ui_lease_already_held"
     return SupervisionStepResult(
-        ok=False,
+        ok=waiting,
         run_id=run_id,
         planner_action=action_value,
         planner_reason_code=plan.reason,
         planner_metadata=plan_metadata,
         action_executed=False,
-        next_state_hint="blocked",
-        blocked=True,
+        next_state_hint=action_value if waiting else "blocked",
+        blocked=not waiting,
+        waiting_for_chatgpt=waiting,
         reason_code=reason_code,
         error_message=_result_error_message(acquire_result) or reason_code,
         events_written=_result_events_written(acquire_result),
@@ -1027,8 +1047,129 @@ def _chatgpt_lease_denied_result(
                 "event_id": getattr(acquire_result, "event_id", None),
                 "exclusive_ui_owner_only": True,
                 "destination_verified": False,
+                "waiting_for_chatgpt": waiting,
             },
         },
+    )
+
+
+def _chatgpt_wait_result(
+    *,
+    run_id: str,
+    plan: SupervisePlan,
+    action_value: str,
+    plan_metadata: dict[str, Any],
+    status: str | None,
+    metadata: dict[str, Any],
+    reason_code: str,
+    error_message: str | None = None,
+    events_written: list[dict[str, Any]] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> SupervisionStepResult:
+    return SupervisionStepResult(
+        ok=True,
+        run_id=run_id,
+        planner_action=action_value,
+        planner_reason_code=plan.reason,
+        planner_metadata=plan_metadata,
+        action_executed=False,
+        next_state_hint=action_value,
+        blocked=False,
+        waiting_for_chatgpt=True,
+        reason_code=reason_code,
+        error_message=error_message or reason_code,
+        events_written=list(events_written or []),
+        run_status=status,
+        metadata={
+            **metadata,
+            "waiting_for_chatgpt": True,
+            **(extra_metadata or {}),
+        },
+    )
+
+
+def _handoff_queue_available(ledger: Any) -> bool:
+    return all(
+        callable(getattr(ledger, name, None))
+        for name in (
+            "enqueue_chatgpt_handoff",
+            "claim_chatgpt_handoff_for_run",
+            "complete_chatgpt_handoff",
+            "block_chatgpt_handoff",
+        )
+    )
+
+
+def _enqueue_and_claim_chatgpt_handoff(
+    run_id: str,
+    *,
+    action_value: str,
+    claim_owner_identifier: str,
+    ledger: Any,
+) -> Any:
+    enqueue_result = ledger.enqueue_chatgpt_handoff(
+        run_id,
+        enqueue_source=action_value or CHATGPT_HANDOFF_QUEUE_ENQUEUE_SOURCE,
+    )
+    enqueue_status = str(getattr(enqueue_result, "status", "") or "")
+    if enqueue_status in {
+        str(default_ledger.AtomicChatGPTHandoffQueueStatus.RUN_NOT_FOUND),
+        str(default_ledger.AtomicChatGPTHandoffQueueStatus.INVALID),
+        str(default_ledger.AtomicChatGPTHandoffQueueStatus.OPERATIONAL_FAILURE),
+    }:
+        return enqueue_result
+    return ledger.claim_chatgpt_handoff_for_run(
+        run_id,
+        claim_owner_identifier=claim_owner_identifier,
+    )
+
+
+def _queue_result_is_waiting(result: Any) -> bool:
+    status = str(getattr(result, "status", "") or "")
+    return status in {
+        str(default_ledger.AtomicChatGPTHandoffQueueStatus.WAITING),
+        str(default_ledger.AtomicChatGPTHandoffQueueStatus.WAITING_FOR_ACTIVE_CLAIM),
+    }
+
+
+def _queue_result_is_claimed(result: Any) -> bool:
+    return str(getattr(result, "status", "") or "") == str(
+        default_ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED
+    )
+
+
+def _finish_claimed_handoff_queue(
+    queue_sequence: int | None,
+    *,
+    claim_owner_identifier: str,
+    terminal: str,
+    reason_code: str,
+    lease_correlation: dict[str, object] | None,
+    ledger: Any,
+) -> None:
+    if not isinstance(queue_sequence, int) or queue_sequence <= 0:
+        return
+    if not _handoff_queue_available(ledger):
+        return
+    finisher = (
+        ledger.complete_chatgpt_handoff
+        if terminal == "completed"
+        else ledger.block_chatgpt_handoff
+    )
+    finisher(
+        queue_sequence,
+        claim_owner_identifier=claim_owner_identifier,
+        reason_code=reason_code,
+        lease_correlation=lease_correlation,
+    )
+
+
+def _chatgpt_submit_is_uncertain(result: Any) -> bool:
+    reason_code = _result_reason_code(result, "")
+    event_type = str(getattr(result, "event_type", "") or "")
+    return (
+        reason_code in {"chatgpt_submission_ambiguous", "chatgpt_submission_not_verified"}
+        or event_type == "gpt_feedback_submission_ambiguous"
     )
 
 
@@ -1110,14 +1251,113 @@ def _run_chatgpt_handoff_transaction(
     ledger: Any,
     submit_service: Callable[..., Any],
     capture_service: Callable[..., Any],
-    extraction_service: Callable[..., Any],
     destination_gate_service: Callable[..., Any],
     destination_adapter_factory: Callable[[], Any],
     destination_navigation_service: Callable[..., Any],
     allow_destination_navigation: bool,
     before_action_callback: Callable[[SupervisePlan, dict | None, list[dict]], None] | None,
     events: list[dict],
+    desktop_mutex: Any,
+    controller_instance_id: str | None,
 ) -> SupervisionStepResult:
+    claim_owner_identifier = handoff_claim_owner_identifier(
+        run_id,
+        controller_instance_id=controller_instance_id,
+    )
+    queue_sequence: int | None = None
+    queue_terminal: tuple[str, str] | None = None
+    mutex_hold: ChatGPTDesktopMutexHold | None = None
+
+    if _handoff_queue_available(ledger):
+        queue_result = _enqueue_and_claim_chatgpt_handoff(
+            run_id,
+            action_value=action_value,
+            claim_owner_identifier=claim_owner_identifier,
+            ledger=ledger,
+        )
+        if _queue_result_is_waiting(queue_result):
+            return _chatgpt_wait_result(
+                run_id=run_id,
+                plan=plan,
+                action_value=action_value,
+                plan_metadata=plan_metadata,
+                status=status,
+                metadata=metadata,
+                reason_code=_result_reason_code(
+                    queue_result,
+                    "chatgpt_handoff_queue_not_head",
+                ),
+                error_message=_result_error_message(queue_result),
+                extra_metadata={
+                    "chatgpt_handoff_queue": {
+                        "status": str(getattr(queue_result, "status", "")),
+                        "head_run_id": getattr(queue_result, "head_run_id", None),
+                        "queue_sequence": getattr(queue_result, "queue_sequence", None),
+                    }
+                },
+            )
+        if not _queue_result_is_claimed(queue_result):
+            return SupervisionStepResult(
+                ok=False,
+                run_id=run_id,
+                planner_action=action_value,
+                planner_reason_code=plan.reason,
+                planner_metadata=plan_metadata,
+                action_executed=False,
+                next_state_hint="blocked",
+                blocked=True,
+                reason_code=_result_reason_code(
+                    queue_result,
+                    "chatgpt_handoff_queue_claim_failed",
+                ),
+                error_message=_result_error_message(queue_result),
+                events_written=_result_events_written(queue_result),
+                run_status=status,
+                metadata=metadata,
+            )
+        queue_sequence = getattr(queue_result, "queue_sequence", None)
+
+    mutex = desktop_mutex if desktop_mutex is not None else ChatGPTDesktopMutex()
+    mutex_hold = mutex.acquire(
+        run_id,
+        controller_instance_id=controller_instance_id,
+    )
+    if not mutex_hold.ok:
+        reason_code = mutex_hold.reason_code or "chatgpt_desktop_mutex_already_held"
+        if reason_code == "chatgpt_desktop_mutex_already_held":
+            return _chatgpt_wait_result(
+                run_id=run_id,
+                plan=plan,
+                action_value=action_value,
+                plan_metadata=plan_metadata,
+                status=status,
+                metadata=metadata,
+                reason_code=reason_code,
+                error_message=mutex_hold.error_message,
+                extra_metadata={
+                    "chatgpt_desktop_mutex": {
+                        "acquire_ok": False,
+                        "reason_code": reason_code,
+                        "owner_is_live": mutex_hold.owner_is_live,
+                        "active_owner": mutex_hold.active_owner,
+                    }
+                },
+            )
+        return SupervisionStepResult(
+            ok=False,
+            run_id=run_id,
+            planner_action=action_value,
+            planner_reason_code=plan.reason,
+            planner_metadata=plan_metadata,
+            action_executed=False,
+            next_state_hint="blocked",
+            blocked=True,
+            reason_code=reason_code,
+            error_message=mutex_hold.error_message,
+            run_status=status,
+            metadata=metadata,
+        )
+
     acquire_result = acquire_chatgpt_ui_lease(
         run_id,
         reason=CHATGPT_UI_LEASE_HANDOFF_REASON,
@@ -1125,7 +1365,9 @@ def _run_chatgpt_handoff_transaction(
         ledger=ledger,
     )
     if not _result_ok(acquire_result):
-        return _chatgpt_lease_denied_result(
+        mutex_hold.release()
+        mutex_hold = None
+        denied = _chatgpt_lease_denied_result(
             run_id=run_id,
             plan=plan,
             action_value=action_value,
@@ -1134,9 +1376,12 @@ def _run_chatgpt_handoff_transaction(
             metadata=metadata,
             acquire_result=acquire_result,
         )
+        return denied
 
     lease_token = getattr(acquire_result, "lease_token", None)
     if not isinstance(lease_token, str) or lease_token.strip() == "":
+        mutex_hold.release()
+        mutex_hold = None
         return _chatgpt_lease_denied_result(
             run_id=run_id,
             plan=plan,
@@ -1229,24 +1474,33 @@ def _run_chatgpt_handoff_transaction(
                     handoff_attempts.append(attempt_summary)
                     if attempt_can_retry:
                         continue
-                    blocked_status = _mark_destination_gate_handoff_blocked(
-                        run_id,
-                        run,
-                        error=CHATGPT_DESTINATION_NAVIGATION_BLOCKED_STATUS_ERROR,
-                        ledger=ledger,
+                    queue_terminal = (
+                        "completed",
+                        CHATGPT_HANDOFF_YIELD_REASON_CODE,
                     )
-                    final_result = _navigation_blocked_result(
+                    final_result = _chatgpt_wait_result(
                         run_id=run_id,
                         plan=plan,
                         action_value=action_value,
                         plan_metadata=plan_metadata,
-                        status=blocked_status or status,
+                        status=status,
                         metadata=metadata,
-                        acquire_result=acquire_result,
-                        navigation_summary=navigation_summary,
                         reason_code=nav_result.reason_code or "destination_navigation_incomplete",
                         error_message=nav_result.error_message,
                         events_written=events_written,
+                        extra_metadata={
+                            "chatgpt_handoff_yield": {
+                                "reason_code": CHATGPT_HANDOFF_YIELD_REASON_CODE,
+                                "failed_stage": "navigation",
+                            },
+                            "chatgpt_ui_lease": {
+                                "acquire_ok": True,
+                                "event_type": getattr(acquire_result, "event_type", None),
+                                "event_id": getattr(acquire_result, "event_id", None),
+                                "exclusive_ui_owner_only": True,
+                                "destination_verified": False,
+                            },
+                        },
                     )
                     break
                 phase = HANDOFF_PHASE_NAVIGATION_SUCCEEDED
@@ -1303,22 +1557,38 @@ def _run_chatgpt_handoff_transaction(
                 events_written.append(gate_event)
                 if will_retry:
                     continue
-                blocked_status = _mark_destination_gate_handoff_blocked(
-                    run_id,
-                    run,
-                    ledger=ledger,
+                queue_terminal = (
+                    "completed",
+                    CHATGPT_HANDOFF_YIELD_REASON_CODE,
                 )
-                final_result = _destination_gate_blocked_result(
-                    gate_result=gate_result,
-                    acquire_result=acquire_result,
+                final_result = _chatgpt_wait_result(
                     run_id=run_id,
                     plan=plan,
                     action_value=action_value,
                     plan_metadata=plan_metadata,
-                    status=blocked_status or status,
+                    status=status,
                     metadata=metadata,
+                    reason_code=reason_code,
+                    error_message=gate_result.reason_code or "destination_verification_unavailable",
                     events_written=events_written,
-                    navigation_summary=navigation_summary,
+                    extra_metadata={
+                        "chatgpt_handoff_yield": {
+                            "reason_code": CHATGPT_HANDOFF_YIELD_REASON_CODE,
+                            "failed_stage": "verification",
+                        },
+                        "chatgpt_destination_gate": {
+                            **_destination_gate_metadata(gate_result, acquire_result),
+                            "feedback_ui_handoff_skipped": True,
+                            "navigation": navigation_summary,
+                        },
+                        "chatgpt_ui_lease": {
+                            "acquire_ok": True,
+                            "event_type": getattr(acquire_result, "event_type", None),
+                            "event_id": getattr(acquire_result, "event_id", None),
+                            "exclusive_ui_owner_only": True,
+                            "destination_verified": False,
+                        },
+                    },
                 )
                 break
 
@@ -1353,7 +1623,10 @@ def _run_chatgpt_handoff_transaction(
                 events_written.append(event)
             if not _result_ok(current_result):
                 reason_code = _result_reason_code(current_result, "submit_feedback_failed")
-                retryable_failure = _chatgpt_submit_failure_retryable(current_result)
+                retryable_failure = (
+                    _chatgpt_submit_failure_retryable(current_result)
+                    and not _chatgpt_submit_is_uncertain(current_result)
+                )
                 attempt_summary["stage"] = "submission"
                 attempt_summary["ok"] = False
                 attempt_summary["reason_code"] = reason_code
@@ -1362,6 +1635,52 @@ def _run_chatgpt_handoff_transaction(
                 handoff_attempts.append(attempt_summary)
                 if attempt_can_retry and retryable_failure:
                     continue
+                if _chatgpt_submit_is_uncertain(current_result):
+                    queue_terminal = (
+                        "blocked",
+                        _result_reason_code(current_result, "chatgpt_submission_uncertain"),
+                    )
+                    final_result = _chatgpt_step_result(
+                        ok=False,
+                        run_id=run_id,
+                        plan=plan,
+                        action_value=action_value,
+                        plan_metadata=plan_metadata,
+                        status=status,
+                        metadata=metadata,
+                        result=current_result,
+                        next_state_hint="blocked",
+                        default_reason_code="submit_feedback_failed",
+                        events_written=events_written,
+                    )
+                    break
+                if retryable_failure:
+                    queue_terminal = (
+                        "completed",
+                        CHATGPT_HANDOFF_YIELD_REASON_CODE,
+                    )
+                    final_result = _chatgpt_wait_result(
+                        run_id=run_id,
+                        plan=plan,
+                        action_value=action_value,
+                        plan_metadata=plan_metadata,
+                        status=status,
+                        metadata=metadata,
+                        reason_code=reason_code,
+                        error_message=_result_error_message(current_result),
+                        events_written=events_written,
+                        extra_metadata={
+                            "chatgpt_handoff_yield": {
+                                "reason_code": CHATGPT_HANDOFF_YIELD_REASON_CODE,
+                                "failed_stage": "submission",
+                            }
+                        },
+                    )
+                    break
+                queue_terminal = (
+                    "blocked",
+                    reason_code,
+                )
                 final_result = _chatgpt_step_result(
                     ok=False,
                     run_id=run_id,
@@ -1371,7 +1690,7 @@ def _run_chatgpt_handoff_transaction(
                     status=status,
                     metadata=metadata,
                     result=current_result,
-                    next_state_hint="capture_gpt_response",
+                    next_state_hint="blocked",
                     default_reason_code="submit_feedback_failed",
                     events_written=events_written,
                 )
@@ -1403,6 +1722,10 @@ def _run_chatgpt_handoff_transaction(
             if event is not None:
                 events_written.append(event)
             if not _result_ok(current_result):
+                queue_terminal = (
+                    "blocked",
+                    _result_reason_code(current_result, "capture_gpt_response_failed"),
+                )
                 final_result = _chatgpt_step_result(
                     ok=False,
                     run_id=run_id,
@@ -1417,36 +1740,29 @@ def _run_chatgpt_handoff_transaction(
                     events_written=events_written,
                 )
             else:
-                current_stage = str(SuperviseAction.EXTRACT_NEXT_PROMPT)
-
-        if final_result is None and current_stage == str(SuperviseAction.EXTRACT_NEXT_PROMPT):
-            current_result = extraction_service(
-                run_id,
-                require_sentinel=True,
-                confirm_extract=True,
-                ledger=ledger,
-            )
-            event = _event_from_service_result(current_result)
-            if event is not None:
-                events_written.append(event)
-            ok = _result_ok(current_result)
-            if ok:
-                phase = HANDOFF_PHASE_CONTINUATION_STARTED
-            final_result = _chatgpt_step_result(
-                ok=ok,
-                run_id=run_id,
-                plan=plan,
-                action_value=action_value,
-                plan_metadata=plan_metadata,
-                status=status,
-                metadata=metadata,
-                result=current_result,
-                next_state_hint="ask_run_prompt",
-                default_reason_code="extract_next_prompt_failed",
-                events_written=events_written,
-            )
+                queue_terminal = (
+                    "completed",
+                    CHATGPT_HANDOFF_SLICE_COMPLETED_REASON_CODE,
+                )
+                final_result = _chatgpt_step_result(
+                    ok=True,
+                    run_id=run_id,
+                    plan=plan,
+                    action_value=action_value,
+                    plan_metadata=plan_metadata,
+                    status=status,
+                    metadata=metadata,
+                    result=current_result,
+                    next_state_hint="extract_next_prompt",
+                    default_reason_code="capture_gpt_response_failed",
+                    events_written=events_written,
+                )
 
         if final_result is None:
+            queue_terminal = (
+                "blocked",
+                "unknown_chatgpt_handoff_action",
+            )
             final_result = SupervisionStepResult(
                 ok=False,
                 run_id=run_id,
@@ -1493,6 +1809,26 @@ def _run_chatgpt_handoff_transaction(
         original_exc = exc
         raise
     finally:
+        if original_exc is not None and queue_terminal is None:
+            queue_terminal = (
+                "completed",
+                CHATGPT_HANDOFF_YIELD_REASON_CODE,
+            )
+        try:
+            if queue_terminal is not None:
+                _finish_claimed_handoff_queue(
+                    queue_sequence,
+                    claim_owner_identifier=claim_owner_identifier,
+                    terminal=queue_terminal[0],
+                    reason_code=queue_terminal[1],
+                    lease_correlation={
+                        "owning_run_id": run_id,
+                        "lease_event_id": getattr(acquire_result, "event_id", None),
+                    },
+                    ledger=ledger,
+                )
+        except Exception:
+            pass
         try:
             release_result = release_chatgpt_ui_lease(
                 lease_token,
@@ -1535,6 +1871,11 @@ def _run_chatgpt_handoff_transaction(
                     )
                 except Exception:
                     release_event = None
+        if mutex_hold is not None:
+            try:
+                mutex_hold.release()
+            except Exception:
+                pass
 
     if final_result is None:
         raise RuntimeError("ChatGPT handoff transaction produced no result")
@@ -1545,6 +1886,55 @@ def _run_chatgpt_handoff_transaction(
             release_event,
         )
     return final_result
+
+
+def _run_extract_next_prompt(
+    *,
+    run_id: str,
+    plan: SupervisePlan,
+    action_value: str,
+    plan_metadata: dict[str, Any],
+    status: str | None,
+    metadata: dict[str, Any],
+    extraction_service: Callable[..., Any],
+    ledger: Any,
+) -> SupervisionStepResult:
+    current_result = extraction_service(
+        run_id,
+        require_sentinel=True,
+        confirm_extract=True,
+        ledger=ledger,
+    )
+    events_written = _result_events_written(current_result)
+    event = _event_from_service_result(current_result)
+    if event is not None and event not in events_written:
+        events_written.append(event)
+    ok = _result_ok(current_result)
+    return SupervisionStepResult(
+        ok=ok,
+        run_id=run_id,
+        planner_action=action_value,
+        planner_reason_code=plan.reason,
+        planner_metadata=plan_metadata,
+        action_executed=True,
+        action_result=current_result,
+        next_state_hint="ask_run_prompt" if ok else "blocked",
+        blocked=not ok,
+        waiting_for_chatgpt=False,
+        reason_code=_result_reason_code(current_result, "extract_next_prompt_failed"),
+        error_message=_result_error_message(current_result),
+        events_written=events_written,
+        run_status=status,
+        metadata={
+            **metadata,
+            "chatgpt_ui_lease": {
+                "acquire_ok": False,
+                "skipped": True,
+                "reason_code": "extract_is_ledger_only",
+            },
+            "chatgpt_handoff_queue": {"skipped": True},
+        },
+    )
 
 
 def run_supervision_step(
@@ -1574,6 +1964,8 @@ def run_supervision_step(
     send_auto_safety_evaluator: Callable[[object, list[dict]], tuple[bool, str]] = send_plan_auto_safe,
     auto_stop_recorder: Callable[..., dict[str, Any]] = record_supervise_auto_stop,
     before_action_callback: Callable[[SupervisePlan, dict | None, list[dict]], None] | None = None,
+    desktop_mutex: Any | None = None,
+    controller_instance_id: str | None = None,
 ) -> SupervisionStepResult:
     normalized_decision = _validate_approval_decision(approval_decision)
     if normalized_decision == "":
@@ -1709,13 +2101,14 @@ def run_supervision_step(
             ledger=ledger,
             submit_service=submit_service,
             capture_service=capture_service,
-            extraction_service=extraction_service,
             destination_gate_service=destination_gate_service,
             destination_adapter_factory=destination_adapter_factory,
             destination_navigation_service=destination_navigation_service,
             allow_destination_navigation=allow_destination_navigation,
             before_action_callback=before_action_callback,
             events=events,
+            desktop_mutex=desktop_mutex if desktop_mutex is not None else ChatGPTDesktopMutex(),
+            controller_instance_id=controller_instance_id,
         )
 
     if action == SuperviseAction.CAPTURE_GPT_RESPONSE:
@@ -1734,38 +2127,28 @@ def run_supervision_step(
             ledger=ledger,
             submit_service=submit_service,
             capture_service=capture_service,
-            extraction_service=extraction_service,
             destination_gate_service=destination_gate_service,
             destination_adapter_factory=destination_adapter_factory,
             destination_navigation_service=destination_navigation_service,
             allow_destination_navigation=allow_destination_navigation,
             before_action_callback=before_action_callback,
             events=events,
+            desktop_mutex=desktop_mutex if desktop_mutex is not None else ChatGPTDesktopMutex(),
+            controller_instance_id=controller_instance_id,
         )
 
     if action == SuperviseAction.EXTRACT_NEXT_PROMPT:
-        return _run_chatgpt_handoff_transaction(
+        if before_action_callback is not None:
+            before_action_callback(plan, run, events)
+        return _run_extract_next_prompt(
             run_id=run_id,
-            run=run,
             plan=plan,
             action_value=action_value,
             plan_metadata=plan_metadata,
             status=status,
             metadata=metadata,
-            app_name=app_name,
-            mode=mode,
-            capture_timeout_seconds=capture_timeout_seconds,
-            capture_stable_seconds=capture_stable_seconds,
-            ledger=ledger,
-            submit_service=submit_service,
-            capture_service=capture_service,
             extraction_service=extraction_service,
-            destination_gate_service=destination_gate_service,
-            destination_adapter_factory=destination_adapter_factory,
-            destination_navigation_service=destination_navigation_service,
-            allow_destination_navigation=allow_destination_navigation,
-            before_action_callback=before_action_callback,
-            events=events,
+            ledger=ledger,
         )
 
     if action == SuperviseAction.ASK_RUN_PROMPT:

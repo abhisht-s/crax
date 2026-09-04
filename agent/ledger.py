@@ -17,6 +17,7 @@ from agent.run_state import RunStatus
 
 
 DB_PATH = Path("data/agent_ledger.db")
+SQLITE_BUSY_TIMEOUT_SECONDS = 10.0
 RUN_DESTINATION_BOUND_EVENT_TYPE = "run_destination_bound"
 RUN_DESTINATION_BOUND_MESSAGE = "Run destination bound."
 RUN_DESTINATION_BOUND_SCHEMA_VERSION = 1
@@ -154,6 +155,7 @@ class AtomicChatGPTHandoffQueueStatus(StrEnum):
     COMPLETED = "completed"
     BLOCKED = "blocked"
     EMPTY = "empty"
+    WAITING = "waiting"
     WAITING_FOR_ACTIVE_CLAIM = "waiting_for_active_claim"
     OWNER_MISMATCH = "owner_mismatch"
     NOT_CLAIMED = "not_claimed"
@@ -239,6 +241,7 @@ class AtomicChatGPTHandoffQueueResult:
     reason_code: str | None = None
     error_message: str | None = None
     event_ids: tuple[int, ...] = ()
+    head_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -286,8 +289,9 @@ def _utc_now() -> str:
 
 def _connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
     return connection
 
 
@@ -1244,6 +1248,162 @@ def claim_next_chatgpt_handoff(
                 connection.rollback()
         return AtomicChatGPTHandoffQueueResult(
             status=AtomicChatGPTHandoffQueueStatus.OPERATIONAL_FAILURE,
+            reason_code="chatgpt_handoff_claim_transaction_failed",
+            error_message=f"Failed to claim ChatGPT handoff: {exc}",
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def claim_chatgpt_handoff_for_run(
+    run_id: str,
+    *,
+    claim_owner_identifier: str,
+) -> AtomicChatGPTHandoffQueueResult:
+    """Claim the ChatGPT handoff head only if it belongs to this run.
+
+    Unlike ``claim_next_chatgpt_handoff``, this never steals another run's
+    pending or claimed head. Waiters poll this API without writing events.
+    """
+
+    connection: sqlite3.Connection | None = None
+    transaction_started = False
+    try:
+        connection = _connect()
+        _init_schema(connection)
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        transaction_started = True
+
+        run = connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if run is None:
+            connection.rollback()
+            transaction_started = False
+            return AtomicChatGPTHandoffQueueResult(
+                status=AtomicChatGPTHandoffQueueStatus.RUN_NOT_FOUND,
+                run_id=run_id,
+                reason_code="run_not_found",
+                error_message=f"Run not found: {run_id}",
+            )
+
+        state = _reconstruct_handoff_queue_state(_select_handoff_queue_state_rows(connection))
+        if state.status == AtomicChatGPTHandoffQueueStatus.INVALID:
+            connection.rollback()
+            transaction_started = False
+            return _handoff_queue_result_from_state(state, run_id=run_id)
+
+        active = _active_handoff_entry_for_run(state, run_id)
+        head = _oldest_active_handoff_entry(state)
+        if active is None:
+            connection.rollback()
+            transaction_started = False
+            return AtomicChatGPTHandoffQueueResult(
+                status=AtomicChatGPTHandoffQueueStatus.MISSING,
+                run_id=run_id,
+                reason_code="chatgpt_handoff_queue_entry_missing",
+                error_message="Run has no active ChatGPT handoff queue item.",
+                event_ids=state.event_ids,
+                head_run_id=head.run_id if head is not None else None,
+            )
+
+        if head is not None and head.queue_sequence != active.queue_sequence:
+            connection.rollback()
+            transaction_started = False
+            return AtomicChatGPTHandoffQueueResult(
+                status=AtomicChatGPTHandoffQueueStatus.WAITING,
+                run_id=run_id,
+                queue_entry_id=active.queue_entry_id,
+                queue_sequence=active.queue_sequence,
+                enqueue_source=active.enqueue_source,
+                reason_code="chatgpt_handoff_queue_not_head",
+                error_message="Another run is ahead in the ChatGPT handoff queue.",
+                event_written=False,
+                event_ids=active.event_ids,
+                head_run_id=head.run_id,
+            )
+
+        if active.status == "claimed":
+            connection.rollback()
+            transaction_started = False
+            if active.claim_owner_identifier == claim_owner_identifier:
+                return AtomicChatGPTHandoffQueueResult(
+                    status=AtomicChatGPTHandoffQueueStatus.CLAIMED,
+                    run_id=active.run_id,
+                    queue_entry_id=active.queue_entry_id,
+                    queue_sequence=active.queue_sequence,
+                    enqueue_source=active.enqueue_source,
+                    claim_owner_identifier=active.claim_owner_identifier,
+                    claimed_at=active.claimed_at,
+                    event_written=False,
+                    event_ids=active.event_ids,
+                    head_run_id=active.run_id,
+                )
+            return AtomicChatGPTHandoffQueueResult(
+                status=AtomicChatGPTHandoffQueueStatus.OWNER_MISMATCH,
+                run_id=active.run_id,
+                queue_entry_id=active.queue_entry_id,
+                queue_sequence=active.queue_sequence,
+                enqueue_source=active.enqueue_source,
+                claim_owner_identifier=active.claim_owner_identifier,
+                claimed_at=active.claimed_at,
+                reason_code="chatgpt_handoff_claim_owner_mismatch",
+                error_message="ChatGPT handoff queue claim owner does not match.",
+                event_ids=active.event_ids,
+                head_run_id=active.run_id,
+            )
+
+        now = _utc_now()
+        metadata = {
+            "schema_version": CHATGPT_HANDOFF_QUEUE_SCHEMA_VERSION,
+            "run_id": active.run_id,
+            "queue_sequence": active.queue_sequence,
+            "queue_entry_id": active.queue_entry_id,
+            "claim_owner_identifier": claim_owner_identifier,
+            "claimed_at": now,
+        }
+        cursor = connection.execute(
+            """
+            INSERT INTO events (
+                run_id,
+                created_at,
+                event_type,
+                message,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                active.run_id,
+                now,
+                CHATGPT_HANDOFF_CLAIMED_EVENT_TYPE,
+                CHATGPT_HANDOFF_CLAIMED_MESSAGE,
+                json.dumps(metadata, sort_keys=True),
+            ),
+        )
+        event_id = cursor.lastrowid
+        connection.commit()
+        transaction_started = False
+        return AtomicChatGPTHandoffQueueResult(
+            status=AtomicChatGPTHandoffQueueStatus.CLAIMED,
+            run_id=active.run_id,
+            queue_entry_id=active.queue_entry_id,
+            queue_sequence=active.queue_sequence,
+            enqueue_source=active.enqueue_source,
+            claim_owner_identifier=claim_owner_identifier,
+            claimed_at=now,
+            event_id=event_id if isinstance(event_id, int) else None,
+            event_written=True,
+            event_ids=active.event_ids,
+            head_run_id=active.run_id,
+        )
+    except sqlite3.Error as exc:
+        if connection is not None and transaction_started:
+            with suppress(sqlite3.Error):
+                connection.rollback()
+        return AtomicChatGPTHandoffQueueResult(
+            status=AtomicChatGPTHandoffQueueStatus.OPERATIONAL_FAILURE,
+            run_id=run_id,
             reason_code="chatgpt_handoff_claim_transaction_failed",
             error_message=f"Failed to claim ChatGPT handoff: {exc}",
         )

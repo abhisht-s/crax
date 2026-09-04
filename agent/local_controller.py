@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -12,6 +13,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import ledger as default_ledger
+from agent.chatgpt_desktop_mutex import ChatGPTDesktopMutex
+from agent.codex_invocation import STATUS_LIVE, STATUS_UNCERTAIN, latest_open_invocation
+from agent.codex_services import reconcile_codex_invocation
 from agent.codex_terminal import terminate_codex_run
 from agent.initial_codex_run_services import execute_initial_direct_codex_run_service
 from agent.run_services import (
@@ -72,6 +76,18 @@ LOCAL_CONTROLLER_RETRY_STATUS_RESTORED_EVENT_TYPE = "local_controller_retry_stat
 LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION = 1
 LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE = "local_controller_cancel_requested"
 LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE = "Operator requested cancellation."
+DEFAULT_MAX_ACTIVE_SESSIONS = 1
+CHATGPT_WAIT_INITIAL_SECONDS = 0.5
+CHATGPT_WAIT_MAX_SECONDS = 8.0
+LOCAL_CONTROLLER_SNAPSHOT_SCHEMA_VERSION = 2
+REPLACEABLE_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED.value,
+        RunStatus.FAILED.value,
+        RunStatus.NEEDS_REVIEW.value,
+        RunStatus.REJECTED.value,
+    }
+)
 
 EVENT_METADATA_PREVIEW_LIMIT = 1200
 TEXT_METADATA_PREVIEW_LIMIT = 240
@@ -125,6 +141,53 @@ class LocalControllerSession:
     active_run_id: str | None = None
     controller_state: str = LOCAL_CONTROLLER_INITIAL_STATE
     pending_approval: PendingApprovalSnapshot | None = None
+
+
+@dataclass
+class ControllerSessionRuntime:
+    """Per-run controller runtime. Distinct from dashboard LocalControllerSession."""
+
+    run_id: str
+    controller_state: str = LOCAL_CONTROLLER_INITIAL_STATE
+    pending_approval: PendingApprovalSnapshot | None = None
+    cancel_requested: threading.Event = field(default_factory=threading.Event)
+    action_running: bool = False
+    current_worker: threading.Thread | None = None
+    current_action_kind: str | None = None
+    current_action_started_at: str | None = None
+    last_action_result_summary: dict[str, Any] | None = None
+    last_exception_summary: dict[str, Any] | None = None
+    automatic_burst_count: int = 0
+    automatic_burst_reason: str | None = None
+    repository_path: str | None = None
+    sandbox: str | None = None
+    project_title: str | None = None
+    chat_title: str | None = None
+    allow_destination_navigation: bool = False
+    waiting_for_chatgpt: bool = False
+    chatgpt_wait_count: int = 0
+
+
+def conversation_identity(project_title: str, chat_title: str) -> tuple[str, str]:
+    return (str(project_title or "").strip(), str(chat_title or "").strip())
+
+
+def destination_titles_contain_comma(project_title: str, chat_title: str) -> bool:
+    return "," in str(project_title or "") or "," in str(chat_title or "")
+
+
+def live_conversation_collision_run_id(
+    live_identities: list[tuple[str, str, str]],
+    project_title: str,
+    chat_title: str,
+) -> str | None:
+    wanted = conversation_identity(project_title, chat_title)
+    if wanted[0] == "" or wanted[1] == "":
+        return None
+    for run_id, project, chat in live_identities:
+        if conversation_identity(project, chat) == wanted:
+            return run_id
+    return None
 
 
 @dataclass(frozen=True)
@@ -259,6 +322,9 @@ class LocalController:
         read_model_builder: Callable[..., LocalControllerReadModel] | None = None,
         supervision_step: Callable[..., Any] = run_supervision_step_service,
         initial_run_executor: Callable[..., Any] | None = None,
+        max_active_sessions: int = DEFAULT_MAX_ACTIVE_SESSIONS,
+        chatgpt_wait_sleeper: Callable[[float], None] | None = None,
+        desktop_mutex: Any | None = None,
     ) -> None:
         restore_persisted_session = session is None
         self.session = session or LocalControllerSession()
@@ -268,7 +334,11 @@ class LocalController:
         self.initial_run_executor = initial_run_executor or (
             lambda **kwargs: default_initial_run_executor(**kwargs, ledger=self.ledger)
         )
+        self.max_active_sessions = max(1, int(max_active_sessions))
+        self._chatgpt_wait_sleeper = chatgpt_wait_sleeper or time.sleep
+        self.desktop_mutex = desktop_mutex if desktop_mutex is not None else ChatGPTDesktopMutex()
         self._lock = threading.Lock()
+        self._sessions: dict[str, ControllerSessionRuntime] = {}
         self.cancel_requested = threading.Event()
         self.action_running = False
         self.current_worker: threading.Thread | None = None
@@ -280,10 +350,120 @@ class LocalController:
         self.automatic_burst_reason: str | None = None
         if restore_persisted_session:
             self._restore_persisted_session()
+            for run_id in list(self._sessions):
+                self._reconcile_open_codex_invocation(run_id)
+        elif self.session.active_run_id:
+            self._hydrate_injected_session()
 
     @property
     def controller_state(self) -> str:
         return self.session.controller_state
+
+    def _hydrate_injected_session(self) -> None:
+        run_id = self.session.active_run_id
+        if not run_id:
+            return
+        runtime = self._get_or_create_session(run_id)
+        runtime.controller_state = self.session.controller_state
+        runtime.pending_approval = self.session.pending_approval
+        self._apply_focused_runtime(runtime)
+
+    def _get_or_create_session(self, run_id: str) -> ControllerSessionRuntime:
+        runtime = self._sessions.get(run_id)
+        if runtime is None:
+            runtime = ControllerSessionRuntime(run_id=run_id)
+            self._sessions[run_id] = runtime
+        return runtime
+
+    def _apply_focused_runtime(self, runtime: ControllerSessionRuntime) -> None:
+        self.session.active_run_id = runtime.run_id
+        self.session.controller_state = runtime.controller_state
+        self.session.pending_approval = runtime.pending_approval
+        self.cancel_requested = runtime.cancel_requested
+        self.action_running = runtime.action_running
+        self.current_worker = runtime.current_worker
+        self.current_action_kind = runtime.current_action_kind
+        self.current_action_started_at = runtime.current_action_started_at
+        self.last_action_result_summary = runtime.last_action_result_summary
+        self.last_exception_summary = runtime.last_exception_summary
+        self.automatic_burst_count = runtime.automatic_burst_count
+        self.automatic_burst_reason = runtime.automatic_burst_reason
+
+    def _reset_focused_runtime_fields(self) -> None:
+        self.cancel_requested = threading.Event()
+        self.action_running = False
+        self.current_worker = None
+        self.current_action_kind = None
+        self.current_action_started_at = None
+        self.last_action_result_summary = None
+        self.last_exception_summary = None
+        self.automatic_burst_count = 0
+        self.automatic_burst_reason = None
+
+    def _session_is_replaceable_locked(self, run_id: str) -> bool:
+        runtime = self._sessions.get(run_id)
+        if runtime is not None and runtime.action_running:
+            return False
+        if (
+            runtime is None
+            and run_id == self.session.active_run_id
+            and self.action_running
+        ):
+            return False
+        active_run = self.ledger.get_run(run_id)
+        active_status = (
+            str(active_run.get("status") or "")
+            if isinstance(active_run, dict)
+            else ""
+        )
+        return active_status in REPLACEABLE_RUN_STATUSES
+
+    def _live_session_ids_locked(self) -> list[str]:
+        known = set(self._sessions)
+        if self.session.active_run_id:
+            known.add(self.session.active_run_id)
+        return [
+            run_id
+            for run_id in known
+            if not self._session_is_replaceable_locked(run_id)
+        ]
+
+    def _live_conversation_identities_locked(self) -> list[tuple[str, str, str]]:
+        identities: list[tuple[str, str, str]] = []
+        for run_id in self._live_session_ids_locked():
+            runtime = self._sessions.get(run_id)
+            project = runtime.project_title if runtime is not None else None
+            chat = runtime.chat_title if runtime is not None else None
+            if not project or not chat:
+                lookup = get_run_destination_binding(run_id, ledger=self.ledger)
+                binding = getattr(lookup, "binding", None)
+                if binding is not None:
+                    project = binding.project_title
+                    chat = binding.chat_title
+            if project and chat:
+                identities.append((run_id, project, chat))
+        return identities
+
+    def _drop_session_locked(self, run_id: str) -> None:
+        self._sessions.pop(run_id, None)
+        if self.session.active_run_id != run_id:
+            return
+        self.session.active_run_id = None
+        self.session.pending_approval = None
+        self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+        self._reset_focused_runtime_fields()
+
+    def _touch_runtime_locked(self, runtime: ControllerSessionRuntime) -> None:
+        if runtime.run_id == self.session.active_run_id:
+            self._apply_focused_runtime(runtime)
+
+    def _cancel_requested_for(self, run_id: str) -> bool:
+        runtime = self._sessions.get(run_id)
+        if runtime is not None:
+            return runtime.cancel_requested.is_set()
+        return bool(
+            self.session.active_run_id == run_id and self.cancel_requested.is_set()
+        )
 
     def start_run(
         self,
@@ -316,34 +496,33 @@ class LocalController:
             )
 
         with self._lock:
-            if self.session.active_run_id is not None:
-                active_run_id = self.session.active_run_id
-                active_run = self.ledger.get_run(active_run_id)
-                active_status = (
-                    str(active_run.get("status") or "")
-                    if isinstance(active_run, dict)
-                    else ""
+            live_ids = self._live_session_ids_locked()
+            if len(live_ids) >= self.max_active_sessions:
+                active_run_id = self.session.active_run_id or live_ids[0]
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="active_run_exists",
+                    error_message="A local controller run is already active.",
+                    run_id=active_run_id,
+                    controller_state=self.session.controller_state,
                 )
-                if (
-                    self.action_running
-                    or active_status
-                    not in {
-                        RunStatus.COMPLETED.value,
-                        RunStatus.FAILED.value,
-                        RunStatus.NEEDS_REVIEW.value,
-                        RunStatus.REJECTED.value,
-                    }
-                ):
-                    return LocalControllerOperationResult(
-                        ok=False,
-                        reason_code="active_run_exists",
-                        error_message="A local controller run is already active.",
-                        run_id=active_run_id,
-                        controller_state=self.session.controller_state,
-                    )
-                self.session.active_run_id = None
-                self.session.pending_approval = None
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+            collision_run_id = live_conversation_collision_run_id(
+                self._live_conversation_identities_locked(),
+                validation.project_title or "",
+                validation.chat_title or "",
+            )
+            if collision_run_id is not None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="duplicate_chatgpt_conversation",
+                    error_message=(
+                        "A live session already uses this ChatGPT project and chat."
+                    ),
+                    run_id=collision_run_id,
+                    controller_state=self.session.controller_state,
+                )
+            if self.session.active_run_id is not None:
+                self._drop_session_locked(self.session.active_run_id)
                 self._persist_session_locked()
 
             start_result = start_local_controller_run(
@@ -362,15 +541,23 @@ class LocalController:
             run_id = start_result.run_id
             if run_id is None:
                 raise ValueError("start_local_controller_run returned no run_id")
-            self.session.controller_state = LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX
-            self.session.pending_approval = None
-            self.cancel_requested.clear()
-            self._mark_action_running_locked("initial_codex")
-            self.last_exception_summary = None
-            self.last_action_result_summary = {
+            runtime = self._get_or_create_session(run_id)
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX
+            runtime.pending_approval = None
+            runtime.cancel_requested.clear()
+            runtime.repository_path = validation.repository_path
+            runtime.sandbox = validation.sandbox
+            runtime.project_title = validation.project_title
+            runtime.chat_title = validation.chat_title
+            runtime.allow_destination_navigation = bool(
+                validation.allow_destination_navigation
+            )
+            runtime.last_exception_summary = None
+            runtime.last_action_result_summary = {
                 "kind": "start_run",
                 "reason_code": "local_controller_run_started",
             }
+            self._mark_action_running_locked(run_id, "initial_codex")
             worker = self._new_worker(
                 self._initial_worker,
                 run_id,
@@ -379,7 +566,8 @@ class LocalController:
                 validation.sandbox,
                 None,
             )
-            self.current_worker = worker
+            runtime.current_worker = worker
+            self._apply_focused_runtime(runtime)
             self._persist_session_locked()
             worker.start()
 
@@ -392,7 +580,11 @@ class LocalController:
             metadata={"start_event_type": LOCAL_CONTROLLER_RUN_STARTED_EVENT_TYPE},
         )
 
-    def submit_approval_decision(self, decision: str) -> LocalControllerOperationResult:
+    def submit_approval_decision(
+        self,
+        decision: str,
+        run_id: str | None = None,
+    ) -> LocalControllerOperationResult:
         if decision not in {"approved", "rejected"}:
             return LocalControllerOperationResult(
                 ok=False,
@@ -402,33 +594,43 @@ class LocalController:
             )
 
         with self._lock:
-            if self.action_running:
+            target_run_id = run_id or self.session.active_run_id
+            runtime = self._sessions.get(target_run_id) if target_run_id else None
+            if target_run_id is None or runtime is None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="no_pending_approval",
+                    error_message="No pending approval is available.",
+                    run_id=target_run_id,
+                    controller_state=self.session.controller_state,
+                )
+            if runtime.action_running:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="action_already_running",
                     error_message="A controller action is already running.",
-                    run_id=self.session.active_run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
             if (
-                self.session.active_run_id is None
-                or self.session.controller_state != LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
-                or self.session.pending_approval is None
+                runtime.controller_state != LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
+                or runtime.pending_approval is None
             ):
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="no_pending_approval",
                     error_message="No pending approval is available.",
-                    run_id=self.session.active_run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
 
-            snapshot = self.session.pending_approval
-            self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
-            self._mark_action_running_locked(f"approval_{snapshot.approval_kind}")
-            self.last_exception_summary = None
+            snapshot = runtime.pending_approval
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            self._mark_action_running_locked(target_run_id, f"approval_{snapshot.approval_kind}")
+            runtime.last_exception_summary = None
             worker = self._new_worker(self._approval_worker, snapshot, decision)
-            self.current_worker = worker
+            runtime.current_worker = worker
+            self._touch_runtime_locked(runtime)
             worker.start()
 
         return LocalControllerOperationResult(
@@ -439,50 +641,54 @@ class LocalController:
             read_model=self.get_current_state(snapshot.run_id).read_model,
         )
 
-    def request_automatic_progress(self) -> LocalControllerOperationResult:
+    def request_automatic_progress(
+        self,
+        run_id: str | None = None,
+    ) -> LocalControllerOperationResult:
         with self._lock:
-            run_id = self.session.active_run_id
-            if run_id is None:
+            target_run_id = run_id or self.session.active_run_id
+            runtime = self._sessions.get(target_run_id) if target_run_id else None
+            if target_run_id is None or runtime is None:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="no_active_run",
                     error_message="No active run is available.",
                     controller_state=self.session.controller_state,
                 )
-            if self.action_running:
+            if runtime.action_running:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="action_already_running",
                     error_message="A controller action is already running.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
-            if self.session.pending_approval is not None:
+            if runtime.pending_approval is not None:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="pending_approval_exists",
                     error_message="A pending approval must be handled before progress can continue.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
-            if self.session.controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY:
+            if runtime.controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="manual_retry_required",
                     error_message="The last failed action is paused for an explicit manual retry.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
-            if self.session.controller_state in LOCAL_CONTROLLER_TERMINAL_STATES:
+            if runtime.controller_state in LOCAL_CONTROLLER_TERMINAL_STATES:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="controller_state_terminal",
                     error_message="Controller state is terminal for automatic work.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
 
-        state = self.get_current_state(run_id)
+        state = self.get_current_state(target_run_id)
         read_model = state.read_model
         if read_model is None:
             return state
@@ -492,70 +698,82 @@ class LocalController:
                 ok=False,
                 reason_code="human_approval_required",
                 error_message="Human approval is required before progress can continue.",
-                run_id=run_id,
+                run_id=target_run_id,
                 controller_state=self.session.controller_state,
-                read_model=self.get_current_state(run_id).read_model,
+                read_model=self.get_current_state(target_run_id).read_model,
             )
         if not read_model.routine_action_available or read_model.blocked or read_model.completed or read_model.terminal:
             return LocalControllerOperationResult(
                 ok=False,
                 reason_code="no_routine_action_available",
                 error_message="No routine action is currently available.",
-                run_id=run_id,
+                run_id=target_run_id,
                 controller_state=self.session.controller_state,
                 read_model=read_model,
             )
 
         with self._lock:
-            if self.action_running:
+            runtime = self._sessions.get(target_run_id)
+            if runtime is None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="no_active_run",
+                    error_message="No active run is available.",
+                    run_id=target_run_id,
+                    controller_state=self.session.controller_state,
+                )
+            if runtime.action_running:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="action_already_running",
                     error_message="A controller action is already running.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
-            if self.session.pending_approval is not None:
+            if runtime.pending_approval is not None:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="pending_approval_exists",
                     error_message="A pending approval must be handled before progress can continue.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
-            self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
-            self._mark_action_running_locked("routine_progress")
-            worker = self._new_worker(self._routine_worker, run_id, 0)
-            self.current_worker = worker
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            self._mark_action_running_locked(target_run_id, "routine_progress")
+            worker = self._new_worker(self._routine_worker, target_run_id, 0)
+            runtime.current_worker = worker
+            self._touch_runtime_locked(runtime)
             worker.start()
 
         return LocalControllerOperationResult(
             ok=True,
             reason_code="routine_worker_started",
-            run_id=run_id,
+            run_id=target_run_id,
             controller_state=self.session.controller_state,
-            read_model=self.get_current_state(run_id).read_model,
+            read_model=self.get_current_state(target_run_id).read_model,
         )
 
-    def request_cancel(self) -> LocalControllerOperationResult:
+    def request_cancel(self, run_id: str | None = None) -> LocalControllerOperationResult:
         with self._lock:
-            run_id = self.session.active_run_id
-            if run_id is None:
+            target_run_id = run_id or self.session.active_run_id
+            runtime = self._sessions.get(target_run_id) if target_run_id else None
+            if target_run_id is None or runtime is None:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="no_active_run",
                     error_message="No active run is available.",
                     controller_state=self.session.controller_state,
                 )
-            self.cancel_requested.set()
-            self.session.pending_approval = None
-            self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
-            self.automatic_burst_reason = "operator_cancelled"
+            runtime.cancel_requested.set()
+            runtime.pending_approval = None
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            runtime.automatic_burst_reason = "operator_cancelled"
+            self._touch_runtime_locked(runtime)
             self._persist_session_locked()
 
-        termination = terminate_codex_run(run_id)
+        termination = terminate_codex_run(target_run_id)
         self.ledger.add_event(
-            run_id,
+            target_run_id,
             LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE,
             LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE,
             {
@@ -566,7 +784,7 @@ class LocalController:
         )
         try:
             self.ledger.update_run_status(
-                run_id,
+                target_run_id,
                 RunStatus.FAILED,
                 error="Run cancelled by operator.",
             )
@@ -575,13 +793,17 @@ class LocalController:
         return LocalControllerOperationResult(
             ok=True,
             reason_code="cancel_requested",
-            run_id=run_id,
+            run_id=target_run_id,
             controller_state=LOCAL_CONTROLLER_STATE_BLOCKED,
-            read_model=self.get_current_state(run_id).read_model,
+            read_model=self.get_current_state(target_run_id).read_model,
             metadata={"process_termination": termination},
         )
 
-    def retry_failed_action(self, failure_event_id: int) -> LocalControllerOperationResult:
+    def retry_failed_action(
+        self,
+        failure_event_id: int,
+        run_id: str | None = None,
+    ) -> LocalControllerOperationResult:
         if isinstance(failure_event_id, bool) or not isinstance(failure_event_id, int) or failure_event_id <= 0:
             return LocalControllerOperationResult(
                 ok=False,
@@ -591,40 +813,41 @@ class LocalController:
             )
 
         with self._lock:
-            run_id = self.session.active_run_id
-            if run_id is None:
+            target_run_id = run_id or self.session.active_run_id
+            runtime = self._sessions.get(target_run_id) if target_run_id else None
+            if target_run_id is None or runtime is None:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="no_active_run",
                     error_message="No active run is available.",
                     controller_state=self.session.controller_state,
                 )
-            if self.action_running:
+            if runtime.action_running:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="action_already_running",
                     error_message="A controller action is already running.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
             failure = _latest_unresolved_action_failure(
-                self.ledger.list_events(run_id),
+                self.ledger.list_events(target_run_id),
             )
             if failure is None:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="no_retryable_failure",
                     error_message="No unresolved controller action failure is available.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                 )
             if failure["event_id"] != failure_event_id:
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="stale_failure_retry",
                     error_message="The requested failure is no longer the latest unresolved failure.",
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                     metadata={"latest_failure": failure},
                 )
             if failure.get("retryable") is not True:
@@ -635,17 +858,17 @@ class LocalController:
                         failure.get("recovery_message")
                         or "This failure cannot be retried safely without review."
                     ),
-                    run_id=run_id,
-                    controller_state=self.session.controller_state,
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
                     metadata={"latest_failure": failure},
                 )
 
-            restore_failure = self._restore_retryable_run_status(run_id, failure)
+            restore_failure = self._restore_retryable_run_status(target_run_id, failure)
             if restore_failure is not None:
                 return restore_failure
 
             self.ledger.add_event(
-                run_id,
+                target_run_id,
                 LOCAL_CONTROLLER_RETRY_REQUESTED_EVENT_TYPE,
                 LOCAL_CONTROLLER_RETRY_REQUESTED_MESSAGE,
                 {
@@ -658,22 +881,26 @@ class LocalController:
                 },
             )
 
-            self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
-            self.session.pending_approval = None
-            self._mark_action_running_locked(f"retry:{failure.get('action_key') or 'failed_action'}")
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            runtime.pending_approval = None
+            self._mark_action_running_locked(
+                target_run_id,
+                f"retry:{failure.get('action_key') or 'failed_action'}",
+            )
             worker = self._new_worker(
                 self._retry_worker,
-                run_id,
+                target_run_id,
                 failure_event_id,
                 failure,
             )
-            self.current_worker = worker
+            runtime.current_worker = worker
+            self._touch_runtime_locked(runtime)
             worker.start()
 
         return LocalControllerOperationResult(
             ok=True,
             reason_code="retry_worker_started",
-            run_id=run_id,
+            run_id=target_run_id,
             controller_state=self.session.controller_state,
             metadata={
                 "failure_event_id": failure_event_id,
@@ -872,7 +1099,7 @@ class LocalController:
         with self._lock:
             active_run_id = self.session.active_run_id
             target_run_id = run_id or active_run_id
-            runtime = self._runtime_snapshot_locked()
+            runtime = self._runtime_snapshot_locked(target_run_id)
         if target_run_id is None:
             return LocalControllerOperationResult(
                 ok=False,
@@ -943,11 +1170,18 @@ class LocalController:
             )
         except AttributeError:
             events = []
+        with self._lock:
+            runtime = self._sessions.get(run_id)
+            controller_state = (
+                runtime.controller_state
+                if runtime is not None
+                else self.session.controller_state
+            )
         return LocalControllerOperationResult(
             ok=True,
             reason_code="progress_loaded",
             run_id=run_id,
-            controller_state=self.session.controller_state,
+            controller_state=controller_state,
             metadata={
                 "progress": _codex_progress_payload(
                     run_id,
@@ -975,11 +1209,13 @@ class LocalController:
                 sandbox=sandbox,
                 timeout_seconds=None,
             )
-            if self.cancel_requested.is_set():
+            if self._cancel_requested_for(run_id):
                 return
             summary = _action_result_summary(result, "initial_run")
             with self._lock:
-                self.last_action_result_summary = summary
+                runtime = self._get_or_create_session(run_id)
+                runtime.last_action_result_summary = summary
+                self._touch_runtime_locked(runtime)
             if not _result_ok(result):
                 self._pause_for_action_failure(
                     run_id,
@@ -1007,7 +1243,7 @@ class LocalController:
                 },
             )
         finally:
-            self._clear_action_running()
+            self._clear_action_running(run_id)
 
     def _routine_worker(self, run_id: str, starting_burst_count: int) -> None:
         try:
@@ -1016,10 +1252,10 @@ class LocalController:
             self._record_worker_exception(
                 exc,
                 run_id=run_id,
-                action_key=self.current_action_kind or "routine_progress",
+                action_key=self._action_kind_for(run_id) or "routine_progress",
             )
         finally:
-            self._clear_action_running()
+            self._clear_action_running(run_id)
 
     def _retry_worker(
         self,
@@ -1077,14 +1313,21 @@ class LocalController:
                 ),
                 allow_destination_navigation=read_model.allow_destination_navigation,
                 ledger=self.ledger,
+                **self._supervision_handoff_kwargs(),
             )
-            if self.cancel_requested.is_set():
+            if self._cancel_requested_for(run_id):
                 return
             with self._lock:
-                self.last_action_result_summary = _action_result_summary(
+                runtime = self._get_or_create_session(run_id)
+                runtime.last_action_result_summary = _action_result_summary(
                     result,
                     "manual_retry",
                 )
+                self._touch_runtime_locked(runtime)
+            if getattr(result, "waiting_for_chatgpt", False):
+                self._wait_for_chatgpt_lane(run_id, result)
+                self._automatic_progress_loop(run_id, starting_burst_count=0)
+                return
             if not _result_ok(result) or getattr(result, "blocked", False):
                 self._pause_for_action_failure(
                     run_id,
@@ -1112,7 +1355,7 @@ class LocalController:
                 supersedes_failure_event_id=failure_event_id,
             )
         finally:
-            self._clear_action_running()
+            self._clear_action_running(run_id)
 
     def _retry_initial_codex(
         self,
@@ -1140,6 +1383,29 @@ class LocalController:
                 supersedes_failure_event_id=failure_event_id,
             )
             return
+        open_item = latest_open_invocation(
+            run_id,
+            events=self.ledger.list_events(run_id),
+        )
+        if open_item is not None and open_item.status == STATUS_UNCERTAIN:
+            self._pause_for_action_failure(
+                run_id,
+                action_key="initial_codex",
+                result=_controller_failure_result(
+                    "codex_invocation_uncertain",
+                    "An existing Codex invocation has start evidence without proven completion and will not be replayed.",
+                    retryable=False,
+                ),
+                run_status_before_action=read_model.run_status,
+                source="manual_retry",
+                retry_context={
+                    "repository_path": read_model.repository_path,
+                    "sandbox": read_model.sandbox,
+                    "codex_invocation_id": open_item.invocation_id,
+                },
+                supersedes_failure_event_id=failure_event_id,
+            )
+            return
         result = self.initial_run_executor(
             run_id=run_id,
             run=run,
@@ -1149,10 +1415,12 @@ class LocalController:
             timeout_seconds=None,
         )
         with self._lock:
-            self.last_action_result_summary = _action_result_summary(
+            runtime = self._get_or_create_session(run_id)
+            runtime.last_action_result_summary = _action_result_summary(
                 result,
                 "manual_retry_initial_run",
             )
+            self._touch_runtime_locked(runtime)
         if not _result_ok(result):
             self._pause_for_action_failure(
                 run_id,
@@ -1178,8 +1446,10 @@ class LocalController:
     def _approval_worker(self, snapshot: PendingApprovalSnapshot, decision: str) -> None:
         try:
             with self._lock:
-                if self.session.pending_approval == snapshot:
-                    self.session.pending_approval = None
+                runtime = self._sessions.get(snapshot.run_id)
+                if runtime is not None and runtime.pending_approval == snapshot:
+                    runtime.pending_approval = None
+                    self._touch_runtime_locked(runtime)
             read_model = self._build_read_model(snapshot.run_id)
             if not read_model.configuration_complete or not read_model.repository_path or not read_model.sandbox:
                 self._pause_for_action_failure(
@@ -1206,11 +1476,18 @@ class LocalController:
                 expected_prompt_sha256=snapshot.expected_prompt_sha256,
                 allow_destination_navigation=read_model.allow_destination_navigation,
                 ledger=self.ledger,
+                **self._supervision_handoff_kwargs(),
             )
-            if self.cancel_requested.is_set():
+            if self._cancel_requested_for(snapshot.run_id):
                 return
             with self._lock:
-                self.last_action_result_summary = _action_result_summary(result, "approval_decision")
+                runtime = self._get_or_create_session(snapshot.run_id)
+                runtime.last_action_result_summary = _action_result_summary(result, "approval_decision")
+                self._touch_runtime_locked(runtime)
+            if getattr(result, "waiting_for_chatgpt", False):
+                self._wait_for_chatgpt_lane(snapshot.run_id, result)
+                self._automatic_progress_loop(snapshot.run_id, starting_burst_count=0)
+                return
             if not _result_ok(result) or getattr(result, "blocked", False):
                 self._pause_for_action_failure(
                     snapshot.run_id,
@@ -1230,12 +1507,12 @@ class LocalController:
                 retry_context={"approval_decision": decision},
             )
         finally:
-            self._clear_action_running()
+            self._clear_action_running(snapshot.run_id)
 
     def _automatic_progress_loop(self, run_id: str, *, starting_burst_count: int) -> None:
         burst_count = starting_burst_count
         while True:
-            if self.cancel_requested.is_set():
+            if self._cancel_requested_for(run_id):
                 return
             read_model = self._build_read_model(run_id)
             if read_model.requires_human_approval:
@@ -1261,9 +1538,11 @@ class LocalController:
                 return
 
             with self._lock:
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
-                self.current_action_kind = read_model.planner_action or "routine_progress"
-                self.automatic_burst_count = burst_count
+                runtime = self._get_or_create_session(run_id)
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+                runtime.current_action_kind = read_model.planner_action or "routine_progress"
+                runtime.automatic_burst_count = burst_count
+                self._touch_runtime_locked(runtime)
             result = self.run_supervision_step(
                 run_id,
                 read_model.repository_path,
@@ -1271,13 +1550,21 @@ class LocalController:
                 approval_mode="auto",
                 allow_destination_navigation=read_model.allow_destination_navigation,
                 ledger=self.ledger,
+                **self._supervision_handoff_kwargs(),
             )
-            if self.cancel_requested.is_set():
+            if self._cancel_requested_for(run_id):
                 return
+            if getattr(result, "waiting_for_chatgpt", False):
+                self._wait_for_chatgpt_lane(run_id, result)
+                continue
             burst_count += 1
             with self._lock:
-                self.automatic_burst_count = burst_count
-                self.last_action_result_summary = _action_result_summary(result, "routine_step")
+                runtime = self._get_or_create_session(run_id)
+                runtime.automatic_burst_count = burst_count
+                runtime.waiting_for_chatgpt = False
+                runtime.chatgpt_wait_count = 0
+                runtime.last_action_result_summary = _action_result_summary(result, "routine_step")
+                self._touch_runtime_locked(runtime)
             if (
                 getattr(result, "blocked", False)
                 or getattr(result, "terminal", False)
@@ -1300,6 +1587,37 @@ class LocalController:
                 )
                 return
 
+    def _supervision_handoff_kwargs(self) -> dict[str, Any]:
+        return {
+            "desktop_mutex": self.desktop_mutex,
+            "controller_instance_id": self.session.session_id,
+        }
+
+    def _chatgpt_wait_delay_seconds(self, wait_count: int) -> float:
+        exponent = max(0, wait_count - 1)
+        return min(
+            CHATGPT_WAIT_INITIAL_SECONDS * (2 ** exponent),
+            CHATGPT_WAIT_MAX_SECONDS,
+        )
+
+    def _wait_for_chatgpt_lane(self, run_id: str, result: Any) -> None:
+        with self._lock:
+            runtime = self._get_or_create_session(run_id)
+            runtime.waiting_for_chatgpt = True
+            runtime.chatgpt_wait_count += 1
+            wait_count = runtime.chatgpt_wait_count
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            runtime.last_action_result_summary = {
+                "kind": "chatgpt_wait",
+                "ok": True,
+                "reason_code": _string_or_none(getattr(result, "reason_code", None)),
+                "waiting_for_chatgpt": True,
+                "wait_count": wait_count,
+            }
+            self._touch_runtime_locked(runtime)
+        delay = self._chatgpt_wait_delay_seconds(wait_count)
+        self._chatgpt_wait_sleeper(delay)
+
     def _commit_state_from_read_model(
         self,
         read_model: LocalControllerReadModel,
@@ -1310,27 +1628,31 @@ class LocalController:
             self._store_pending_approval(read_model)
             return
         with self._lock:
+            runtime = self._get_or_create_session(read_model.run_id)
             if read_model.completed:
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_COMPLETED
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_COMPLETED
             elif read_model.blocked or read_model.terminal:
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
             else:
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+            self._touch_runtime_locked(runtime)
             self._persist_session_locked()
 
     def _store_pending_approval(self, read_model: LocalControllerReadModel) -> None:
         snapshot_result = create_pending_approval_snapshot(read_model)
         if snapshot_result.ok:
             with self._lock:
-                self.session.pending_approval = snapshot_result.snapshot
-                self.session.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
-                self.last_action_result_summary = {
+                runtime = self._get_or_create_session(read_model.run_id)
+                runtime.pending_approval = snapshot_result.snapshot
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
+                runtime.last_action_result_summary = {
                     "kind": "approval_gate",
                     "reason_code": "human_approval_required",
                     "approval_kind": snapshot_result.snapshot.approval_kind
                     if snapshot_result.snapshot
                     else None,
                 }
+                self._touch_runtime_locked(runtime)
                 self._persist_session_locked()
             return
         self._pause_for_action_failure(
@@ -1352,18 +1674,42 @@ class LocalController:
         # Daemon workers avoid hanging local process shutdown; Slice 10 does not implement termination.
         return threading.Thread(target=target, args=args, daemon=True)
 
-    def _mark_action_running_locked(self, kind: str) -> None:
-        self.action_running = True
-        self.current_action_kind = kind
-        self.current_action_started_at = datetime.now(UTC).isoformat()
-        self.automatic_burst_count = 0
-        self.automatic_burst_reason = None
+    def _action_kind_for(self, run_id: str) -> str | None:
+        runtime = self._sessions.get(run_id)
+        if runtime is not None:
+            return runtime.current_action_kind
+        if run_id == self.session.active_run_id:
+            return self.current_action_kind
+        return None
 
-    def _clear_action_running(self) -> None:
+    def _mark_action_running_locked(self, run_id: str, kind: str) -> None:
+        runtime = self._get_or_create_session(run_id)
+        runtime.action_running = True
+        runtime.current_action_kind = kind
+        runtime.current_action_started_at = datetime.now(UTC).isoformat()
+        runtime.automatic_burst_count = 0
+        runtime.automatic_burst_reason = None
+        self._touch_runtime_locked(runtime)
+
+    def _clear_action_running(self, run_id: str | None = None) -> None:
         with self._lock:
-            self.action_running = False
-            self.current_action_kind = None
-            self.current_action_started_at = None
+            target_run_id = run_id or self.session.active_run_id
+            if target_run_id is None:
+                self.action_running = False
+                self.current_action_kind = None
+                self.current_action_started_at = None
+                self._persist_session_locked()
+                return
+            runtime = self._sessions.get(target_run_id)
+            if runtime is not None:
+                runtime.action_running = False
+                runtime.current_action_kind = None
+                runtime.current_action_started_at = None
+                self._touch_runtime_locked(runtime)
+            elif target_run_id == self.session.active_run_id:
+                self.action_running = False
+                self.current_action_kind = None
+                self.current_action_started_at = None
             self._persist_session_locked()
 
     def _persist_session_locked(self) -> None:
@@ -1371,12 +1717,28 @@ class LocalController:
         if not callable(writer):
             return
         pending = asdict(self.session.pending_approval) if self.session.pending_approval else None
+        sessions: dict[str, Any] = {}
+        for run_id, runtime in self._sessions.items():
+            sessions[run_id] = {
+                "controller_state": runtime.controller_state,
+                "pending_approval": (
+                    asdict(runtime.pending_approval) if runtime.pending_approval else None
+                ),
+                "repository_path": runtime.repository_path,
+                "sandbox": runtime.sandbox,
+                "project_title": runtime.project_title,
+                "chat_title": runtime.chat_title,
+                "allow_destination_navigation": runtime.allow_destination_navigation,
+            }
         try:
             writer(
                 {
+                    "schema_version": LOCAL_CONTROLLER_SNAPSHOT_SCHEMA_VERSION,
                     "active_run_id": self.session.active_run_id,
                     "controller_state": self.session.controller_state,
                     "pending_approval": pending,
+                    "max_active_sessions": self.max_active_sessions,
+                    "sessions": sessions,
                 }
             )
         except Exception:
@@ -1399,15 +1761,44 @@ class LocalController:
         if active_run is None:
             return
         active_status = str(active_run.get("status") or "")
-        if active_status in {
-            RunStatus.COMPLETED.value,
-            RunStatus.FAILED.value,
-            RunStatus.NEEDS_REVIEW.value,
-            RunStatus.REJECTED.value,
-        }:
+        if active_status in REPLACEABLE_RUN_STATUSES:
             self._persist_session_locked()
             return
-        controller_state = snapshot.get("controller_state")
+
+        payloads: dict[str, dict[str, Any]] = {}
+        raw_sessions = snapshot.get("sessions")
+        if isinstance(raw_sessions, dict):
+            for key, value in raw_sessions.items():
+                if isinstance(key, str) and isinstance(value, dict):
+                    payloads[key] = value
+        if active_run_id not in payloads:
+            payloads[active_run_id] = {
+                "controller_state": snapshot.get("controller_state"),
+                "pending_approval": snapshot.get("pending_approval"),
+            }
+
+        focused = self._runtime_from_restore_payload(
+            active_run_id,
+            payloads.get(active_run_id, {}),
+        )
+        self._sessions[active_run_id] = focused
+        for run_id, payload in payloads.items():
+            if run_id == active_run_id:
+                continue
+            other = self.ledger.get_run(run_id)
+            if other is None:
+                continue
+            if str(other.get("status") or "") in REPLACEABLE_RUN_STATUSES:
+                continue
+            self._sessions[run_id] = self._runtime_from_restore_payload(run_id, payload)
+        self._apply_focused_runtime(focused)
+
+    def _runtime_from_restore_payload(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> ControllerSessionRuntime:
+        controller_state = payload.get("controller_state")
         if controller_state not in {
             LOCAL_CONTROLLER_STATE_IDLE,
             LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX,
@@ -1419,7 +1810,7 @@ class LocalController:
             LOCAL_CONTROLLER_STATE_COMPLETED,
         }:
             controller_state = LOCAL_CONTROLLER_STATE_IDLE
-        pending = _pending_approval_from_snapshot(snapshot.get("pending_approval"))
+        pending = _pending_approval_from_snapshot(payload.get("pending_approval"))
         if controller_state in {
             LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX,
             LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION,
@@ -1431,9 +1822,35 @@ class LocalController:
             and pending is None
         ):
             controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
-        self.session.active_run_id = active_run_id
-        self.session.controller_state = str(controller_state)
-        self.session.pending_approval = pending
+        return ControllerSessionRuntime(
+            run_id=run_id,
+            controller_state=str(controller_state),
+            pending_approval=pending,
+            repository_path=_string_or_none(payload.get("repository_path")),
+            sandbox=_string_or_none(payload.get("sandbox")),
+            project_title=_string_or_none(payload.get("project_title")),
+            chat_title=_string_or_none(payload.get("chat_title")),
+            allow_destination_navigation=payload.get("allow_destination_navigation") is True,
+        )
+
+    def _reconcile_open_codex_invocation(self, run_id: str) -> None:
+        try:
+            events = self.ledger.list_events(run_id)
+        except Exception:
+            return
+        open_item = latest_open_invocation(run_id, events=events)
+        if open_item is None:
+            return
+        if open_item.status == STATUS_LIVE:
+            worker = threading.Thread(
+                target=reconcile_codex_invocation,
+                kwargs={"run_id": run_id, "ledger": self.ledger},
+                daemon=True,
+                name=f"codex-observe-{run_id}",
+            )
+            worker.start()
+            return
+        reconcile_codex_invocation(run_id, ledger=self.ledger)
 
     def _pause_for_action_failure(
         self,
@@ -1446,7 +1863,7 @@ class LocalController:
         retry_context: dict[str, Any] | None = None,
         supersedes_failure_event_id: int | None = None,
     ) -> dict[str, Any]:
-        if self.cancel_requested.is_set():
+        if self._cancel_requested_for(run_id):
             return {
                 "reason_code": "operator_cancelled",
                 "error_message": "Run cancelled by operator.",
@@ -1507,7 +1924,8 @@ class LocalController:
             metadata,
         )
         with self._lock:
-            self.last_action_result_summary = {
+            runtime = self._get_or_create_session(run_id)
+            runtime.last_action_result_summary = {
                 "kind": source,
                 "ok": False,
                 "reason_code": reason_code,
@@ -1516,11 +1934,12 @@ class LocalController:
                 "retry_classification": classification["classification"],
                 "retryable": classification["retryable"],
             }
-            self.session.controller_state = (
+            runtime.controller_state = (
                 LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY
                 if classification["retryable"]
                 else LOCAL_CONTROLLER_STATE_BLOCKED
             )
+            self._touch_runtime_locked(runtime)
             self._persist_session_locked()
         return metadata
 
@@ -1571,26 +1990,85 @@ class LocalController:
                 supersedes_failure_event_id=supersedes_failure_event_id,
             )
         with self._lock:
-            self.last_exception_summary = _exception_summary(exc)
-            if run_id is None or action_key is None:
+            if run_id is not None:
+                runtime = self._get_or_create_session(run_id)
+                runtime.last_exception_summary = _exception_summary(exc)
+                if action_key is None:
+                    runtime.controller_state = LOCAL_CONTROLLER_STATE_FAILED
+                self._touch_runtime_locked(runtime)
+            else:
+                self.last_exception_summary = _exception_summary(exc)
                 self.session.controller_state = LOCAL_CONTROLLER_STATE_FAILED
+            if run_id is None or action_key is None:
                 self._persist_session_locked()
 
-    def _runtime_snapshot_locked(self) -> dict[str, Any]:
-        pending = self.session.pending_approval
+    def _runtime_snapshot_locked(self, run_id: str | None = None) -> dict[str, Any]:
+        target_run_id = run_id or self.session.active_run_id
+        runtime = self._sessions.get(target_run_id) if target_run_id else None
+        if runtime is None:
+            pending = (
+                self.session.pending_approval
+                if target_run_id == self.session.active_run_id
+                else None
+            )
+            return {
+                "controller_state": (
+                    self.session.controller_state
+                    if target_run_id == self.session.active_run_id or target_run_id is None
+                    else LOCAL_CONTROLLER_STATE_IDLE
+                ),
+                "active_run_id": target_run_id,
+                "pending_approval_available": pending is not None,
+                "pending_approval_kind": pending.approval_kind if pending is not None else None,
+                "session_age_seconds": _session_age_seconds(self.session.created_at),
+                "action_running": self.action_running if target_run_id == self.session.active_run_id else False,
+                "current_action_kind": (
+                    self.current_action_kind
+                    if target_run_id == self.session.active_run_id
+                    else None
+                ),
+                "current_action_started_at": (
+                    self.current_action_started_at
+                    if target_run_id == self.session.active_run_id
+                    else None
+                ),
+                "last_action_result_summary": (
+                    self.last_action_result_summary
+                    if target_run_id == self.session.active_run_id
+                    else None
+                ),
+                "last_exception_summary": (
+                    self.last_exception_summary
+                    if target_run_id == self.session.active_run_id
+                    else None
+                ),
+                "automatic_burst_count": (
+                    self.automatic_burst_count
+                    if target_run_id == self.session.active_run_id
+                    else 0
+                ),
+                "automatic_burst_reason": (
+                    self.automatic_burst_reason
+                    if target_run_id == self.session.active_run_id
+                    else None
+                ),
+            }
+        pending = runtime.pending_approval
         return {
-            "controller_state": self.session.controller_state,
-            "active_run_id": self.session.active_run_id,
+            "controller_state": runtime.controller_state,
+            "active_run_id": runtime.run_id,
             "pending_approval_available": pending is not None,
             "pending_approval_kind": pending.approval_kind if pending is not None else None,
             "session_age_seconds": _session_age_seconds(self.session.created_at),
-            "action_running": self.action_running,
-            "current_action_kind": self.current_action_kind,
-            "current_action_started_at": self.current_action_started_at,
-            "last_action_result_summary": self.last_action_result_summary,
-            "last_exception_summary": self.last_exception_summary,
-            "automatic_burst_count": self.automatic_burst_count,
-            "automatic_burst_reason": self.automatic_burst_reason,
+            "action_running": runtime.action_running,
+            "current_action_kind": runtime.current_action_kind,
+            "current_action_started_at": runtime.current_action_started_at,
+            "last_action_result_summary": runtime.last_action_result_summary,
+            "last_exception_summary": runtime.last_exception_summary,
+            "automatic_burst_count": runtime.automatic_burst_count,
+            "automatic_burst_reason": runtime.automatic_burst_reason,
+            "waiting_for_chatgpt": runtime.waiting_for_chatgpt,
+            "chatgpt_wait_count": runtime.chatgpt_wait_count,
         }
 
 
@@ -2833,6 +3311,7 @@ def _failure_retry_classification(
         "extracted_prompt_run_incomplete",
         "extracted_codex_prompt_run_failed",
         "retry_planner_action_changed",
+        "codex_invocation_uncertain",
     }
     deterministic_reasons = {
         "gpt_feedback_not_submittable",

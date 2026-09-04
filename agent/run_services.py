@@ -125,6 +125,13 @@ class ChatGPTHandoffQueueLedger(Protocol):
         claim_owner_identifier: str,
     ) -> Any: ...
 
+    def claim_chatgpt_handoff_for_run(
+        self,
+        run_id: str,
+        *,
+        claim_owner_identifier: str,
+    ) -> Any: ...
+
     def complete_chatgpt_handoff(
         self,
         queue_sequence: int,
@@ -275,6 +282,10 @@ class RunDestinationBinding:
             raise ValueError("project_title must not be empty")
         if chat_title == "":
             raise ValueError("chat_title must not be empty")
+        if "," in project_title:
+            raise ValueError("project_title must not contain a comma")
+        if "," in chat_title:
+            raise ValueError("chat_title must not contain a comma")
 
         object.__setattr__(self, "project_title", project_title)
         object.__setattr__(self, "chat_title", chat_title)

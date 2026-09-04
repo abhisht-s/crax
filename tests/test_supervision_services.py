@@ -10,6 +10,10 @@ from agent.chatgpt_destination_gate import (
     ChatGPTDestinationSnapshot,
     DestinationEvidenceCandidate,
 )
+from agent.chatgpt_desktop_mutex import (
+    ChatGPTDesktopMutexHold,
+    NullChatGPTDesktopMutex,
+)
 from agent.supervise import SuperviseAction, SupervisePlan
 from agent.supervision_services import (
     CHATGPT_HANDOFF_MAX_UI_ATTEMPTS,
@@ -111,6 +115,7 @@ class FakeLedger:
         self.release_raises = release_raises
         self.lease_token = _raw_token("supervision")
         self.lease_owner_run_id = lease_owner_run_id
+        self._handoff_entries: list[dict] = []
         self._next_id = max(
             [int(event.get("id") or 0) for event in self.events if str(event.get("id") or "").isdigit()],
             default=0,
@@ -268,6 +273,136 @@ class FakeLedger:
             acquired_at="2026-01-01T00:00:00+00:00",
             released_at="2026-01-01T00:01:00+00:00",
             event_id=event["id"],
+            event_written=True,
+        )
+
+    def enqueue_chatgpt_handoff(self, run_id: str, *, enqueue_source: str):
+        self.operations.append("enqueue_handoff")
+        if not hasattr(self, "_handoff_entries"):
+            self._handoff_entries = []
+        active = next(
+            (
+                entry
+                for entry in self._handoff_entries
+                if entry["run_id"] == run_id and entry["status"] in {"pending", "claimed"}
+            ),
+            None,
+        )
+        if active is not None:
+            status = (
+                default_ledger.AtomicChatGPTHandoffQueueStatus.IDEMPOTENT
+                if active["status"] == "pending"
+                else default_ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED
+            )
+            return default_ledger.AtomicChatGPTHandoffQueueResult(
+                status=status,
+                run_id=run_id,
+                queue_entry_id=active["queue_entry_id"],
+                queue_sequence=active["queue_sequence"],
+                enqueue_source=active["enqueue_source"],
+                claim_owner_identifier=active.get("claim_owner_identifier"),
+                event_written=False,
+            )
+        sequence = self._next_id
+        entry = {
+            "run_id": run_id,
+            "queue_entry_id": f"chatgpt-handoff-{sequence}",
+            "queue_sequence": sequence,
+            "enqueue_source": enqueue_source,
+            "status": "pending",
+        }
+        self._next_id += 1
+        self._handoff_entries.append(entry)
+        return default_ledger.AtomicChatGPTHandoffQueueResult(
+            status=default_ledger.AtomicChatGPTHandoffQueueStatus.ENQUEUED,
+            run_id=run_id,
+            queue_entry_id=entry["queue_entry_id"],
+            queue_sequence=sequence,
+            enqueue_source=enqueue_source,
+            event_written=True,
+        )
+
+    def claim_chatgpt_handoff_for_run(self, run_id: str, *, claim_owner_identifier: str):
+        self.operations.append("claim_handoff")
+        entries = getattr(self, "_handoff_entries", [])
+        active = next(
+            (
+                entry
+                for entry in entries
+                if entry["run_id"] == run_id and entry["status"] in {"pending", "claimed"}
+            ),
+            None,
+        )
+        head = next(
+            (entry for entry in entries if entry["status"] in {"pending", "claimed"}),
+            None,
+        )
+        if active is None:
+            return default_ledger.AtomicChatGPTHandoffQueueResult(
+                status=default_ledger.AtomicChatGPTHandoffQueueStatus.MISSING,
+                run_id=run_id,
+                reason_code="chatgpt_handoff_queue_entry_missing",
+            )
+        if head is not None and head["queue_sequence"] != active["queue_sequence"]:
+            return default_ledger.AtomicChatGPTHandoffQueueResult(
+                status=default_ledger.AtomicChatGPTHandoffQueueStatus.WAITING,
+                run_id=run_id,
+                queue_sequence=active["queue_sequence"],
+                reason_code="chatgpt_handoff_queue_not_head",
+                head_run_id=head["run_id"],
+            )
+        active["status"] = "claimed"
+        active["claim_owner_identifier"] = claim_owner_identifier
+        return default_ledger.AtomicChatGPTHandoffQueueResult(
+            status=default_ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED,
+            run_id=run_id,
+            queue_entry_id=active["queue_entry_id"],
+            queue_sequence=active["queue_sequence"],
+            enqueue_source=active["enqueue_source"],
+            claim_owner_identifier=claim_owner_identifier,
+            event_written=True,
+            head_run_id=run_id,
+        )
+
+    def complete_chatgpt_handoff(
+        self,
+        queue_sequence: int,
+        *,
+        claim_owner_identifier: str,
+        reason_code: str,
+        lease_correlation: dict | None = None,
+    ):
+        del claim_owner_identifier, lease_correlation
+        self.operations.append("complete_handoff")
+        for entry in getattr(self, "_handoff_entries", []):
+            if entry["queue_sequence"] == queue_sequence:
+                entry["status"] = "completed"
+                entry["terminal_reason_code"] = reason_code
+        return default_ledger.AtomicChatGPTHandoffQueueResult(
+            status=default_ledger.AtomicChatGPTHandoffQueueStatus.COMPLETED,
+            queue_sequence=queue_sequence,
+            terminal_reason_code=reason_code,
+            event_written=True,
+        )
+
+    def block_chatgpt_handoff(
+        self,
+        queue_sequence: int,
+        *,
+        claim_owner_identifier: str,
+        reason_code: str,
+        lease_correlation: dict | None = None,
+    ):
+        del claim_owner_identifier, lease_correlation
+        self.operations.append("block_handoff")
+        for entry in getattr(self, "_handoff_entries", []):
+            if entry["queue_sequence"] == queue_sequence:
+                entry["status"] = "blocked"
+                entry["terminal_reason_code"] = reason_code
+        return default_ledger.AtomicChatGPTHandoffQueueResult(
+            status=default_ledger.AtomicChatGPTHandoffQueueStatus.BLOCKED,
+            queue_sequence=queue_sequence,
+            terminal_reason_code=reason_code,
             event_written=True,
         )
 
@@ -464,6 +599,7 @@ class SupervisionStepServiceTests(unittest.TestCase):
             extraction_service=extract,
             extracted_prompt_execution_service=run_prompt,
             destination_adapter_factory=destination_adapter_factory,
+            desktop_mutex=kwargs.pop("desktop_mutex", NullChatGPTDesktopMutex()),
             **kwargs,
         )
         return result, planner, ledger, submit, capture, extract, run_prompt
@@ -474,11 +610,11 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertTrue(result.action_executed)
         self.assertEqual(result.planner_action, "ask_send_to_gpt")
-        self.assertEqual(result.next_state_hint, "ask_run_prompt")
+        self.assertEqual(result.next_state_hint, "extract_next_prompt")
         self.assertEqual(len(planner.calls), 1)
         self.assertEqual(len(submit.calls), 1)
         self.assertEqual(len(capture.calls), 1)
-        self.assertEqual(len(extract.calls), 1)
+        self.assertEqual(len(extract.calls), 0)
         self.assertEqual(len(run_prompt.calls), 0)
         self.assertEqual(submit.calls[0][1]["approval_mode"], "auto")
         self.assertEqual(
@@ -500,7 +636,7 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertEqual(len(submit.calls), 1)
         self.assertEqual(submit.calls[0][1]["approval_mode"], "auto")
         self.assertEqual(len(capture.calls), 1)
-        self.assertEqual(len(extract.calls), 1)
+        self.assertEqual(len(extract.calls), 0)
         self.assertEqual(len(run_prompt.calls), 0)
         self.assertNotIn(
             "supervise_auto_stopped",
@@ -572,7 +708,7 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertEqual(len(run_prompt.calls), 0)
 
     def test_extract_called_once_with_sentinel_and_confirmed_persistence(self) -> None:
-        result, planner, _ledger, submit, capture, extract, run_prompt = self._run_step(_extract_plan())
+        result, planner, ledger, submit, capture, extract, run_prompt = self._run_step(_extract_plan())
 
         self.assertTrue(result.ok)
         self.assertEqual(result.next_state_hint, "ask_run_prompt")
@@ -583,6 +719,11 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertEqual(len(submit.calls), 0)
         self.assertEqual(len(capture.calls), 0)
         self.assertEqual(len(run_prompt.calls), 0)
+        self.assertNotIn("acquire_lease", ledger.operations)
+        self.assertNotIn("enqueue_handoff", ledger.operations)
+        self.assertNotIn("claim_handoff", ledger.operations)
+        self.assertEqual(result.metadata["chatgpt_ui_lease"]["reason_code"], "extract_is_ledger_only")
+        self.assertTrue(result.metadata["chatgpt_handoff_queue"]["skipped"])
 
     def test_run_action_ignores_prompt_auto_run_safety_flag_and_preserves_metadata(self) -> None:
         safe, _planner, _ledger, _submit, _capture, _extract, run_prompt = self._run_step(_run_plan())
@@ -683,8 +824,10 @@ class SupervisionStepServiceTests(unittest.TestCase):
             _send_plan(),
             submit_service=failed_submit,
         )
-        self.assertFalse(result.ok)
-        self.assertTrue(result.action_executed)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertFalse(result.blocked)
+        self.assertFalse(result.action_executed)
         self.assertEqual(result.reason_code, "submit_feedback_failed")
         self.assertEqual(len(submit.calls), CHATGPT_HANDOFF_MAX_UI_ATTEMPTS)
         self.assertEqual(
@@ -697,7 +840,9 @@ class SupervisionStepServiceTests(unittest.TestCase):
             _send_plan(),
             submit_service=exploding_submit,
         )
-        self.assertFalse(exception_result.ok)
+        self.assertTrue(exception_result.ok)
+        self.assertTrue(exception_result.waiting_for_chatgpt)
+        self.assertFalse(exception_result.blocked)
         self.assertEqual(exception_result.reason_code, "submit_feedback_exception")
         self.assertEqual(len(submit.calls), CHATGPT_HANDOFF_MAX_UI_ATTEMPTS)
 
@@ -732,10 +877,10 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertEqual(len(planner.calls), 1)
         self.assertEqual(len(capture.calls), 1)
         self.assertEqual(len(submit.calls), 0)
-        self.assertEqual(len(extract.calls), 1)
+        self.assertEqual(len(extract.calls), 0)
         self.assertEqual(len(run_prompt.calls), 0)
 
-    def test_successful_handoff_holds_one_lease_until_after_extraction(self) -> None:
+    def test_successful_handoff_holds_one_lease_through_send_and_capture(self) -> None:
         ledger = FakeLedger()
 
         def submit(*args, **kwargs):
@@ -765,7 +910,8 @@ class SupervisionStepServiceTests(unittest.TestCase):
         )
 
         self.assertTrue(result.ok)
-        self.assertEqual(result.next_state_hint, "ask_run_prompt")
+        self.assertEqual(result.next_state_hint, "extract_next_prompt")
+        self.assertNotIn("extract_prompt", ledger.operations)
         ordered = [
             op
             for op in ledger.operations
@@ -787,10 +933,10 @@ class SupervisionStepServiceTests(unittest.TestCase):
                 "read_only_destination_gate",
                 "submit_feedback",
                 "capture_response",
-                "extract_prompt",
                 "release_lease",
             ],
         )
+        self.assertNotIn("extract_prompt", ledger.operations)
 
     def test_submit_failure_retries_until_verified_submission(self) -> None:
         ledger = FakeLedger()
@@ -836,7 +982,7 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(len(submit_attempts), CHATGPT_HANDOFF_MAX_UI_ATTEMPTS)
         self.assertEqual(ledger.operations.count("capture_response"), 1)
-        self.assertEqual(ledger.operations.count("extract_prompt"), 1)
+        self.assertEqual(ledger.operations.count("extract_prompt"), 0)
         retry = result.metadata["chatgpt_handoff_retry"]
         self.assertEqual(retry["attempt_count"], CHATGPT_HANDOFF_MAX_UI_ATTEMPTS)
         self.assertTrue(retry["attempts"][-1]["ok"])
@@ -902,7 +1048,6 @@ class SupervisionStepServiceTests(unittest.TestCase):
                 "read_only_destination_gate",
                 "feedback_generation",
                 "submit_capture_extract",
-                "submit_capture_extract",
                 "release_lease",
             ],
         )
@@ -925,8 +1070,9 @@ class SupervisionStepServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
-        self.assertTrue(result.blocked)
+        self.assertTrue(result.ok)
+        self.assertFalse(result.blocked)
+        self.assertTrue(result.waiting_for_chatgpt)
         self.assertEqual(result.reason_code, "chatgpt_ui_lease_already_held")
         self.assertFalse(result.action_executed)
         self.assertEqual(len(submit.calls), 0)
@@ -952,17 +1098,18 @@ class SupervisionStepServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
-        self.assertTrue(result.blocked)
-        self.assertFalse(result.action_executed)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertFalse(result.blocked)
         self.assertEqual(result.reason_code, "project_not_active")
+        self.assertFalse(result.action_executed)
         self.assertEqual(len(submit.calls), 0)
         self.assertEqual(len(capture.calls), 0)
         self.assertEqual(len(extract.calls), 0)
         self.assertIn("release_lease", ledger.operations)
-        self.assertIn("status:needs_review", ledger.operations)
-        self.assertEqual(result.run_status, "needs_review")
-        self.assertEqual(ledger.run["status"], "needs_review")
+        self.assertIn("complete_handoff", ledger.operations)
+        self.assertNotIn("status:needs_review", ledger.operations)
+        self.assertNotEqual(result.run_status, "needs_review")
         blocked_events = [
             event
             for event in ledger.added_events
@@ -1017,7 +1164,8 @@ class SupervisionStepServiceTests(unittest.TestCase):
                     ledger=FakeLedger(),
                     destination_adapter_factory=_destination_adapter_factory(snapshot),
                 )
-                self.assertFalse(result.ok)
+                self.assertTrue(result.ok)
+                self.assertTrue(result.waiting_for_chatgpt)
                 self.assertEqual(result.reason_code, reason)
                 self.assertEqual(len(submit.calls), 0)
                 self.assertEqual(len(capture.calls), 0)
@@ -1034,7 +1182,8 @@ class SupervisionStepServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
         self.assertEqual(result.reason_code, "destination_binding_missing")
         self.assertEqual(adapter_calls, [])
         self.assertEqual(len(submit.calls), 0)
@@ -1061,7 +1210,8 @@ class SupervisionStepServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
         self.assertEqual(result.reason_code, "destination_binding_invalid")
         self.assertEqual(adapter_calls, [])
         self.assertEqual(len(submit.calls), 0)
@@ -1080,7 +1230,8 @@ class SupervisionStepServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
         self.assertEqual(result.reason_code, "destination_lease_invalid_or_mismatched")
         self.assertEqual(adapter_calls, [])
         self.assertEqual(len(submit.calls), 0)
@@ -1103,7 +1254,9 @@ class SupervisionStepServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertFalse(result.blocked)
         self.assertEqual(result.reason_code, "chatgpt_ui_lease_already_held")
         self.assertEqual(adapter_calls, [])
         self.assertEqual(len(submit.calls), 0)
@@ -1121,7 +1274,8 @@ class SupervisionStepServiceTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
         self.assertEqual(len(submit.calls), 0)
         self.assertEqual(len(capture.calls), 0)
         self.assertEqual(len(extract.calls), 0)
@@ -1203,31 +1357,27 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertIn("release_lease", ledger.operations)
         self.assertLess(ledger.operations.index("capture_response"), ledger.operations.index("release_lease"))
 
-    def test_extraction_failure_releases_lease(self) -> None:
+    def test_extraction_failure_does_not_acquire_chatgpt(self) -> None:
         ledger = FakeLedger()
-
-        def capture(*args, **kwargs):
-            del args, kwargs
-            ledger.operations.append("capture_response")
-            return ServiceResult(True)
 
         def extract(*args, **kwargs):
             del args, kwargs
             ledger.operations.append("extract_prompt")
             return ServiceResult(False, reason_code="extraction_failed", error_message="bad response")
 
-        result, _planner, ledger, submit, _capture, _extract, _run_prompt = self._run_step(
-            _capture_plan(),
+        result, _planner, ledger, submit, capture, _extract, _run_prompt = self._run_step(
+            _extract_plan(),
             ledger=ledger,
-            capture_service=capture,
             extraction_service=extract,
         )
 
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "extraction_failed")
         self.assertEqual(len(submit.calls), 0)
-        self.assertIn("release_lease", ledger.operations)
-        self.assertLess(ledger.operations.index("extract_prompt"), ledger.operations.index("release_lease"))
+        self.assertEqual(len(capture.calls), 0)
+        self.assertNotIn("acquire_lease", ledger.operations)
+        self.assertNotIn("enqueue_handoff", ledger.operations)
+        self.assertIn("extract_prompt", ledger.operations)
 
     def test_submit_exception_retries_then_releases_lease_without_crashing(self) -> None:
         ledger = FakeLedger()
@@ -1243,7 +1393,8 @@ class SupervisionStepServiceTests(unittest.TestCase):
             submit_service=submit,
         )
 
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
         self.assertEqual(result.reason_code, "submit_feedback_exception")
         self.assertEqual(
             [op for op in ledger.operations if op in {"acquire_lease", "submit_feedback", "release_lease"}],
@@ -1252,10 +1403,99 @@ class SupervisionStepServiceTests(unittest.TestCase):
             + ["release_lease"],
         )
 
+    def test_lease_wait_keeps_the_queue_claim(self) -> None:
+        ledger = FakeLedger(lease_already_held=True)
+        result, _planner, ledger, *_ = self._run_step(_send_plan(), ledger=ledger)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertNotIn("complete_handoff", ledger.operations)
+        self.assertNotIn("block_handoff", ledger.operations)
+        claimed = [
+            entry
+            for entry in ledger._handoff_entries
+            if entry["status"] == "claimed"
+        ]
+        self.assertEqual(len(claimed), 1)
+
+    def test_uncertain_submission_blocks_without_automatic_requeue(self) -> None:
+        submit = ActionRecorder(
+            result=ServiceResult(
+                False,
+                reason_code="chatgpt_submission_ambiguous",
+                event_type="gpt_feedback_submission_ambiguous",
+            )
+        )
+        result, _planner, ledger, submit, capture, extract, _run_prompt = self._run_step(
+            _send_plan(),
+            submit_service=submit,
+        )
+        self.assertFalse(result.ok)
+        self.assertTrue(result.blocked)
+        self.assertFalse(result.waiting_for_chatgpt)
+        self.assertEqual(len(submit.calls), 1)
+        self.assertEqual(len(capture.calls), 0)
+        self.assertIn("block_handoff", ledger.operations)
+        self.assertNotIn("complete_handoff", ledger.operations)
+        self.assertEqual(
+            [entry["status"] for entry in ledger._handoff_entries],
+            ["blocked"],
+        )
+
+    def test_machine_mutex_contention_is_wait_and_keeps_the_claim(self) -> None:
+        class HeldMutex:
+            def acquire(self, owning_run_id, *, controller_instance_id=None):
+                del owning_run_id, controller_instance_id
+                return ChatGPTDesktopMutexHold(
+                    ok=False,
+                    reason_code="chatgpt_desktop_mutex_already_held",
+                    error_message="ChatGPT Desktop is owned by another live process.",
+                    owner_is_live=True,
+                )
+
+        ledger = FakeLedger()
+        result, _planner, ledger, submit, capture, extract, _run_prompt = self._run_step(
+            _send_plan(),
+            ledger=ledger,
+            desktop_mutex=HeldMutex(),
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertFalse(result.blocked)
+        self.assertEqual(result.reason_code, "chatgpt_desktop_mutex_already_held")
+        self.assertEqual(len(submit.calls), 0)
+        self.assertEqual(len(capture.calls), 0)
+        self.assertEqual(len(extract.calls), 0)
+        self.assertNotIn("acquire_lease", ledger.operations)
+        self.assertNotIn("complete_handoff", ledger.operations)
+        self.assertEqual(
+            [entry["status"] for entry in ledger._handoff_entries],
+            ["claimed"],
+        )
+
+    def test_extract_only_never_acquires_the_machine_mutex(self) -> None:
+        class RecordingMutex:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def acquire(self, owning_run_id, *, controller_instance_id=None):
+                del controller_instance_id
+                self.calls.append(owning_run_id)
+                raise AssertionError("extract must not acquire ChatGPT")
+
+        mutex = RecordingMutex()
+        result, _planner, ledger, submit, capture, extract, _run_prompt = self._run_step(
+            _extract_plan(),
+            desktop_mutex=mutex,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(mutex.calls, [])
+        self.assertEqual(len(extract.calls), 1)
+        self.assertNotIn("acquire_lease", ledger.operations)
+        self.assertNotIn("enqueue_handoff", ledger.operations)
+
     def test_release_failure_is_surfaced_without_forced_takeover(self) -> None:
         ledger = FakeLedger(release_fails=True)
 
-        result, _planner, ledger, *_ = self._run_step(_extract_plan(), ledger=ledger)
+        result, _planner, ledger, *_ = self._run_step(_send_plan(), ledger=ledger)
 
         self.assertTrue(result.ok)
         self.assertEqual(
@@ -1271,7 +1511,7 @@ class SupervisionStepServiceTests(unittest.TestCase):
     def test_no_lease_timeout_or_deadline_operation_is_added(self) -> None:
         ledger = FakeLedger()
 
-        result, _planner, ledger, *_ = self._run_step(_extract_plan(), ledger=ledger)
+        result, _planner, ledger, *_ = self._run_step(_send_plan(), ledger=ledger)
 
         self.assertTrue(result.ok)
         forbidden = ("timeout", "deadline", "expires", "heartbeat", "takeover")
@@ -1322,6 +1562,7 @@ class NavigationBeforeGateTests(unittest.TestCase):
             extraction_service=extract,
             extracted_prompt_execution_service=run_prompt,
             destination_adapter_factory=destination_adapter_factory,
+            desktop_mutex=kwargs.pop("desktop_mutex", NullChatGPTDesktopMutex()),
             **kwargs,
         )
         return result, ledger, submit, capture, extract, run_prompt
@@ -1344,7 +1585,8 @@ class NavigationBeforeGateTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
         self.assertEqual(result.reason_code, "project_not_active")
         self.assertEqual(len(nav.calls), 0)
         self.assertEqual(len(submit.calls), 0)
@@ -1395,7 +1637,7 @@ class NavigationBeforeGateTests(unittest.TestCase):
             ordered,
             ["acquire_lease", "navigate", "read_only_destination_gate", "submit", "release_lease"],
         )
-        self.assertEqual(self._phase_event(ledger)["metadata"]["handoff_phase"], "continuation_started")
+        self.assertEqual(self._phase_event(ledger)["metadata"]["handoff_phase"], "capture_started")
 
     def test_navigation_failure_retries_until_destination_opens(self) -> None:
         ledger = FakeLedger()
@@ -1446,7 +1688,7 @@ class NavigationBeforeGateTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(len(nav_calls), CHATGPT_HANDOFF_MAX_UI_ATTEMPTS)
         self.assertEqual(ledger.operations.count("submit"), 1)
-        self.assertEqual(self._phase_event(ledger)["metadata"]["handoff_phase"], "continuation_started")
+        self.assertEqual(self._phase_event(ledger)["metadata"]["handoff_phase"], "capture_started")
 
     def test_navigation_failure_blocks_before_gate_and_releases_lease(self) -> None:
         ledger = FakeLedger()
@@ -1472,10 +1714,11 @@ class NavigationBeforeGateTests(unittest.TestCase):
             extraction_service=extract,
         )
 
-        self.assertFalse(result.ok)
-        self.assertTrue(result.blocked)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertFalse(result.blocked)
         self.assertEqual(result.reason_code, "destination_navigation_incomplete")
-        self.assertEqual(result.run_status, "needs_review")
+        self.assertNotEqual(result.run_status, "needs_review")
         self.assertEqual(len(nav.calls), CHATGPT_HANDOFF_MAX_UI_ATTEMPTS)
         self.assertEqual(len(submit.calls), 0)
         self.assertEqual(len(capture.calls), 0)
@@ -1537,10 +1780,11 @@ class NavigationBeforeGateTests(unittest.TestCase):
             ),
         )
 
-        self.assertFalse(result.ok)
-        self.assertTrue(result.blocked)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertFalse(result.blocked)
         self.assertEqual(result.reason_code, "chat_not_active")
-        self.assertEqual(result.run_status, "needs_review")
+        self.assertNotEqual(result.run_status, "needs_review")
         self.assertEqual(len(nav.calls), 2)
         self.assertEqual(len(submit.calls), 0)
         self.assertEqual(len(capture.calls), 0)
@@ -1679,10 +1923,10 @@ class NavigationBeforeGateTests(unittest.TestCase):
             if op in {"navigate", "read_only_destination_gate", "submit", "capture", "extract"}
         ]
         self.assertEqual(
-            ordered, ["navigate", "read_only_destination_gate", "submit", "capture", "extract"]
+            ordered, ["navigate", "read_only_destination_gate", "submit", "capture"]
         )
         phase = self._phase_event(ledger)["metadata"]
-        self.assertEqual(phase["handoff_phase"], "continuation_started")
+        self.assertEqual(phase["handoff_phase"], "capture_started")
         self.assertFalse(phase["navigation"]["navigator_confirmed"])
         self.assertTrue(phase["navigation"]["action_posted"])
 
@@ -1712,10 +1956,11 @@ class NavigationBeforeGateTests(unittest.TestCase):
             submit_service=submit,
         )
 
-        self.assertFalse(result.ok)
-        self.assertTrue(result.blocked)
+        self.assertTrue(result.ok)
+        self.assertTrue(result.waiting_for_chatgpt)
+        self.assertFalse(result.blocked)
         self.assertEqual(result.reason_code, "destination_verification_unavailable")
-        self.assertEqual(result.run_status, "needs_review")
+        self.assertNotEqual(result.run_status, "needs_review")
         self.assertEqual(len(submit.calls), 0)
         self.assertEqual(len(capture.calls), 0)
         self.assertEqual(len(extract.calls), 0)

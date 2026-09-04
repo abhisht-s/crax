@@ -520,6 +520,26 @@ class RunDestinationBindingServiceTests(unittest.TestCase):
                 self.assertEqual(ledger.destination_bind_calls, [])
                 self.assertEqual(ledger.events, [])
 
+    def test_comma_in_project_or_chat_title_is_rejected_at_bind_time(self) -> None:
+        cases = [
+            ("Proj,ect", "Chat", "project_title must not contain a comma"),
+            ("Project", "Cha,t", "chat_title must not contain a comma"),
+        ]
+        for project_title, chat_title, message in cases:
+            with self.subTest(project_title=project_title, chat_title=chat_title):
+                ledger = FakeCreateRunLedger()
+                result = bind_run_destination(
+                    "run-1",
+                    project_title,
+                    chat_title,
+                    ledger=ledger,
+                )
+                self.assertFalse(result.ok)
+                self.assertEqual(result.reason_code, "invalid_destination")
+                self.assertEqual(result.error_message, message)
+                self.assertEqual(ledger.destination_bind_calls, [])
+                self.assertEqual(ledger.events, [])
+
     def test_first_bind_writes_exactly_one_durable_binding_event(self) -> None:
         ledger = self._ledger_with_run()
 

@@ -1,17 +1,36 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 import uuid
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.codex_invocation import (
+    InvocationArtifactPaths,
+    artifact_paths_for,
+    build_intent_payload,
+    classify_invocation,
+    disk_invocation_ids,
+    identity_matches_live_process,
+    read_json_file,
+    result_from_artifacts,
+    spawn_invocation_wrapper,
+    tail_stdout_and_wait,
+    terminate_verified_identity,
+    write_cancel_marker,
+    write_intent,
+)
 from agent.ledger import ALLOWED_CODEX_MODEL_SELECTIONS, CODEX_DEFAULT_SELECTION
 
 ALLOWED_CODEX_SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
@@ -19,8 +38,18 @@ CODEX_JSON_PROGRESS_SOURCE = "codex_cli_jsonl"
 CODEX_PROGRESS_TITLE_LIMIT = 240
 CODEX_PROGRESS_SUMMARY_LIMIT = 1000
 CODEX_PROGRESS_METADATA_TEXT_LIMIT = 500
-_ACTIVE_CODEX_PROCESSES: dict[str, subprocess.Popen] = {}
+@dataclass
+class ActiveCodexInvocation:
+    run_id: str
+    invocation_id: str
+    process: subprocess.Popen
+    paths: InvocationArtifactPaths
+
+
+_ACTIVE_CODEX_PROCESSES: dict[str, ActiveCodexInvocation] = {}
 _ACTIVE_CODEX_PROCESSES_LOCK = threading.Lock()
+_SHUTDOWN_LOCK = threading.Lock()
+_SHUTDOWN_HANDLERS_INSTALLED = False
 
 
 def _utc_now() -> str:
@@ -458,6 +487,96 @@ def run_command(
         }
 
 
+def _register_active_invocation(active: ActiveCodexInvocation) -> None:
+    with _ACTIVE_CODEX_PROCESSES_LOCK:
+        _ACTIVE_CODEX_PROCESSES[active.run_id] = active
+
+
+def _forget_active_invocation(active: ActiveCodexInvocation | None) -> None:
+    if active is None:
+        return
+    with _ACTIVE_CODEX_PROCESSES_LOCK:
+        current = _ACTIVE_CODEX_PROCESSES.get(active.run_id)
+        if current is active:
+            _ACTIVE_CODEX_PROCESSES.pop(active.run_id, None)
+
+
+def _terminate_popen_group(
+    process: subprocess.Popen,
+    *,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    if process.poll() is not None:
+        return {
+            "terminated": True,
+            "reason_code": "codex_process_terminated",
+            "exit_code": process.returncode,
+        }
+    pid = process.pid
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        process.terminate()
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        process.wait(timeout=timeout_seconds)
+    return {
+        "terminated": True,
+        "reason_code": "codex_process_terminated",
+        "exit_code": process.returncode,
+    }
+
+
+def _install_main_thread_shutdown_handlers() -> None:
+    global _SHUTDOWN_HANDLERS_INSTALLED
+    with _SHUTDOWN_LOCK:
+        if _SHUTDOWN_HANDLERS_INSTALLED:
+            return
+        try:
+            previous_int = signal.getsignal(signal.SIGINT)
+            previous_term = signal.getsignal(signal.SIGTERM)
+        except ValueError:
+            return
+
+        def handler(signum: int, frame: object) -> None:
+            terminate_all_active_codex_invocations(source="signal")
+            if signum == signal.SIGINT:
+                if callable(previous_int) and previous_int not in (
+                    signal.SIG_DFL,
+                    signal.SIG_IGN,
+                    handler,
+                ):
+                    previous_int(signum, frame)
+                raise KeyboardInterrupt
+            if callable(previous_term) and previous_term not in (
+                signal.SIG_DFL,
+                signal.SIG_IGN,
+                handler,
+            ):
+                previous_term(signum, frame)
+            raise SystemExit(128 + int(signum))
+
+        try:
+            signal.signal(signal.SIGINT, handler)
+            signal.signal(signal.SIGTERM, handler)
+        except ValueError:
+            return
+        _SHUTDOWN_HANDLERS_INSTALLED = True
+
+
+def install_codex_shutdown_handlers() -> None:
+    _install_main_thread_shutdown_handlers()
+
+
 def run_json_streaming_command(
     command: list[str],
     cwd: str | None = None,
@@ -466,63 +585,84 @@ def run_json_streaming_command(
     process_metadata: dict[str, object] | None = None,
 ) -> dict:
     started_at = _utc_now()
-    stdout_parts: list[str] = []
-    metadata = process_metadata or {}
-    process_key = str(metadata.get("run_id") or "").strip() or None
-    process: subprocess.Popen | None = None
-
+    metadata = dict(process_metadata or {})
+    run_id = str(metadata.get("run_id") or "").strip() or "unscoped-run"
+    invocation_id = str(metadata.get("codex_invocation_id") or "").strip()
+    if not invocation_id:
+        invocation_id = f"codex-invocation-{uuid.uuid4().hex}"
+        metadata["codex_invocation_id"] = invocation_id
+    paths = artifact_paths_for(
+        run_id,
+        invocation_id,
+        artifact_dir=metadata.get("artifact_dir"),  # type: ignore[arg-type]
+    )
+    intent = build_intent_payload(
+        run_id=run_id,
+        invocation_id=invocation_id,
+        prompt=str(metadata.get("prompt") or (command[-1] if command else "")),
+        repo_path=str(metadata.get("repo_path") or cwd or ""),
+        cwd=str(cwd or metadata.get("repo_path") or ""),
+        sandbox=str(metadata.get("sandbox") or ""),
+        model=str(metadata["model"]) if metadata.get("model") is not None else None,
+        command=command,
+        json_mode=True,
+        paths=paths,
+        extraction_event_id=(
+            int(metadata["extraction_event_id"])
+            if isinstance(metadata.get("extraction_event_id"), int)
+            else None
+        ),
+        extraction_prompt_sha256=(
+            str(metadata["extraction_prompt_sha256"])
+            if metadata.get("extraction_prompt_sha256")
+            else None
+        ),
+    )
+    write_intent(paths, intent)
+    active: ActiveCodexInvocation | None = None
+    _install_main_thread_shutdown_handlers()
     try:
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr_file:
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                stdout=subprocess.PIPE,
-                stderr=stderr_file,
-                text=True,
-                bufsize=1,
-            )
-            if process_key is not None:
-                with _ACTIVE_CODEX_PROCESSES_LOCK:
-                    _ACTIVE_CODEX_PROCESSES[process_key] = process
-            _emit_progress(
-                progress_callback,
-                _progress_event(
-                    kind="process_started",
-                    status="running",
-                    title="Codex process started",
-                    summary="Codex exec started with JSONL progress enabled.",
-                    metadata={
-                        **metadata,
-                        "pid": getattr(process, "pid", None),
-                        "command": _command_summary(command[:-1]),
-                        "json_streaming": True,
-                    },
-                ),
-            )
-            stdout_stream = process.stdout
-            if stdout_stream is not None:
-                for raw_line in stdout_stream:
-                    line = _decode_output(raw_line)
-                    stdout_parts.append(line)
-                    if line.strip():
-                        _emit_progress(
-                            progress_callback,
-                            normalize_codex_jsonl_event(line),
-                        )
-            exit_code = process.wait()
-            stderr_file.seek(0)
-            stderr_text = stderr_file.read()
-        stdout_text = "".join(stdout_parts)
-        return {
-            "command": command,
-            "cwd": cwd,
-            "exit_code": exit_code,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "timed_out": False,
-            "started_at": started_at,
-            "finished_at": _utc_now(),
-        }
+        process = spawn_invocation_wrapper(paths)
+        active = ActiveCodexInvocation(
+            run_id=run_id,
+            invocation_id=invocation_id,
+            process=process,
+            paths=paths,
+        )
+        _register_active_invocation(active)
+        _emit_progress(
+            progress_callback,
+            _progress_event(
+                kind="process_started",
+                status="running",
+                title="Codex process started",
+                summary="Codex exec started with JSONL progress enabled.",
+                metadata={
+                    **metadata,
+                    "pid": getattr(process, "pid", None),
+                    "command": _command_summary(command[:-1]),
+                    "json_streaming": True,
+                    **paths.as_dict(),
+                },
+            ),
+        )
+
+        def on_line(line: str) -> None:
+            _emit_progress(progress_callback, normalize_codex_jsonl_event(line))
+
+        observation = tail_stdout_and_wait(
+            paths=paths,
+            wrapper=process,
+            invocation_id=invocation_id,
+            progress_callback=on_line,
+        )
+        return result_from_artifacts(
+            paths=paths,
+            command=command,
+            cwd=cwd or "",
+            started_at=started_at,
+            observation=observation,
+        )
     except FileNotFoundError as error:
         _emit_progress(
             progress_callback,
@@ -542,45 +682,90 @@ def run_json_streaming_command(
             "command": command,
             "cwd": cwd,
             "exit_code": 127,
-            "stdout": "".join(stdout_parts),
+            "stdout": "",
             "stderr": f"{error}\n",
             "timed_out": False,
             "started_at": started_at,
             "finished_at": _utc_now(),
         }
+    except KeyboardInterrupt:
+        if active is not None:
+            write_cancel_marker(
+                active.paths,
+                invocation_id=active.invocation_id,
+                source="signal",
+            )
+            with suppress(OSError, subprocess.SubprocessError):
+                _terminate_popen_group(active.process, timeout_seconds=2.0)
+        raise
     finally:
-        if process_key is not None and process is not None:
-            with _ACTIVE_CODEX_PROCESSES_LOCK:
-                if _ACTIVE_CODEX_PROCESSES.get(process_key) is process:
-                    _ACTIVE_CODEX_PROCESSES.pop(process_key, None)
+        _forget_active_invocation(active)
 
 
-def terminate_codex_run(run_id: str, *, timeout_seconds: float = 2.0) -> dict[str, object]:
+def terminate_codex_run(
+    run_id: str,
+    *,
+    timeout_seconds: float = 2.0,
+    source: str = "operator_cancel",
+) -> dict[str, object]:
     with _ACTIVE_CODEX_PROCESSES_LOCK:
-        process = _ACTIVE_CODEX_PROCESSES.get(run_id)
-    if process is None or process.poll() is not None:
+        active = _ACTIVE_CODEX_PROCESSES.get(run_id)
+    if active is not None and active.process.poll() is None:
+        write_cancel_marker(
+            active.paths,
+            invocation_id=active.invocation_id,
+            source=source,
+        )
+        try:
+            return _terminate_popen_group(active.process, timeout_seconds=timeout_seconds)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {
+                "terminated": False,
+                "reason_code": "codex_process_termination_failed",
+                "error_message": str(exc),
+            }
+
+    invocation_ids = disk_invocation_ids(run_id)
+    if not invocation_ids:
         return {
             "terminated": False,
             "reason_code": "codex_process_not_running",
         }
-    try:
-        process.terminate()
-        try:
-            process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=timeout_seconds)
-        return {
-            "terminated": True,
-            "reason_code": "codex_process_terminated",
-            "exit_code": process.returncode,
-        }
-    except (OSError, subprocess.SubprocessError) as exc:
+    classified = classify_invocation(run_id, invocation_ids[-1])
+    identity = classified.identity
+    if identity is None or not identity_matches_live_process(identity):
         return {
             "terminated": False,
-            "reason_code": "codex_process_termination_failed",
-            "error_message": str(exc),
+            "reason_code": "codex_process_not_running",
         }
+    return terminate_verified_identity(
+        identity,
+        timeout_seconds=timeout_seconds,
+        cancel_paths=classified.paths,
+        source=source,
+    )
+
+
+def terminate_all_active_codex_invocations(
+    *,
+    timeout_seconds: float = 2.0,
+    source: str = "shutdown",
+) -> list[dict[str, object]]:
+    with _ACTIVE_CODEX_PROCESSES_LOCK:
+        actives = list(_ACTIVE_CODEX_PROCESSES.values())
+    results: list[dict[str, object]] = []
+    for active in actives:
+        results.append(
+            terminate_codex_run(
+                active.run_id,
+                timeout_seconds=timeout_seconds,
+                source=source,
+            )
+        )
+    return results
+
+
+atexit.register(lambda: terminate_all_active_codex_invocations(source="atexit"))
 
 
 def run_codex_exec(
@@ -595,18 +780,32 @@ def run_codex_exec(
     json_stream: bool = False,
     codex_invocation_id: str | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    artifact_dir: str | Path | None = None,
+    extraction_event_id: int | None = None,
+    extraction_prompt_sha256: str | None = None,
 ) -> dict:
+    del timeout_seconds
     codex_path = shutil.which("codex")
     if repo_path is None:
         repo_path = cwd if cwd is not None else Path.cwd()
 
     resolved_repo_path = Path(repo_path).expanduser().resolve(strict=False)
     resolved_repo_path_text = str(resolved_repo_path)
-    resolved_final_message_path = (
-        Path(final_message_path).expanduser().resolve(strict=False)
-        if final_message_path is not None
-        else _default_final_message_path(run_id)
-    )
+    durable_paths = None
+    if json_stream:
+        if not codex_invocation_id:
+            codex_invocation_id = f"codex-invocation-{uuid.uuid4().hex}"
+        durable_paths = artifact_paths_for(
+            run_id or "unscoped-run",
+            codex_invocation_id,
+            artifact_dir=artifact_dir,
+        )
+    if final_message_path is not None:
+        resolved_final_message_path = Path(final_message_path).expanduser().resolve(strict=False)
+    elif durable_paths is not None:
+        resolved_final_message_path = durable_paths.final_message_path
+    else:
+        resolved_final_message_path = _default_final_message_path(run_id)
     model_text = CODEX_DEFAULT_SELECTION if model is None else str(model).strip()
     command = [
         "codex",
@@ -775,6 +974,12 @@ def run_codex_exec(
         "codex_invocation_id": codex_invocation_id,
         "final_message_path": str(resolved_final_message_path),
     }
+    if durable_paths is not None:
+        process_metadata["artifact_dir"] = str(durable_paths.artifact_dir)
+    if extraction_event_id is not None:
+        process_metadata["extraction_event_id"] = extraction_event_id
+    if extraction_prompt_sha256 is not None:
+        process_metadata["extraction_prompt_sha256"] = extraction_prompt_sha256
     if json_stream:
         result = run_json_streaming_command(
             command,
@@ -835,6 +1040,106 @@ def run_codex_exec(
         **result,
         **final_message,
     }
+
+
+def observe_existing_codex_invocation(
+    classification,
+    *,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
+    wrapper: subprocess.Popen | None = None,
+) -> dict:
+    intent = classification.intent or {}
+    command = intent.get("command") if isinstance(intent.get("command"), list) else []
+    cwd = str(intent.get("cwd") or "")
+    started_at = str(intent.get("created_at") or _utc_now())
+    metadata = {
+        "run_id": classification.run_id,
+        "repo_path": intent.get("repo_path"),
+        "sandbox": intent.get("sandbox"),
+        "model": intent.get("model"),
+        "codex_invocation_id": classification.invocation_id,
+        "final_message_path": str(classification.paths.final_message_path),
+        **classification.paths.as_dict(),
+    }
+    _install_main_thread_shutdown_handlers()
+    active = None
+    if wrapper is not None:
+        active = ActiveCodexInvocation(
+            run_id=classification.run_id,
+            invocation_id=classification.invocation_id,
+            process=wrapper,
+            paths=classification.paths,
+        )
+        _register_active_invocation(active)
+    try:
+        def on_line(line: str) -> None:
+            _emit_progress(progress_callback, normalize_codex_jsonl_event(line))
+
+        observation = tail_stdout_and_wait(
+            paths=classification.paths,
+            wrapper=wrapper,
+            invocation_id=classification.invocation_id,
+            progress_callback=on_line,
+        )
+        result = result_from_artifacts(
+            paths=classification.paths,
+            command=command if isinstance(command, list) else [],
+            cwd=cwd,
+            started_at=started_at,
+            observation=observation,
+        )
+        final_message = _final_message_artifact_result(classification.paths.final_message_path)
+        final_status = str(final_message.get("final_message_status") or "")
+        _emit_progress(
+            progress_callback,
+            _progress_event(
+                kind="final_message_available",
+                status="available" if final_status == "valid" else final_status or "unavailable",
+                title="Final message available" if final_status == "valid" else "Final message unavailable",
+                summary="Codex final assistant message was read from the final-message artifact.",
+                metadata={
+                    **metadata,
+                    "final_message_status": final_status,
+                    "final_message_length": int(final_message.get("final_message_length") or 0),
+                    "final_message_error": final_message.get("final_message_error"),
+                },
+            ),
+        )
+        stdout_text = str(result.get("stdout") or "")
+        stderr_text = str(result.get("stderr") or "")
+        _emit_progress(
+            progress_callback,
+            _progress_event(
+                kind="process_exited",
+                status="completed" if result.get("exit_code") == 0 else "failed",
+                title="Codex process exited",
+                summary="Codex exec process exited.",
+                metadata={
+                    **metadata,
+                    "exit_code": result.get("exit_code"),
+                    "timed_out": bool(result.get("timed_out")),
+                    "stdout_length": len(stdout_text),
+                    "stdout_sha256": _sha256_text(stdout_text),
+                    "stderr_length": len(stderr_text),
+                    "stderr_sha256": _sha256_text(stderr_text),
+                },
+            ),
+        )
+        return {
+            "mode": "exec",
+            "found": True,
+            "codex_path": shutil.which("codex"),
+            "prompt": str(intent.get("prompt") or ""),
+            "repo_path": str(intent.get("repo_path") or cwd),
+            "sandbox": str(intent.get("sandbox") or ""),
+            "codex_invocation_id": classification.invocation_id,
+            "json_stream": True,
+            "validation_error": None,
+            **result,
+            **final_message,
+        }
+    finally:
+        _forget_active_invocation(active)
 
 
 def check_codex_environment(timeout_seconds: float | None = None) -> dict:

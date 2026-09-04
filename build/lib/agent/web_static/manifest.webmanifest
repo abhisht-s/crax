@@ -1,0 +1,17 @@
+{
+  "name": "CRAX Remote Dashboard",
+  "short_name": "CRAX",
+  "description": "Private remote control for the CRAX supervised coding loop.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#181818",
+  "theme_color": "#181818",
+  "icons": [
+    {
+      "src": "/assets/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

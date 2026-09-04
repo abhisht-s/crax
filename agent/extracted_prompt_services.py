@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import ledger as default_ledger
+from agent.codex_invocation import STATUS_COMPLETE, STATUS_LIVE, event_metadata, latest_open_invocation
+from agent.codex_services import execute_codex_direct_service
 from agent.codex_terminal import ALLOWED_CODEX_SANDBOXES
 from agent.continuation_policy import can_continue_run
 from agent.prompt_contract import parse_prompt_contract
@@ -153,6 +155,68 @@ def _failure(
         metadata=metadata or {},
         persisted=False,
         selection=None,
+    )
+
+
+def _unpaired_extracted_run_started(events: list[dict]) -> dict | None:
+    for event in reversed(events):
+        if event.get("event_type") != "extracted_codex_prompt_run_started":
+            continue
+        started_id = _event_id_or_negative(event)
+        metadata = event_metadata(event)
+        extraction_event_id = metadata.get("extraction_event_id")
+        prompt_sha = metadata.get("prompt_sha256")
+        for candidate in events:
+            if candidate.get("event_type") != "extracted_codex_prompt_run_finished":
+                continue
+            finished_id = _event_id_or_negative(candidate)
+            if finished_id <= started_id:
+                continue
+            finished_metadata = event_metadata(candidate)
+            if (
+                finished_metadata.get("extraction_event_id") == extraction_event_id
+                and finished_metadata.get("prompt_sha256") == prompt_sha
+            ):
+                return None
+        return event
+    return None
+
+
+def _codex_finished_after(events: list[dict], after_event_id: int) -> dict | None:
+    latest = None
+    for event in events:
+        if event.get("event_type") != "codex_exec_finished":
+            continue
+        if _event_id_or_negative(event) <= after_event_id:
+            continue
+        latest = event
+    return latest
+
+
+def _repair_extracted_run_finished(
+    event_ledger: Any,
+    run_id: str,
+    started_event: dict[str, Any],
+    finished_codex: dict[str, Any],
+    *,
+    events_written: list[dict[str, Any]],
+) -> int | None:
+    selection_metadata = event_metadata(started_event)
+    raw_result = event_metadata(finished_codex)
+    return _record_wrapper_event(
+        event_ledger,
+        events_written,
+        run_id,
+        "extracted_codex_prompt_run_finished",
+        "Finished extracted Codex prompt execution.",
+        {
+            **selection_metadata,
+            "exit_code": raw_result.get("exit_code"),
+            "timed_out": raw_result.get("timed_out"),
+            "status": selection_metadata.get("status"),
+            "repaired": True,
+            "codex_invocation_id": raw_result.get("codex_invocation_id"),
+        },
     )
 
 
@@ -343,6 +407,75 @@ def execute_extracted_codex_prompt_service(
         )
 
     events = ledger.list_events(run_id)
+    unpaired_started = _unpaired_extracted_run_started(events)
+    if unpaired_started is not None:
+        started_id = _event_id_or_negative(unpaired_started)
+        started_metadata = event_metadata(unpaired_started)
+        finished_codex = _codex_finished_after(events, started_id)
+        if finished_codex is None:
+            open_item = latest_open_invocation(run_id, events=events)
+            if open_item is not None and open_item.status in {STATUS_LIVE, STATUS_COMPLETE}:
+                execute_codex_direct_service(
+                    run_id,
+                    str(started_metadata.get("prompt") or started_metadata.get("prompt_text") or ""),
+                    str(started_metadata.get("repo_path") or repo_path_text),
+                    str(started_metadata.get("sandbox") or sandbox),
+                    None,
+                    started_metadata.get("prompt_contract")
+                    if isinstance(started_metadata.get("prompt_contract"), dict)
+                    else {},
+                    ledger=ledger,
+                )
+                events = ledger.list_events(run_id)
+                finished_codex = _codex_finished_after(events, started_id)
+        if finished_codex is not None:
+            events_written: list[dict[str, Any]] = []
+            finished_event_id = _repair_extracted_run_finished(
+                ledger,
+                run_id,
+                unpaired_started,
+                finished_codex,
+                events_written=events_written,
+            )
+            raw_result = event_metadata(finished_codex)
+            return ExtractedCodexPromptExecutionResult(
+                ok=raw_result.get("exit_code") == 0,
+                run_id=run_id,
+                reason_code="extracted_codex_prompt_run_completed"
+                if raw_result.get("exit_code") == 0
+                else "extracted_codex_prompt_run_failed",
+                error_message=None,
+                selected_event_id=_event_id(started_metadata.get("extraction_event_id")),
+                selected_prompt_text=None,
+                selected_prompt_sha256=started_metadata.get("prompt_sha256"),
+                selected_method=None,
+                source_capture_event_id=None,
+                source_response_sha256=None,
+                artifact_path=None,
+                artifact_status=None,
+                continuation_result=continuation,
+                workspace_write_pre_run_result=workspace_write_pre_run_policy,
+                sandbox=sandbox,
+                started_event_id=_event_id(unpaired_started),
+                finished_event_id=finished_event_id,
+                codex_flow_result=None,
+                exit_code=raw_result.get("exit_code") if isinstance(raw_result.get("exit_code"), int) else 0,
+                timed_out=bool(raw_result.get("timed_out")),
+                status=None,
+                events_written=events_written,
+                metadata={"repaired_extracted_wrapper_finished": True},
+                persisted=True,
+                selection=None,
+            )
+        return _failure(
+            run_id,
+            sandbox,
+            "codex_invocation_uncertain",
+            "An extracted Codex prompt run was started but Codex completion is unproven and will not be replayed.",
+            1,
+            continuation_result=continuation,
+            workspace_write_pre_run_result=workspace_write_pre_run_policy,
+        )
     if expected_extraction_event_id is None:
         selection = latest_extraction_selector(
             events,

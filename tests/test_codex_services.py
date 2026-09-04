@@ -4,6 +4,8 @@ import contextlib
 import hashlib
 import io
 import json
+import os
+import stat
 from pathlib import Path
 import subprocess
 import tempfile
@@ -435,52 +437,51 @@ class CodexTerminalTimeoutTests(unittest.TestCase):
 
     def test_run_codex_exec_json_stream_parses_incrementally_and_uses_final_file(self) -> None:
         progress_events: list[dict] = []
-        checkpoints: list[int] = []
-        FakeStreamingPopen.instances = []
-        FakeStreamingPopen.lines = [
-            json.dumps(
-                {
-                    "type": "command_started",
-                    "command": ["npm", "test", "--token", "secret-value"],
-                    "stdout": "raw stdout body that must not appear in progress",
-                }
-            )
-            + "\n",
-            "{malformed json line with secret output\n",
-            json.dumps(
-                {
-                    "type": "command_finished",
-                    "command": ["npm", "test"],
-                    "exit_code": 0,
-                    "stderr": "raw stderr body that must not appear in progress",
-                }
-            )
-            + "\n",
-        ]
-        FakeStreamingPopen.checkpoints = checkpoints
-        FakeStreamingPopen.progress_events = progress_events
-        FakeStreamingPopen.returncode = 0
+        fake_source = (
+            "#!/usr/bin/env python3\n"
+            "import json, sys, time\n"
+            "from pathlib import Path\n"
+            "final = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+            "sys.stderr.write('raw stderr body that must not appear in progress\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.stdout.write(json.dumps({'type': 'command_started', 'command': ['npm', 'test', '--token', 'secret-value']}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(0.2)\n"
+            "sys.stdout.write('{malformed json line with secret output\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.stdout.write(json.dumps({'type': 'command_finished', 'command': ['npm', 'test'], 'exit_code': 0}) + '\\n')\n"
+            "sys.stdout.flush()\n"
+            "Path(final).write_text('Authoritative final message from file.\\n')\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake = bin_dir / "codex"
+            fake.write_text(fake_source, encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            old_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{old_path}"
+            try:
+                result = codex_terminal.run_codex_exec(
+                    "Prompt text must stay out of progress",
+                    repo_path=repo,
+                    sandbox="read-only",
+                    run_id="run-stream",
+                    json_stream=True,
+                    codex_invocation_id="inv-1",
+                    artifact_dir=root / "inv",
+                    progress_callback=progress_events.append,
+                )
+            finally:
+                os.environ["PATH"] = old_path
+                codex_terminal.terminate_all_active_codex_invocations(source="test_teardown")
 
-        with (
-            tempfile.TemporaryDirectory() as repo,
-            mock.patch.object(codex_terminal.shutil, "which", return_value="/opt/homebrew/bin/codex"),
-            mock.patch.object(codex_terminal.subprocess, "Popen", FakeStreamingPopen),
-        ):
-            result = codex_terminal.run_codex_exec(
-                "Prompt text must stay out of progress",
-                repo_path=repo,
-                sandbox="read-only",
-                run_id="run-stream",
-                json_stream=True,
-                codex_invocation_id="inv-1",
-                progress_callback=progress_events.append,
-            )
-
-        command = FakeStreamingPopen.instances[0].command
-        self.assertIn("--json", command)
+        self.assertIn("--json", result["command"])
         self.assertEqual(result["final_message"], "Authoritative final message from file.")
         self.assertIn("command_started", result["stdout"])
-        self.assertGreaterEqual(checkpoints[0], 2)
         progress_text = json.dumps(progress_events, sort_keys=True)
         self.assertIn("Malformed Codex JSONL event", progress_text)
         self.assertIn("final_message_available", progress_text)

@@ -11,11 +11,13 @@ from unittest import mock
 from agent import ledger as ledger_module
 from agent.codex_services import execute_codex_direct_service
 from agent.local_controller import (
+    DEFAULT_MAX_ACTIVE_SESSIONS,
     LOCAL_CONTROLLER_ALLOWED_SANDBOXES,
     LOCAL_CONTROLLER_METADATA_VERSION,
     LOCAL_CONTROLLER_RUN_START_FAILED_EVENT_TYPE,
     LOCAL_CONTROLLER_RUN_STARTED_EVENT_TYPE,
     LOCAL_CONTROLLER_SOURCE,
+    ControllerSessionRuntime,
     InitialRunExecutionResult,
     LocalController,
     LocalControllerEventTimelineRow,
@@ -23,8 +25,11 @@ from agent.local_controller import (
     LocalControllerSession,
     StartRequestValidationResult,
     build_local_controller_read_model,
+    conversation_identity,
     create_pending_approval_snapshot,
     default_initial_run_executor,
+    destination_titles_contain_comma,
+    live_conversation_collision_run_id,
     start_local_controller_run,
     validate_local_controller_start_request,
 )
@@ -72,6 +77,7 @@ class FakeLedger:
             [int(event.get("id") or 0) for event in self.events if str(event.get("id") or "").isdigit()],
             default=0,
         ) + 1
+        self.controller_snapshot: dict | None = None
 
     def create_run(self, user_instruction: str) -> str:
         self.create_run_calls.append(user_instruction)
@@ -243,6 +249,14 @@ class FakeLedger:
             event_written=True,
         )
 
+    def save_local_controller_snapshot(self, snapshot: dict) -> None:
+        self.controller_snapshot = dict(snapshot)
+
+    def load_local_controller_snapshot(self) -> dict | None:
+        if self.controller_snapshot is None:
+            return None
+        return dict(self.controller_snapshot)
+
 
 class Planner:
     def __init__(self, plan: SupervisePlan) -> None:
@@ -263,6 +277,7 @@ class FakeStepResult:
     terminal: bool = False
     completed: bool = False
     blocked: bool = False
+    waiting_for_chatgpt: bool = False
     requires_human_approval: bool = False
     planner_action: str | None = "capture_gpt_response"
     planner_reason_code: str | None = "routine"
@@ -613,6 +628,14 @@ class LocalControllerValidationTests(unittest.TestCase):
                 ({"chat_title": "Chat"}, "destination_required"),
                 ({"project_title": " ", "chat_title": "Chat"}, "invalid_destination"),
                 ({"project_title": ["Project"], "chat_title": "Chat"}, "invalid_destination"),
+                (
+                    {"project_title": "Proj,ect", "chat_title": "Chat"},
+                    "invalid_destination",
+                ),
+                (
+                    {"project_title": "Project", "chat_title": "Cha,t"},
+                    "invalid_destination",
+                ),
             ):
                 with self.subTest(reason=reason, kwargs=kwargs):
                     result = validate_local_controller_start_request(
@@ -2319,6 +2342,56 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             extract.assert_not_called()
             self.assertEqual(len(initial.calls), 1)
 
+    def test_retry_initial_codex_refuses_uncertain_invocation(self) -> None:
+        failure = _event(
+            11,
+            "local_controller_action_failed",
+            {
+                "schema_version": 1,
+                "action_key": "initial_codex",
+                "reason_code": "codex_nonzero_exit",
+                "error_message": "failed",
+                "retry_classification": "retryable",
+                "retryable": True,
+                "recovery_message": "retry",
+                "run_status_before_action": "created",
+                "run_status_after_action": "failed",
+            },
+        )
+        started = _event(
+            5,
+            "codex_exec_started",
+            {
+                "codex_invocation_id": "inv-uncertain",
+                "prompt": "Initial task",
+                "sandbox": "read-only",
+            },
+        )
+        calls: list[dict] = []
+
+        def executor(**kwargs):
+            calls.append(kwargs)
+            return InitialRunExecutionResult(ok=True)
+
+        ledger = FakeLedger(_run(RunStatus.FAILED.value), [started, failure])
+        controller = LocalController(
+            session=LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="waiting_for_retry",
+            ),
+            ledger=ledger,
+            read_model_builder=lambda run_id, **kwargs: _model(sandbox="read-only"),
+            initial_run_executor=executor,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "agent.codex_invocation.default_runs_root",
+                return_value=Path(tmp),
+            ):
+                controller._retry_initial_codex("run-1", 11, failure["metadata"])
+        self.assertEqual(calls, [])
+        self.assertEqual(controller.session.controller_state, "blocked")
+
 
 class LocalControllerNavigationSettingTests(unittest.TestCase):
     def _controller(self, ledger: FakeLedger) -> LocalController:
@@ -2407,6 +2480,240 @@ class LocalControllerNavigationSettingTests(unittest.TestCase):
         self.assertEqual(
             model.latest_handoff_phase["navigation_outcome"], "chat_opened_via_axpress"
         )
+
+
+class SessionRegistryHelperTests(unittest.TestCase):
+    def test_conversation_identity_strips_and_keeps_interior_whitespace(self) -> None:
+        self.assertEqual(
+            conversation_identity("  craxii  ", " Dev Internal App "),
+            ("craxii", "Dev Internal App"),
+        )
+
+    def test_comma_titles_are_detected(self) -> None:
+        self.assertTrue(destination_titles_contain_comma("crax,ii", "Chat"))
+        self.assertTrue(destination_titles_contain_comma("Project", "Dev, Internal"))
+        self.assertFalse(destination_titles_contain_comma("craxii", "Dev Internal App"))
+
+    def test_same_chat_collides_same_project_different_chat_does_not(self) -> None:
+        live = [
+            ("run-a", "craxii", "Dev Internal App"),
+            ("run-b", "craxii", "Other Chat"),
+        ]
+        self.assertEqual(
+            live_conversation_collision_run_id(live, "craxii", "Dev Internal App"),
+            "run-a",
+        )
+        self.assertIsNone(
+            live_conversation_collision_run_id(live, "craxii", "Brand New Chat")
+        )
+        self.assertIsNone(
+            live_conversation_collision_run_id(live, "PTG Assistant", "Dev Internal App")
+        )
+
+    def test_same_repo_is_not_a_conversation_collision(self) -> None:
+        live = [("run-a", "craxii", "Chat A")]
+        self.assertIsNone(
+            live_conversation_collision_run_id(live, "craxii", "Chat B")
+        )
+
+
+class LocalControllerSessionRegistryTests(unittest.TestCase):
+    def test_default_max_active_sessions_is_one(self) -> None:
+        controller = LocalController(ledger=FakeLedger())
+        self.assertEqual(controller.max_active_sessions, DEFAULT_MAX_ACTIVE_SESSIONS)
+        self.assertEqual(controller.max_active_sessions, 1)
+
+    def test_start_registers_per_run_runtime_and_persists_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            executor = BlockingInitialExecutor()
+            ledger = FakeLedger()
+            controller = LocalController(ledger=ledger, initial_run_executor=executor)
+            result = controller.start_run(
+                repository_path=repo,
+                initial_instruction="Task",
+                project_title="craxii",
+                chat_title="Dev Internal App",
+                sandbox="read-only",
+            )
+            self.assertTrue(result.ok)
+            self.assertTrue(executor.entered.wait(1))
+            runtime = controller._sessions[result.run_id]
+            self.assertIsInstance(runtime, ControllerSessionRuntime)
+            self.assertEqual(runtime.run_id, result.run_id)
+            self.assertEqual(runtime.project_title, "craxii")
+            self.assertEqual(runtime.chat_title, "Dev Internal App")
+            self.assertEqual(runtime.repository_path, str(Path(repo).resolve(strict=False)))
+            self.assertEqual(runtime.sandbox, "read-only")
+            self.assertTrue(runtime.action_running)
+            snapshot = ledger.controller_snapshot
+            self.assertEqual(snapshot["schema_version"], 2)
+            self.assertEqual(snapshot["active_run_id"], result.run_id)
+            self.assertEqual(snapshot["max_active_sessions"], 1)
+            self.assertIn(result.run_id, snapshot["sessions"])
+            self.assertEqual(
+                snapshot["sessions"][result.run_id]["project_title"],
+                "craxii",
+            )
+            executor.release.set()
+            controller.current_worker.join(1)
+
+    def test_start_rejects_comma_titles_before_creating_a_run(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            ledger = FakeLedger()
+            controller = LocalController(ledger=ledger)
+            result = controller.start_run(
+                repository_path=repo,
+                initial_instruction="Task",
+                project_title="cra,xii",
+                chat_title="Chat",
+                sandbox="read-only",
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason_code, "invalid_destination")
+            self.assertIn("comma", result.error_message)
+            self.assertEqual(ledger.create_run_calls, [])
+            self.assertEqual(controller._sessions, {})
+
+    def test_cancel_and_retry_target_the_named_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            executor = BlockingInitialExecutor()
+            ledger = FakeLedger()
+            controller = LocalController(ledger=ledger, initial_run_executor=executor)
+            started = controller.start_run(
+                repository_path=repo,
+                initial_instruction="Task",
+                project_title="Project",
+                chat_title="Chat",
+                sandbox="read-only",
+            )
+            self.assertTrue(executor.entered.wait(1))
+            unknown = controller.request_cancel("run-missing")
+            self.assertFalse(unknown.ok)
+            self.assertEqual(unknown.reason_code, "no_active_run")
+            self.assertTrue(controller.action_running)
+            self.assertEqual(controller.session.controller_state, "starting_initial_codex")
+            cancelled = controller.request_cancel(started.run_id)
+            self.assertTrue(cancelled.ok)
+            self.assertEqual(cancelled.reason_code, "cancel_requested")
+            self.assertEqual(controller.session.controller_state, "blocked")
+            self.assertTrue(controller._sessions[started.run_id].cancel_requested.is_set())
+            executor.release.set()
+            controller.current_worker.join(1)
+
+    def test_old_snapshot_without_sessions_still_restores_one_runtime(self) -> None:
+        ledger = FakeLedger(_run(RunStatus.CREATED.value))
+        ledger.controller_snapshot = {
+            "active_run_id": "run-1",
+            "controller_state": "starting_initial_codex",
+            "pending_approval": None,
+        }
+        controller = LocalController(ledger=ledger)
+        self.assertEqual(controller.session.active_run_id, "run-1")
+        self.assertEqual(controller.session.controller_state, "blocked")
+        self.assertIn("run-1", controller._sessions)
+        self.assertEqual(controller._sessions["run-1"].controller_state, "blocked")
+
+
+class SequenceStepRecorder:
+    def __init__(self, *results: FakeStepResult) -> None:
+        self.results = list(results)
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        if not self.results:
+            raise AssertionError("step sequence is empty")
+        if len(self.results) == 1:
+            return self.results[0]
+        return self.results.pop(0)
+
+
+class ChatGPTLaneWaitTests(unittest.TestCase):
+    def test_lease_contention_waits_without_waiting_for_retry_or_busy_spin(self) -> None:
+        sleeps: list[float] = []
+        routine = _model(action="ask_send_to_gpt", routine=True, stage="routine_action_available")
+        completed = _model(
+            action="stop",
+            reason="extracted_prompt_already_run",
+            completed=True,
+            terminal=True,
+            stage="completed",
+        )
+        wait = FakeStepResult(
+            ok=True,
+            waiting_for_chatgpt=True,
+            blocked=False,
+            action_executed=False,
+            reason_code="chatgpt_ui_lease_already_held",
+            planner_action="ask_send_to_gpt",
+            next_state_hint="ask_send_to_gpt",
+        )
+        success = FakeStepResult(
+            ok=True,
+            waiting_for_chatgpt=False,
+            blocked=False,
+            planner_action="ask_send_to_gpt",
+            next_state_hint="extract_next_prompt",
+        )
+        step = SequenceStepRecorder(wait, wait, success)
+        controller = LocalController(
+            session=LocalControllerSession(active_run_id="run-1"),
+            ledger=FakeLedger(_run()),
+            read_model_builder=ReadModelSequence(
+                routine,
+                routine,
+                routine,
+                routine,
+                routine,
+                completed,
+                repeat_last=True,
+            ),
+            supervision_step=step,
+            chatgpt_wait_sleeper=sleeps.append,
+        )
+
+        controller.request_automatic_progress()
+        controller.current_worker.join(2)
+
+        self.assertGreaterEqual(len(step.calls), 3)
+        self.assertEqual(sleeps, [0.5, 1.0])
+        self.assertNotEqual(controller.session.controller_state, "waiting_for_retry")
+        self.assertEqual(controller.session.controller_state, "completed")
+        failure_events = [
+            event
+            for event in controller.ledger.added_events
+            if event["event_type"] == "local_controller_action_failed"
+        ]
+        self.assertEqual(failure_events, [])
+
+    def test_second_start_is_still_rejected_while_a_run_is_live(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            executor = BlockingInitialExecutor()
+            controller = LocalController(
+                ledger=FakeLedger(),
+                initial_run_executor=executor,
+            )
+            first = controller.start_run(
+                repository_path=repo,
+                initial_instruction="Task",
+                project_title="craxii",
+                chat_title="Dev Internal App",
+                sandbox="read-only",
+            )
+            self.assertTrue(executor.entered.wait(1))
+            second = controller.start_run(
+                repository_path=repo,
+                initial_instruction="Other",
+                project_title="craxii",
+                chat_title="Other Chat",
+                sandbox="read-only",
+            )
+            self.assertTrue(first.ok)
+            self.assertFalse(second.ok)
+            self.assertEqual(second.reason_code, "active_run_exists")
+            self.assertEqual(controller.max_active_sessions, 1)
+            executor.release.set()
+            controller.current_worker.join(1)
 
 
 if __name__ == "__main__":

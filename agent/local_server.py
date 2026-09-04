@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from agent.local_controller import LocalController, LocalControllerSession
+from agent.codex_terminal import install_codex_shutdown_handlers, terminate_all_active_codex_invocations
 from agent.repository_picker import RepositoryPickerResult, choose_repository_directory
 from agent.remote_access import (
     REMOTE_FULL_ACCESS_CONFIRMATION,
@@ -110,6 +111,7 @@ class LocalControllerServer:
             self.httpd = ThreadingHTTPServer((self.host, self.configured_port), handler_class)
             self._ensure_remote_pairing()
             self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+            install_codex_shutdown_handlers()
             self.thread.start()
 
     def serve_foreground(self) -> None:
@@ -119,12 +121,14 @@ class LocalControllerServer:
             handler_class = _make_handler(self)
             self.httpd = ThreadingHTTPServer((self.host, self.configured_port), handler_class)
             self._ensure_remote_pairing()
+        install_codex_shutdown_handlers()
         try:
             self.httpd.serve_forever()
         finally:
             self.shutdown()
 
     def shutdown(self) -> None:
+        terminate_all_active_codex_invocations(source="server_shutdown")
         with self._lifecycle_lock:
             httpd = self.httpd
             thread = self.thread

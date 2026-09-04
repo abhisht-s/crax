@@ -578,6 +578,8 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
             ),
             (_start_body(chat_title=" "), "invalid_destination", 400, "application/json"),
             (_start_body(project_title=[]), "invalid_destination", 400, "application/json"),
+            (_start_body(project_title="Proj,ect"), "invalid_destination", 400, "application/json"),
+            (_start_body(chat_title="Cha,t"), "invalid_destination", 400, "application/json"),
         ]
         for body, reason, status_code, content_type in cases:
             with self.subTest(reason=reason):
@@ -1005,6 +1007,8 @@ class LocalServerExecutionProfileContractTests(unittest.TestCase):
             ),
             (_start_body(project_title=" "), "invalid_destination"),
             (_start_body(chat_title=[]), "invalid_destination"),
+            (_start_body(project_title="Proj,ect"), "invalid_destination"),
+            (_start_body(chat_title="Cha,t"), "invalid_destination"),
         ):
             with self.subTest(reason=reason):
                 with self.assertRaises(local_server.LocalServerError) as raised:

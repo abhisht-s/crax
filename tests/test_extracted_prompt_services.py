@@ -539,6 +539,78 @@ class ExtractedPromptServiceTests(unittest.TestCase):
         self.assertEqual(result.selected_method, "labeled_fenced_code_block")
         self.assertEqual(len(coordinator.calls), 1)
 
+    def test_missing_extracted_wrapper_finished_is_repaired_without_codex_replay(self) -> None:
+        prompt = "Say exactly: extracted"
+        events = _events(prompt)
+        events.append(
+            {
+                "id": 4,
+                "event_type": "extracted_codex_prompt_run_started",
+                "metadata": {
+                    "extraction_event_id": 3,
+                    "prompt_sha256": _sha(prompt),
+                    "repo_path": tempfile.gettempdir(),
+                    "sandbox": "read-only",
+                },
+                "metadata_json": json.dumps(
+                    {
+                        "extraction_event_id": 3,
+                        "prompt_sha256": _sha(prompt),
+                        "repo_path": tempfile.gettempdir(),
+                        "sandbox": "read-only",
+                    }
+                ),
+            }
+        )
+        events.append(
+            {
+                "id": 5,
+                "event_type": "codex_exec_finished",
+                "metadata": {
+                    "codex_invocation_id": "inv-1",
+                    "exit_code": 0,
+                    "timed_out": False,
+                    "validation_error": None,
+                    "found": True,
+                },
+                "metadata_json": json.dumps(
+                    {
+                        "codex_invocation_id": "inv-1",
+                        "exit_code": 0,
+                        "timed_out": False,
+                        "validation_error": None,
+                        "found": True,
+                    }
+                ),
+            }
+        )
+        ledger = FakeLedger({"id": "run-1", "status": "completed"}, events)
+
+        def coordinator(*args, **kwargs):
+            raise AssertionError("Codex must not be replayed")
+
+        result = execute_extracted_codex_prompt_service(
+            "run-1",
+            ledger.run,
+            tempfile.gettempdir(),
+            "read-only",
+            None,
+            confirm_full_access=False,
+            allow_full_access=False,
+            approval_mode="human",
+            ledger=ledger,
+            codex_flow_coordinator=coordinator,
+        )
+        self.assertTrue(result.metadata.get("repaired_extracted_wrapper_finished"))
+        self.assertEqual(
+            [
+                event["event_type"]
+                for event in ledger.events
+                if "extracted_codex_prompt_run" in event["event_type"]
+            ],
+            ["extracted_codex_prompt_run_started", "extracted_codex_prompt_run_finished"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
