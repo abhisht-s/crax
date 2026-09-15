@@ -218,6 +218,8 @@ PROJECT_CHAT_OPEN_OUTCOMES = {
 }
 MAX_PROJECT_CHAT_SEARCH_CYCLES = 60
 MAX_PROJECT_CHAT_SEARCH_ELAPSED_SECONDS = 90.0
+PROJECT_CHAT_LIST_READINESS_TIMEOUT_SECONDS = 10.0
+PROJECT_CHAT_LIST_READINESS_POLL_INTERVAL_SECONDS = 0.2
 PROJECT_CHAT_FINAL_RE_RESOLUTION_MAX_RETRIES = 2
 PROJECT_CHAT_FINAL_RE_RESOLUTION_RETRY_DELAY_SECONDS = 1.0
 INITIAL_PROJECT_CHAT_HYDRATION_TIMEOUT_SECONDS = 2.0
@@ -4834,7 +4836,13 @@ def open_chatgpt_project_chat(
         if key in project_result:
             result[key] = project_result.get(key)
 
-    if not _project_open_result_allows_chat_targeting(project_result):
+    project_result_allows_targeting = _project_open_result_allows_chat_targeting(project_result)
+    project_action_posted = _project_open_action_was_posted(project_result)
+    if not project_result_allows_targeting and not (
+        confirm_open_chat
+        and project_action_posted
+        and _project_open_result_allows_chat_list_readiness_wait(project_result)
+    ):
         result.update(_project_chat_open_project_failure(project_result))
         return result
 
@@ -4867,6 +4875,19 @@ def open_chatgpt_project_chat(
         windowserver_probe_factory or _WindowServerBoundsProbe,
         sleeper,
     )
+    if confirm_open_chat and plan.get("status") in _PROJECT_CHAT_LIST_READINESS_TRANSIENT_STATUSES:
+        readiness = _wait_for_project_chat_list_readiness(
+            reader,
+            process.pid,
+            requested_project,
+            requested_chat,
+            plan,
+            display_probe_factory or _CoreGraphicsDisplayProbe,
+            windowserver_probe_factory or _WindowServerBoundsProbe,
+            sleeper,
+        )
+        result["project_chat_list_readiness"] = _project_chat_list_readiness_result_fields(readiness)
+        plan = readiness["plan"]
     result.update(_project_chat_plan_result_fields(plan))
     _apply_project_chat_search_observation(result, plan)
     result["initial_visible_chat_count"] = int(result.get("targeting_visible_chat_count") or 0)
@@ -4954,6 +4975,15 @@ def _base_project_chat_open_result(project_title: str, chat_title: str, app_name
         "max_search_cycles": MAX_CHAT_SEARCH_CYCLES,
         "configured_max_search_cycles": MAX_PROJECT_CHAT_SEARCH_CYCLES,
         "configured_max_search_elapsed_seconds": MAX_PROJECT_CHAT_SEARCH_ELAPSED_SECONDS,
+        "project_chat_list_readiness": {
+            "attempted": False,
+            "timeout_seconds": PROJECT_CHAT_LIST_READINESS_TIMEOUT_SECONDS,
+            "poll_interval_seconds": PROJECT_CHAT_LIST_READINESS_POLL_INTERVAL_SECONDS,
+            "samples_taken": 0,
+            "waited_seconds": 0.0,
+            "timed_out": False,
+            "final_status": "not_attempted",
+        },
         "search_cycles_attempted": 0,
         "scroll_pulses_posted": 0,
         "scroll_method_used": "",
@@ -5087,6 +5117,106 @@ def _project_open_result_allows_chat_targeting(project_result: dict) -> bool:
     if project_result.get("outcome") == "dry_run_ready":
         return True
     return project_result.get("outcome") == "destination_opened_and_visible_chats_resolved" and int(project_result.get("visible_chat_count") or 0) > 0
+
+
+_PROJECT_OPEN_OUTCOMES_ALLOWING_CHAT_LIST_READINESS_WAIT = {
+    "action_posted_but_destination_not_confirmed",
+    "destination_opened_with_empty_visible_chat_list",
+    "post_action_inspection_unavailable",
+    "project_chat_list_identity_not_confirmed",
+    "project_opened_but_visible_chats_not_resolved",
+}
+
+_PROJECT_CHAT_LIST_READINESS_TRANSIENT_STATUSES = {
+    "post_action_inspection_unavailable",
+    "project_chat_list_identity_not_confirmed",
+    "project_opened_but_chats_not_available",
+    "project_open_failed",
+}
+
+
+def _project_open_action_was_posted(project_result: dict) -> bool:
+    if int(project_result.get("target_match_count") or 0) != 1:
+        return False
+
+    target = project_result.get("target") or {}
+    target_paths = {
+        str(target.get("title_ax_path") or ""),
+        str(target.get("row_ax_path") or ""),
+        str((target.get("axpress_target") or {}).get("path") or ""),
+    }
+    target_paths.discard("")
+    actions = project_result.get("actions_performed") or []
+    if any(
+        action.get("action") == "AXPress" and str(action.get("path") or "") in target_paths
+        for action in actions
+    ):
+        return True
+
+    return project_result.get("chosen_method") == "validated_geometry_click" and any(
+        action.get("event") == "left_mouse_up" for action in actions
+    )
+
+
+def _project_open_result_allows_chat_list_readiness_wait(project_result: dict) -> bool:
+    return project_result.get("outcome") in _PROJECT_OPEN_OUTCOMES_ALLOWING_CHAT_LIST_READINESS_WAIT
+
+
+def _wait_for_project_chat_list_readiness(
+    reader: object,
+    pid: int,
+    project_title: str,
+    chat_title: str,
+    initial_plan: dict,
+    display_probe_factory: object,
+    windowserver_probe_factory: object,
+    sleep_function: object,
+) -> dict:
+    timeout_seconds = max(0.0, float(PROJECT_CHAT_LIST_READINESS_TIMEOUT_SECONDS))
+    poll_interval_seconds = max(0.001, float(PROJECT_CHAT_LIST_READINESS_POLL_INTERVAL_SECONDS))
+    max_polls = max(0, int(math.ceil(timeout_seconds / poll_interval_seconds)))
+    plan = initial_plan
+    samples_taken = 1
+    waited_seconds = 0.0
+
+    for _ in range(max_polls):
+        if plan.get("status") not in _PROJECT_CHAT_LIST_READINESS_TRANSIENT_STATUSES:
+            break
+        sleep_function(poll_interval_seconds)
+        waited_seconds = min(timeout_seconds, waited_seconds + poll_interval_seconds)
+        plan = _fresh_project_chat_targeting_plan(
+            reader,
+            pid,
+            project_title,
+            chat_title,
+            display_probe_factory,
+            windowserver_probe_factory,
+            sleep_function,
+        )
+        samples_taken += 1
+
+    return {
+        "plan": plan,
+        "attempted": True,
+        "timeout_seconds": timeout_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+        "samples_taken": samples_taken,
+        "waited_seconds": waited_seconds,
+        "timed_out": plan.get("status") in _PROJECT_CHAT_LIST_READINESS_TRANSIENT_STATUSES,
+        "final_status": plan.get("status") or "",
+    }
+
+
+def _project_chat_list_readiness_result_fields(readiness: dict) -> dict:
+    return {
+        "attempted": bool(readiness.get("attempted")),
+        "timeout_seconds": float(readiness.get("timeout_seconds") or 0.0),
+        "poll_interval_seconds": float(readiness.get("poll_interval_seconds") or 0.0),
+        "samples_taken": max(0, int(readiness.get("samples_taken") or 0)),
+        "waited_seconds": max(0.0, float(readiness.get("waited_seconds") or 0.0)),
+        "timed_out": bool(readiness.get("timed_out")),
+        "final_status": str(readiness.get("final_status") or ""),
+    }
 
 
 def _project_chat_open_project_failure(project_result: dict) -> dict:

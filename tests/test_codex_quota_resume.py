@@ -6,9 +6,11 @@ import unittest
 
 from agent.codex_quota_resume_services import execute_codex_quota_resume_service
 from agent.codex_quota_wait import (
+    CODEX_FORCE_CONTINUE_PROMPT,
     CODEX_QUOTA_RESUME_PROMPT,
     CODEX_QUOTA_WAIT_SCHEDULED_EVENT_TYPE,
 )
+from tests.test_codex_quota_wait import SESSION_ID, _progress_event
 
 
 class FakeResumeLedger:
@@ -179,4 +181,75 @@ class CodexQuotaResumeServiceTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "quota_wait_not_active")
+        self.assertEqual(raw.calls, [])
+
+    def test_force_without_wait_resumes_latest_thread_and_skips_fresh_exec(self) -> None:
+        ledger = FakeResumeLedger(
+            [
+                {
+                    "id": 1,
+                    "event_type": "codex_exec_started",
+                    "metadata": {
+                        "repo_path": "/tmp/repo",
+                        "sandbox": "workspace-write",
+                    },
+                },
+                _progress_event(kind="thread.started", session_id=SESSION_ID, event_id=2),
+                _progress_event(kind="error", error="command failed", event_id=3),
+            ]
+        )
+        raw = RecordingDirect(
+            SimpleNamespace(
+                ok=True,
+                reason_code="codex_exec_completed",
+                error_message=None,
+                exit_code=0,
+                raw_process_result={"exit_code": 0},
+            )
+        )
+        governance = RecordingGovernance()
+
+        result = execute_codex_quota_resume_service(
+            "run-1",
+            ledger=ledger,
+            now=datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc),
+            allow_before_due=True,
+            raw_execution_service=raw,
+            governance_service=governance,
+            git_snapshot_function=lambda path: {"repo_path": path},
+            invocation_state_function=lambda path: {"repo_path": path},
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(raw.calls[0]["prompt"], CODEX_FORCE_CONTINUE_PROMPT)
+        self.assertEqual(raw.calls[0]["resume_session_id"], SESSION_ID)
+        self.assertEqual(raw.calls[0]["sandbox"], "workspace-write")
+        self.assertEqual(len(governance.calls), 1)
+        started = next(
+            event for event in ledger.events if event["event_type"] == "codex_quota_resume_started"
+        )
+        self.assertTrue(started["metadata"]["forced"])
+        self.assertEqual(started["metadata"]["prompt"], CODEX_FORCE_CONTINUE_PROMPT)
+        self.assertIsNone(started["metadata"]["resume_at"])
+
+    def test_force_without_wait_or_thread_does_not_start_a_fresh_exec(self) -> None:
+        raw = RecordingDirect(SimpleNamespace(ok=True))
+        result = execute_codex_quota_resume_service(
+            "run-1",
+            ledger=FakeResumeLedger(
+                [
+                    {
+                        "id": 1,
+                        "event_type": "codex_exec_started",
+                        "metadata": {"repo_path": "/tmp/repo", "sandbox": "read-only"},
+                    }
+                ]
+            ),
+            now=datetime(2026, 8, 30, 8, 0, tzinfo=timezone.utc),
+            allow_before_due=True,
+            raw_execution_service=raw,
+            governance_service=RecordingGovernance(),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "no_codex_session")
         self.assertEqual(raw.calls, [])

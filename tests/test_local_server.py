@@ -720,6 +720,21 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
         self.assertEqual(status, 409)
         self.assertEqual(payload["reason_code"], "quota_wait_not_active")
 
+        self.controller.quota_resume_result = self.controller._result(
+            ok=False,
+            reason="no_codex_session",
+            error="no session",
+            run_id="run-1",
+        )
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/current/quota-resume",
+            body={},
+            token=self.token,
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["reason_code"], "no_codex_session")
+
         status, _headers, payload = self.request(
             "POST",
             "/api/runs/current/quota-resume",

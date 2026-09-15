@@ -133,9 +133,14 @@ While a wait is active, the planner returns `STOP` with
 `waiting_for_quota_reset`. That reason is not blocked, not terminal, and not
 completed. Operator cancel during the wait writes `codex_quota_wait_cancelled`
 and returns to `needs_review` plus controller `blocked`. The dashboard
-**Force continue** control (`POST /api/runs/current/quota-resume`) starts the
-same `codex exec resume` with `CODEX_QUOTA_RESUME_PROMPT` without waiting for
-`resume_at`, for cases such as a Codex recharge.
+**Force continue** control (`POST /api/runs/current/quota-resume`) starts
+`codex exec resume` with a continue prompt on the latest Codex thread. It does
+not wait for `resume_at`. An active usage-limit wait is not required: Codex
+error, non-zero exit, and quota wait all use this path. The control stays
+disabled while a Codex process is still running or no thread id has been
+captured. Automatic timer resume still waits until `resume_at` and still
+requires an active wait. Quota-wait resumes keep `CODEX_QUOTA_RESUME_PROMPT`;
+other operator force continues use `CODEX_FORCE_CONTINUE_PROMPT`.
 
 The wait timer lives only in the current `local_server` process. A new
 controller process does not resume it. Restore writes `codex_quota_wait_stale`,

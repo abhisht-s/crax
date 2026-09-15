@@ -20,6 +20,7 @@ from agent.codex_quota_wait import (
     CODEX_QUOTA_WAIT_STALE_EVENT_TYPE,
     active_quota_wait,
     decide_quota_wait,
+    latest_codex_thread_id,
     quota_wait_client_message,
     quota_wait_fields,
 )
@@ -699,11 +700,14 @@ class LocalController:
                     run_id=run_id,
                     controller_state=self.session.controller_state,
                 )
-            if not self._quota_wait_context_matches_locked(run_id):
+            events = self.ledger.list_events(run_id)
+            wait_active = self._quota_wait_context_matches_locked(run_id)
+            thread_id = latest_codex_thread_id(events)
+            if not wait_active and not thread_id:
                 return LocalControllerOperationResult(
                     ok=False,
-                    reason_code="quota_wait_not_active",
-                    error_message="No active Codex usage-limit wait is available to continue.",
+                    reason_code="no_codex_session",
+                    error_message="No Codex session is available to continue.",
                     run_id=run_id,
                     controller_state=self.session.controller_state,
                 )

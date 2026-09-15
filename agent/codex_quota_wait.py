@@ -14,6 +14,9 @@ CODEX_QUOTA_WAIT_STALE_EVENT_TYPE = "codex_quota_wait_stale"
 CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE = "codex_quota_resume_started"
 CODEX_QUOTA_RESUME_FINISHED_EVENT_TYPE = "codex_quota_resume_finished"
 CODEX_QUOTA_RESUME_DELAY_SECONDS = 60
+CODEX_FORCE_CONTINUE_PROMPT = (
+    "Continue from the last incomplete work. Do not restart from scratch."
+)
 CODEX_QUOTA_RESUME_PROMPT = (
     "The previous turn ended because the Codex usage limit reset. "
     "Continue from the last incomplete work. Do not restart from scratch."
@@ -138,6 +141,13 @@ def _parse_iso(value: str) -> datetime | None:
     except ValueError:
         return None
     return _aware_now(parsed)
+
+
+def latest_codex_thread_id(events: list[dict[str, Any]]) -> str | None:
+    """Return the newest captured Codex thread id from progress events."""
+    progress = [_progress_payload(event) for event in events]
+    progress = [item for item in progress if item is not None]
+    return _session_id_for_invocation(progress, None)
 
 
 def active_quota_wait(events: list[dict[str, Any]]) -> dict[str, Any] | None:

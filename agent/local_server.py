@@ -1047,6 +1047,7 @@ def _status_for_reason(reason: str, *, default_failure_status: int | None = None
         "chatgpt_ui_lease_not_active",
         "manual_stale_lease_run_status_mismatch",
         "quota_wait_not_active",
+        "no_codex_session",
     }:
         return 409 if default_failure_status is None else default_failure_status
     if reason in {

@@ -2436,7 +2436,7 @@ class LocalControllerStateMachineTests(unittest.TestCase):
             if timer is not None:
                 timer.cancel()
 
-    def test_force_quota_resume_requires_active_wait(self) -> None:
+    def test_force_quota_resume_requires_codex_session(self) -> None:
         controller = LocalController(
             session=LocalControllerSession(active_run_id="run-1"),
             ledger=FakeLedger(_run(RunStatus.RUNNING.value)),
@@ -2444,12 +2444,53 @@ class LocalControllerStateMachineTests(unittest.TestCase):
                 _model(action="stop", reason="no_action", stage="idle"),
             ),
             quota_resume_executor=lambda **_kwargs: (_ for _ in ()).throw(
-                AssertionError("resume must not run without an active wait")
+                AssertionError("resume must not run without a Codex session")
             ),
         )
         result = controller.request_force_quota_resume()
         self.assertFalse(result.ok)
-        self.assertEqual(result.reason_code, "quota_wait_not_active")
+        self.assertEqual(result.reason_code, "no_codex_session")
+
+    def test_force_continue_from_retry_resumes_without_quota_wait(self) -> None:
+        from tests.test_codex_quota_wait import SESSION_ID, _progress_event
+
+        resume_calls: list[dict] = []
+
+        def resume_executor(**kwargs):
+            resume_calls.append(kwargs)
+            return FakeStepResult(ok=True, reason_code="codex_exec_completed")
+
+        controller = LocalController(
+            session=LocalControllerSession(
+                active_run_id="run-1",
+                controller_state="waiting_for_retry",
+            ),
+            ledger=FakeLedger(
+                _run(RunStatus.NEEDS_REVIEW.value),
+                [
+                    _event(
+                        1,
+                        "codex_exec_started",
+                        {"repo_path": "/tmp", "sandbox": "read-only"},
+                    ),
+                    _progress_event(kind="thread.started", session_id=SESSION_ID, event_id=2),
+                    _progress_event(kind="error", error="command failed", event_id=3),
+                ],
+            ),
+            read_model_builder=ReadModelSequence(
+                _model(action="stop", reason="no_action", stage="idle"),
+            ),
+            quota_resume_executor=resume_executor,
+        )
+        result = controller.request_force_quota_resume()
+        if controller.current_worker is not None:
+            controller.current_worker.join(2)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.reason_code, "quota_resume_worker_started")
+        self.assertEqual(len(resume_calls), 1)
+        self.assertEqual(resume_calls[0]["run_id"], "run-1")
+        self.assertTrue(resume_calls[0]["allow_before_due"])
+        self.assertIsNone(controller._quota_wait)
 
     def test_force_quota_resume_blocked_when_action_running(self) -> None:
         from tests.test_codex_quota_wait import SESSION_ID

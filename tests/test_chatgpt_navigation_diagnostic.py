@@ -2646,6 +2646,86 @@ class ChatGPTNavigationDiagnosticTests(unittest.TestCase):
         self.assertTrue(result["project_open_result"]["traversal"]["truncated_by_node_limit"])
         self.assertFalse(result["project_open_result"]["traversal"]["truncated_by_depth_limit"])
 
+    def test_project_chat_open_waits_for_delayed_chat_list_after_project_action(self) -> None:
+        loading = _project_content_shell_without_list()
+        ready = _scrollable_project_chat_page(["Delayed Chat"])
+        opened = _scroll_opened_conversation_snapshots("Delayed Chat")
+        reader = _AutonomousReader(
+            [loading, loading, ready, ready, opened, opened],
+            {"available": True, "path": "W.1.4.1", "role": "AXButton", "title": {"literal": "Delayed Chat"}},
+        )
+        sleeper = _SleepRecorder()
+        project_open = mock.Mock(
+            return_value={
+                "ok": False,
+                "outcome": "post_action_inspection_unavailable",
+                "chosen_method": "axpress",
+                "target_match_count": 1,
+                "target": {
+                    "title_ax_path": "W.0.2.1",
+                    "row_ax_path": "W.0.2",
+                    "axpress_target": {"path": "W.0.2"},
+                },
+                "actions_performed": [{"path": "W.0.2", "action": "AXPress"}],
+                "visible_chat_count": 0,
+            }
+        )
+
+        with mock.patch.object(nav.sys, "platform", "darwin"):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Delayed Chat",
+                confirm_open_chat=True,
+                open_project_function=project_open,
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=sleeper,
+            )
+
+        self.assertEqual(result["outcome"], "chat_opened_via_axpress")
+        project_open.assert_called_once()
+        self.assertTrue(result["project_chat_list_readiness"]["attempted"])
+        self.assertFalse(result["project_chat_list_readiness"]["timed_out"])
+        self.assertEqual(result["project_chat_list_readiness"]["final_status"], "ready")
+        self.assertEqual(result["project_chat_list_readiness"]["samples_taken"], 3)
+        self.assertEqual(sleeper.calls[:2], [nav.PROJECT_CHAT_LIST_READINESS_POLL_INTERVAL_SECONDS] * 2)
+        self.assertIn(("W.1.4.1", "AXPress"), reader.actions)
+
+    def test_project_chat_open_readiness_wait_is_bounded_and_posts_no_chat_action_on_timeout(self) -> None:
+        loading = _project_content_shell_without_list()
+        reader = _AutonomousReader([loading], {"available": True, "path": "W.1.4.1"})
+        sleeper = _SleepRecorder()
+
+        with mock.patch.object(nav.sys, "platform", "darwin"), mock.patch.object(
+            nav, "PROJECT_CHAT_LIST_READINESS_TIMEOUT_SECONDS", 0.4
+        ):
+            result = nav.open_chatgpt_project_chat(
+                project_title="PTG Assistant",
+                chat_title="Delayed Chat",
+                confirm_open_chat=True,
+                open_project_function=mock.Mock(
+                    return_value={
+                        "ok": True,
+                        "outcome": "destination_opened_and_visible_chats_resolved",
+                        "visible_chat_count": 1,
+                    }
+                ),
+                process_resolver=lambda app_name: nav.ProcessResolution(pid=123, method="fake"),
+                reader_factory=_ActionFactory(reader),
+                display_probe_factory=_DisplayFactory(_DisplayProbe()),
+                windowserver_probe_factory=_WindowServerFactory(_WindowServerProbe([{"window_id": 9, "bounds": (0, 0, 1200, 900)}])),
+                sleep_function=sleeper,
+            )
+
+        self.assertTrue(result["project_chat_list_readiness"]["attempted"])
+        self.assertTrue(result["project_chat_list_readiness"]["timed_out"])
+        self.assertEqual(result["project_chat_list_readiness"]["samples_taken"], 3)
+        self.assertAlmostEqual(result["project_chat_list_readiness"]["waited_seconds"], 0.4)
+        self.assertEqual(sleeper.calls, [nav.PROJECT_CHAT_LIST_READINESS_POLL_INTERVAL_SECONDS] * 2)
+        self.assertEqual(reader.actions, [])
+
     def test_project_chat_open_matches_exact_accessibility_row_text(self) -> None:
         with mock.patch.object(nav.sys, "platform", "darwin"):
             result = nav.open_chatgpt_project_chat(

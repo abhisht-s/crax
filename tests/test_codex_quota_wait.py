@@ -12,6 +12,7 @@ from agent.codex_quota_wait import (
     CODEX_QUOTA_WAIT_STALE_EVENT_TYPE,
     active_quota_wait,
     decide_quota_wait,
+    latest_codex_thread_id,
     quota_wait_client_message,
     parse_try_again_at,
 )
@@ -332,6 +333,17 @@ class CodexQuotaWaitHelpersTests(unittest.TestCase):
             {"id": 2, "event_type": CODEX_QUOTA_RESUME_STARTED_EVENT_TYPE, "metadata": {}},
         ]
         self.assertIsNone(active_quota_wait(events))
+
+    def test_latest_codex_thread_id_uses_newest_progress_session(self) -> None:
+        events = [
+            _progress_event(kind="thread.started", session_id="thread-old", event_id=1),
+            _progress_event(kind="thread.started", session_id=SESSION_ID, event_id=2),
+            _progress_event(kind="error", error="boom", event_id=3),
+        ]
+        self.assertEqual(latest_codex_thread_id(events), SESSION_ID)
+
+    def test_latest_codex_thread_id_missing_without_progress(self) -> None:
+        self.assertIsNone(latest_codex_thread_id([]))
 
 
 if __name__ == "__main__":

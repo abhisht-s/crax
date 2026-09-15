@@ -1051,9 +1051,11 @@
     if (eventName === "progress") {
       appendProgressEvent(payload, expectedRunId);
       renderCodexLiveProgress({});
+      updateControlState();
     } else if (eventName === "progress_state") {
       applyProgressPayload(payload);
       renderCodexLiveProgress({});
+      updateControlState();
     }
   }
 
@@ -1070,6 +1072,7 @@
     if (result.ok) {
       applyProgressPayload(result);
       renderCodexLiveProgress({});
+      updateControlState();
     }
     if (!progressStreamActive && progressRunId) {
       scheduleProgressPoll(PROGRESS_POLL_MS);
@@ -1730,17 +1733,19 @@
       cancelRequestInFlight ||
       Boolean(model && model.completed) ||
       Boolean(model && REPLACEABLE_RUN_STATUSES.has(model.run_status));
-    const quotaWaitActive = Boolean(
+    const quotaWaitThreadId = String(
+      (model && model.quota_wait && model.quota_wait.thread_id) || "",
+    ).trim();
+    const knownCodexSessionId = Boolean(currentCodexSessionId || quotaWaitThreadId);
+    const forceContinueAvailable = Boolean(
       authenticated &&
       model &&
-      model.quota_wait &&
-      model.quota_wait.resume_at &&
-      runtime.controller_state === "waiting_for_quota_reset" &&
+      knownCodexSessionId &&
       !quotaResumeIsLive(runtime) &&
       !running &&
       !quotaContinueRequestInFlight,
     );
-    elements["quota-force-continue-button"].disabled = !quotaWaitActive;
+    elements["quota-force-continue-button"].disabled = !forceContinueAvailable;
 
     if (model) {
       renderApproval(model, runtime);
