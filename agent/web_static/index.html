@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#181818">
-    <title>Agent Controller</title>
+    <meta name="theme-color" content="#000000">
+    <title>Crax</title>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/assets/style.css">
@@ -12,14 +12,15 @@
   </head>
   <body>
     <header class="app-header">
-      <div>
-        <h1>Agent Controller</h1>
-      </div>
+      <h1>Crax</h1>
       <section class="connection-panel" aria-label="Controller connection">
         <p class="connection-label">Controller connection</p>
         <p id="connection-status" class="status-badge connection-status status-muted" aria-live="polite">Connecting</p>
+        <p id="session-capacity" class="status-badge status-muted" aria-live="polite">0 / 1 active</p>
       </section>
     </header>
+
+    <p id="durability-banner" class="durability-banner hidden" role="status" aria-live="polite"></p>
 
     <main class="layout">
       <section id="pairing-panel" class="panel pairing-panel hidden" aria-labelledby="pairing-heading">
@@ -45,6 +46,13 @@
           <span id="remote-device-status" class="inline-status" aria-live="polite"></span>
         </div>
         <ul id="remote-device-list" class="device-list"></ul>
+      </section>
+
+      <section id="session-list-panel" class="panel wide" aria-labelledby="session-list-heading">
+        <h2 id="session-list-heading">Sessions</h2>
+        <p id="chatgpt-lane-status" class="form-note" aria-live="polite">ChatGPT lane is idle.</p>
+        <div id="session-list" class="session-list"></div>
+        <p id="session-list-empty" class="form-note">No live or resumable sessions. Start a run below.</p>
       </section>
 
       <section id="startup-panel" class="panel" aria-labelledby="startup-heading">
@@ -111,6 +119,7 @@
         </div>
         <div class="action-row">
           <button id="start-button" type="button">Start run</button>
+          <button id="start-additional-button" type="button" class="secondary hidden">Start additional session</button>
           <span id="startup-status" class="inline-status" aria-live="polite"></span>
         </div>
       </section>
@@ -200,14 +209,31 @@
         <h2 id="codex-live-heading">Codex Working Notes</h2>
         <p id="codex-live-state" class="status-badge status-muted" aria-live="polite">No active run</p>
         <dl class="summary-grid codex-live-grid">
+          <div><dt>Codex session ID</dt><dd id="codex-live-session-id">Not available yet</dd></div>
+          <div><dt>Usage limit</dt><dd id="codex-live-quota-wait">None</dd></div>
           <div><dt>Final message</dt><dd id="codex-live-final">Not available yet</dd></div>
           <div><dt>Latest issue</dt><dd id="codex-live-error">None</dd></div>
         </dl>
-        <ol id="codex-live-events" class="progress-events"></ol>
+        <div class="action-row quota-continue-row">
+          <button id="quota-force-continue-button" type="button">Force continue</button>
+          <span id="quota-force-continue-status" class="inline-status" aria-live="polite"></span>
+        </div>
+        <p class="form-note">If Codex stopped for any reason, this injects a continue prompt into the same Codex session.</p>
+        <div class="codex-live-columns">
+          <section class="codex-live-column" aria-labelledby="codex-commentary-heading">
+            <h3 id="codex-commentary-heading" class="codex-live-subheading">Commentary</h3>
+            <ol id="codex-live-events" class="progress-events"></ol>
+          </section>
+          <section class="codex-live-column codex-plan-column" aria-labelledby="codex-plan-heading">
+            <h3 id="codex-plan-heading" class="codex-live-subheading">Plan</h3>
+            <ol id="codex-live-plan" class="codex-plan"></ol>
+          </section>
+        </div>
       </section>
 
       <section id="approval-panel" class="panel hidden" aria-labelledby="approval-heading">
         <h2 id="approval-heading">Approval Required</h2>
+        <p id="approval-session" class="form-note">No session selected.</p>
         <p id="approval-kind">No approval is pending.</p>
         <div class="action-row">
           <button id="approve-button" type="button">Approve</button>
@@ -227,6 +253,7 @@
 
       <section id="failure-panel" class="panel failure-panel hidden" aria-labelledby="failure-heading">
         <h2 id="failure-heading">Action Paused</h2>
+        <p id="failure-session" class="form-note">No session selected.</p>
         <p id="failure-summary" class="status-badge status-bad" aria-live="polite">An action failed.</p>
         <dl class="summary-grid failure-grid">
           <div><dt>Failed action</dt><dd id="failure-action">None</dd></div>

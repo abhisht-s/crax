@@ -78,6 +78,13 @@ class ChatGPTHandoffQueueTests(unittest.TestCase):
             )
             self.assertEqual(claimed_b.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
             self.assertEqual(still_waiting_c.status, ledger.AtomicChatGPTHandoffQueueStatus.WAITING)
+            snapshot = ledger.describe_chatgpt_handoff_queue()
+            self.assertTrue(snapshot["ok"])
+            self.assertEqual(snapshot["head_run_id"], run_b)
+            self.assertEqual(
+                [entry["run_id"] for entry in snapshot["entries"]],
+                [run_b, run_c],
+            )
             self.assertEqual(still_waiting_c.head_run_id, run_b)
 
             ledger.complete_chatgpt_handoff(
@@ -378,11 +385,27 @@ class ChatGPTHandoffQueueTests(unittest.TestCase):
                 blocked_events[0]["metadata_json"],
             )
 
+    def test_completed_mid_loop_status_can_enqueue_a_handoff(self) -> None:
+        """Governance `completed` is mid-loop, not queue-terminal."""
+        with _temporary_ledger():
+            run_id = ledger.create_run("mid-loop")
+            ledger.update_run_status(run_id, RunStatus.COMPLETED)
+            enqueue = ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="send")
+            self.assertEqual(
+                enqueue.status, ledger.AtomicChatGPTHandoffQueueStatus.ENQUEUED
+            )
+            claim = ledger.claim_chatgpt_handoff_for_run(
+                run_id, claim_owner_identifier="owner-mid"
+            )
+            self.assertEqual(
+                claim.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED
+            )
+
     def test_terminal_run_cannot_enqueue_or_claim_a_handoff(self) -> None:
         with _temporary_ledger():
             run_id = ledger.create_run("finished")
             ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="send")
-            ledger.update_run_status(run_id, RunStatus.COMPLETED)
+            ledger.update_run_status(run_id, RunStatus.FAILED)
 
             enqueue = ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="late")
             claim = ledger.claim_chatgpt_handoff_for_run(

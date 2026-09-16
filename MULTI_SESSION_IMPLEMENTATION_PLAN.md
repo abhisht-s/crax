@@ -62,9 +62,9 @@ From the feature doc and the context doc:
 | 2 | Per-run session runtime | **Done** |
 | 3 | Shared ChatGPT lane | **Done** |
 | 4 | Real concurrent session workers | **Done** |
-| 5 | Multi-session start and identity rules | **Next** |
-| 6 | Restart and durability recovery | Not started |
-| 7 | Backend API and dashboard | Not started |
+| 5 | Multi-session start and identity rules | **Done** |
+| 6 | Restart and durability recovery | **Done** |
+| 7 | Backend API and dashboard | **Done** |
 | 8 | Torture testing and live proof | Not started |
 
 Per-stage workflow (all stages): read the root docs fully -> audit the
@@ -248,142 +248,282 @@ Stage 3 (`tests/test_chatgpt_handoff_queue.py`,
 `tests/test_chatgpt_ui_lease.py`, `tests/test_chatgpt_desktop_mutex.py`)
 suites remain green.
 
-Known gap carried forward (unchanged, Stage 6): restore still bails
-early when the focused run is terminal, which would drop live siblings.
-Stage 4 persistence itself is correct — the snapshot `sessions` map
-records every live runtime, verified under a two-live-session start.
+Known gap recorded at the time (closed in Stage 6): restore still bailed
+early when the focused run was terminal, which would drop live siblings.
+Stage 4 persistence itself was already correct — the snapshot `sessions`
+map records every live runtime, verified under a two-live-session start.
 
 ---
 
-## Stage 5 — Multi-session start and identity rules
-
-### Goal
+## Stage 5 — Multi-session start and identity rules — DONE
 
 Explicit second/third/fourth session creation, enforced server-side.
 
-### Work **[T]**
+Delivered **[C]**:
 
-1. Decide the additional-start shape: dedicated route
-   (`/api/runs/start_additional`) vs a flag on the existing start body.
-   Decision criteria: today's Start button and any cached client must be
-   physically unable to start a second session by accident. Lock the
-   decision with a test that the old start body cannot create a second
-   session while one is live.
-2. Enforce at start, under `_lock`:
-   - Hard cap: at most **4** live sessions; the effective cap is
-     `max_active_sessions` (default 1 until Stage 8 proves 2, then 4).
-   - One live session per `(project_title, chat_title)`; reject with
-     `duplicate_chatgpt_conversation` (exists **[C]**; extend tests to
-     racing starts: exactly one winner).
-   - Same project allowed; same repo allowed; comma in titles rejected
-     (exists **[C]**).
-   - Ambiguous or unparseable chat identity fails closed at start.
-3. Navigation rule: when more than one session is live, every lane slice
-   behaves as `allow_destination_navigation=True` regardless of each
-   session's checkbox — two chats cannot both already be on screen.
-   Single live session keeps its opt-in behavior.
-4. Racing duplicate starts (same conversation, simultaneous): one winner,
-   loser gets the collision error, ledger holds one run.
+- **Additional-start shape settled: a flag, not a route.** The existing
+  `/api/runs/start` body gains an optional boolean `additional_session`
+  (type-checked; non-boolean is a 400). A legacy body never carries the
+  flag, so today's Start button and any cached client are physically
+  unable to start a sibling: with *any* live session, the default start
+  returns `active_run_exists` even when capacity is free. An explicit
+  `additional_session: true` start is allowed while
+  `live_count < max_active_sessions` (hard cap 4) and otherwise returns
+  `session_capacity_reached`. Both codes, plus
+  `duplicate_chatgpt_conversation`, map to HTTP 409. Repeated/racing
+  legacy submits create exactly one session.
+- **Cap exposure:** `LocalControllerServer(max_active_sessions=…)` and a
+  `--max-active-sessions` CLI flag (validated 1–4) pass the cap to the
+  controller constructor; the default stays 1 and the constructor still
+  clamps to the hard cap of 4.
+- **Atomic same-chat ownership:** new ledger primitive
+  `claim_chatgpt_conversation` / `release_chatgpt_conversation_claim`
+  (event-sourced, `BEGIN IMMEDIATE`, same style as the UI lease). The
+  claim is taken in `start_local_controller_run` right after run creation
+  and before profile selection and destination binding, with the caller's
+  controller instance id and full process identity recorded. Exactly one
+  of two racing starts wins — proven for threads in one controller, for
+  two controller instances sharing one ledger database, and for raw
+  concurrent claim transactions. The loser returns
+  `duplicate_chatgpt_conversation` and never binds the destination, never
+  registers a runtime, and never launches Codex. Reclaim happens only when
+  the owning run's status is replaceable
+  (completed/failed/needs_review/rejected) or the recorded owner process
+  is provably dead (three-state liveness verdict; unknown fails closed);
+  each reclaim writes an audit release event under the old owner's run.
+  Claims are released on start failure after the claim, on cancel, and on
+  hard-terminal transitions; needs_review keeps its claim so a resumable
+  run is not silently displaced. **Scope honestly recorded:** the claim is
+  per ledger database. Separate worktrees (separate `data/agent_ledger.db`
+  files) are outside its reach; that scenario remains governed by the
+  documented operating rule plus the machine-global desktop mutex, which
+  serializes UI slices but does not enforce conversation uniqueness.
+- **Identity rules unchanged and re-proven under the new contract:** same
+  project + different chats allowed, same repo allowed (no repo lock),
+  comma-bearing and empty titles rejected at validation
+  (`invalid_destination`), duplicate live conversation rejected.
+- **Forced navigation for multi-live mode:** the controller computes the
+  effective flag per slice (`_navigation_for_handoff`), leaving the lane
+  and destination gate untouched. One live session keeps its opt-in
+  checkbox. The moment a sibling start makes live count exceed one, every
+  live run's `navigation_forced_multi_live` latch is set (also re-checked
+  at handoff time), forcing navigation on every subsequent slice for those
+  runs. Settled behavior for the revert question: the latch is **sticky
+  for the run's lifetime** — a run that ever coexisted with a live sibling
+  keeps forced navigation even after the sibling stops, because the
+  sibling may have moved ChatGPT while it was alive. The latch is
+  persisted in the controller snapshot and restored on restart.
+- **Start failure atomicity:** capacity and duplicate rejections happen
+  before run creation (in-process) or before binding (ledger claim); a
+  claim followed by a profile or binding failure releases the claim and
+  records the existing start-failure event; a failed start leaves no
+  runtime, no focused-run change, no worker, and the conversation and
+  slot immediately reusable.
+- **Focus semantics preserved:** starting B/C/D never stops, cancels, or
+  pauses A; focus moves to the newest start and remains UI/default-route
+  state only; mirrored fields track the focused runtime.
 
-### Acceptance
-
-Contract tests: old body cannot double-start; additional start works to
-cap; collision and race rules hold; cap-4 enforced even when configured
-higher by mistake.
-
-### Files
-
-`agent/local_server.py`, `agent/local_controller.py`,
-`agent/run_services.py`, `tests/test_local_server.py`,
-`tests/test_local_controller.py`.
+Evidence: `tests/test_multi_session_start.py` (26 tests: default-vs-
+additional contract, capacity, identity, in-process and cross-controller
+races, raw claim atomicity/reclaim/release, failure atomicity, forced
+navigation and latch persistence/restore);
+`tests/test_local_server.py` additions (`additional_session` plumbing and
+type checks, 409 mapping, `max_active_sessions` pass-through);
+`tests/test_multi_session_concurrency.py` updated (harness starts siblings
+explicitly; over-cap reason is `session_capacity_reached`) and green;
+one-run ratchet (`tests/test_local_controller.py`,
+`tests/test_supervision_services.py`, `tests/test_local_server.py`,
+`tests/test_run_services.py`) green; Stage 1/3 suites and
+`tests/test_ledger_destination_binding.py` green.
 
 ---
 
-## Stage 6 — Restart and durability recovery
-
-### Goal
+## Stage 6 — Restart and durability recovery — DONE
 
 Four mixed session states recover independently after a CRAX restart, and
-CRAX stops initiating side effects when persistence is untrustworthy.
+CRAX stops initiating new external side effects when persistence is
+untrustworthy.
 
-### Work **[T]**
+Delivered **[C]**:
 
-1. Restore audit. Known gap **[C]**: `_restore_persisted_session` returns
-   early when `active_run_id` is missing or the focused run is
-   terminal/replaceable — live sibling sessions in the snapshot would be
-   dropped. Fix: restore every non-terminal session in the snapshot
-   independently; pick a sane focused run (previous focus if live, else
-   any live session); a terminal focused run must not veto siblings.
-2. Mixed-state restore test: A was waiting on ChatGPT, B queued for the
-   lane, C running Codex, D waiting on approval; kill and restart the
-   controller (in-process re-construction against the same ledger).
-   Expect: C reconciles via invocation artifacts (finalize, fail, or
-   pause-uncertain); D's approval snapshot intact; A and B re-enter the
-   wait/queue path rather than failing; nothing double-executes.
-3. Queue and mutex hygiene on restore: dead-owner queue claims and mutex
-   from the previous process do not deadlock the lane (build on Stage 3's
-   stale-owner work).
-4. **Persistence safety rule:** when a durable ledger write fails
-   (sqlite3 error on commit) on any path that gates an external side
-   effect — starting Codex, entering the lane, submitting — the session
-   pauses (`blocked`, explicit reason code) instead of proceeding.
-   Define the exact detection points; do not sprinkle try/except
-   everywhere. A read failure or a snapshot-persist failure must not
-   silently continue into a paste.
-5. Terminal states absorbing: a restored terminal run never gets a
-   worker, never re-enters the lane, and never re-runs Codex — test it.
+- **Restore audit and focused-run bug.** The previous
+  `_restore_persisted_session` returned early when the focused run was
+  missing or terminal/replaceable, which dropped live siblings in the
+  snapshot. Restore now discovers candidates from
+  `list_restore_candidate_runs()` (ledger run rows whose status is not
+  `failed`/`rejected`), overlays the snapshot `sessions` map as runtime
+  hints, and unions `list_active_chatgpt_conversation_claims()`.
+  `focused_run_id` is UI/default-route state only. Focus restoration:
+  previous focus if it is still a live restored session; else the first
+  remaining live session in discovery order; else the first restored
+  session so `/current` still has something to address; else empty.
+- **Restore from durable evidence, not snapshot alone.** Ledger run
+  status, planner read model, Codex invocation artifacts, conversation
+  claims, and approval integrity outrank the snapshot. In-flight
+  snapshot states still map to `blocked` until evidence proves safe
+  work. `failed`/`rejected` are restore-absorbing (no runtime, no
+  worker). Run status `completed` is mid-loop and is *not* absorbing;
+  loop-finished is `read_model.completed`.
+- **Mixed-state reconstruction.** Verified ChatGPT submit restores to
+  planner `capture_gpt_response` (no resend). Captured text restores to
+  `extract_next_prompt` (ledger-only). Extracted prompt with no Codex
+  start launches that prompt once under Stage 1 rules. Live invocation
+  is observed; complete invocation finalizes idempotently; uncertain
+  invocation stays blocked and is never replayed. Matching approval
+  snapshots restore; stale snapshots are discarded and rebuilt from
+  current evidence, never resurrected. Safely retryable UI/pre-submit
+  failures resume automatically with a fresh capped backoff (monotonic
+  deadlines are RAM-only). They do **not** require operator Retry.
+  Uncertain submit/Codex, capture integrity conflicts, and conversation
+  claim conflicts stay blocked for reconciliation. Cancelled / failed /
+  rejected / loop-finished remain absorbing and are not resurrected.
+- **Conversation claim on resume.** Before `ask_send_to_gpt`,
+  `capture_gpt_response`, `ask_run_prompt`, approval execution, or
+  retry advancement, the run must own the durable claim for its bound
+  chat (`_verify_conversation_claim_for_advancement`). Idempotent if it
+  already owns the claim; atomic reclaim if the current owner is
+  replaceable or provably dead; `conversation_claim_conflict` if another
+  live/resumable session owns the chat. `needs_review` stays reclaimable
+  for a *new start* (replaceable-session rule). Resume of the old run
+  after that reclaim fails closed — two live owners are impossible.
+  Claim replaceable statuses are `failed` / `needs_review` /
+  `rejected`; `completed` is excluded because it is mid-loop.
+- **Queue reconstruction.** The ChatGPT queue is coordination state, not
+  source of truth. Restore does not require stale queue rows to survive.
+  A session that still needs ChatGPT re-enters through the planner and
+  `enqueue_chatgpt_handoff` (idempotent for an already-pending entry).
+  Dead claim owners self-heal on enqueue (Stage 3). Terminal
+  (`failed`/`rejected`) runs are refused at enqueue. Uncertain
+  submission stays blocked; verified submit resumes capture.
+- **Workers.** Daemon threads do not survive process death. Restore
+  spawns a per-run resume worker only when evidence proves safe
+  continuable work, after the registry is fully built. Restoring A does
+  not alter B/C/D workers. Simultaneous ChatGPT-ready sessions enter
+  Stage 3's fair queue rather than racing the desktop. If
+  `list_restore_candidate_runs` itself fails, restore fails closed:
+  durability-blocked, no resume workers, never a healthy-empty boot.
+- **Global durability block.** `DurabilityGuardedLedger` is the single
+  detection point (no scattered try/except). Correctness-critical
+  writes: `create_run`, `add_event`, `update_run_status`, ChatGPT
+  enqueue/claim/complete/block, UI lease acquire/release, conversation
+  claim/release, destination and execution-profile binding. sqlite
+  errors and atomic `operational_failure` results flip
+  `LedgerDurabilityGuard`. Non-critical: `add_codex_progress_event`,
+  `save_local_controller_snapshot`. While blocked: no new Codex start,
+  no new ChatGPT submit, no new session start; sessions are not marked
+  terminal; wait uses the ChatGPT lane backoff; `/current` exposes
+  `ledger_durability`. Recovery is `check_durable_write_health` (a
+  committed `BEGIN IMMEDIATE` write to `durability_health`), not a
+  successful read. After recovery, open Codex invocations are
+  reconciled before new mutations. Already-running work is not killed
+  solely because the ledger became unavailable.
+- **Sibling-start drop policy.** An additional start at cap>1 no longer
+  evicts a finished focused sibling from the registry. Cap-1 and legacy
+  replacement still clear the focused slot.
+- **Cross-worktree limitation unchanged.** Conversation uniqueness is
+  atomic only inside one shared ledger DB. Stage 6 did not add a
+  machine-scoped conversation lock.
 
-### Acceptance
-
-Mixed-state restart test passes; persistence-failure test proves no new
-side effect after a failed durable write; existing restore tests pass.
+Evidence: `tests/test_multi_session_restore.py` (terminal-focused
+sibling restore, mixed A/B/C/D states, capture/extract/send, Codex
+live/complete/uncertain, auto-retry after restart, uncertain submit
+does not resend, claim conflict does not auto-advance, ledger
+candidate discovery when the snapshot is missing/corrupt, loop-finished
+and cancelled runs not resurrected, enumeration failure fail-closed,
+approval/stale/retry, queue loss and idempotency, worker uniqueness,
+needs_review claim conflict, global durability block/recover); Stage
+4/5 suites updated for mid-loop `completed` and cancel-wait isolation;
+`tests/test_chatgpt_handoff_queue.py` (mid-loop `completed` may
+enqueue; `failed` remains queue-terminal);
+`tests/test_multi_session_start.py` (`completed` does not give up the
+claim). Stage 1 (`tests/test_codex_invocation.py`,
+`tests/test_codex_services.py`), Stage 3 (handoff queue, UI lease,
+desktop mutex), Stage 4 concurrency, Stage 5 start, and the one-run
+ratchet (`tests/test_local_controller.py`,
+`tests/test_supervision_services.py`, `tests/test_local_server.py`,
+`tests/test_run_services.py`,
+`tests/test_ledger_destination_binding.py`) remain green.
 
 ### Files
 
-`agent/local_controller.py`, `agent/ledger.py`,
-`agent/supervision_services.py`, `tests/test_local_controller.py`.
+`agent/local_controller.py`, `agent/ledger.py`, `agent/local_server.py`,
+`tests/test_multi_session_restore.py`, plus focused updates in
+`tests/test_chatgpt_handoff_queue.py`,
+`tests/test_multi_session_start.py`,
+`tests/test_multi_session_concurrency.py`,
+`tests/test_local_controller.py`. `agent/supervision_services.py` was
+audited and not changed.
 
 ---
 
-## Stage 7 — Backend API and dashboard
+## Stage 7 — Backend API and dashboard — DONE
 
 ### Goal
 
 Start, watch, approve, retry, and stop up to four sessions without
-curling JSON.
+curling JSON. Presentation only: Stages 1–6 engine semantics are
+unchanged.
 
-### Work **[T]**
+### Delivered **[C]**
 
-- `GET /api/runs` — live sessions: project, chat, repo, controller state,
-  Codex status, queue position, whether this run currently owns the lane,
-  pending approval, retry/wait reason.
-- `/api/runs/<run_id>/progress|events|cancel|retry|approval` — approval
-  decisions name a `run_id`.
-- Keep `/api/runs/current*` bound to the focused session for
-  compatibility; a focus-switch endpoint changes only which run those
-  legacy routes address.
-- **Changing focus must never pause, tick, or otherwise touch a
-  background session.**
-- Explicit "start additional session" control (Stage 5's shape); same
-  form fields as today.
-- Dashboard: up to four session cards (chat/project/repo/state, lane
-  ownership, Codex status, approval prompt, wait reason, per-session
-  stop/approve/retry); detail view for the focused session. Remote phone
-  uses the same APIs — no second protocol.
-- Update `tests/test_web_static.py` URL contracts and
-  `tests/test_local_server.py`.
+- **Session list.** `GET /api/runs` → `LocalController.list_sessions()`.
+  Registered live/resumable sessions only (in-process `_sessions`, plus
+  a focused id not yet in the map). Not a historical catalog. Each
+  entry: `run_id`, project/chat/repo, `focused`/`live`/`terminal`,
+  controller/planner fields, `codex_running`, ChatGPT wait/lease/queue
+  attribution, approval, retry/reconciliation flags, `operator_status`
+  derived by `session_operator_view`, latest failure preview, timestamps.
+  List metadata: `focused_run_id`, `max_active_sessions`,
+  `live_session_count`, `session_capacity_remaining`,
+  `ledger_durability`, `chatgpt_lane` (lease owner + FIFO snapshot from
+  read-only `ledger.describe_chatgpt_handoff_queue()`).
+- **Per-run reads.** `GET /api/runs/<run_id>` (`get_run_state`) and
+  `GET /api/runs/<run_id>/progress|events` reuse existing controller
+  read models. Unknown ids → `run_not_found` / HTTP 404.
+  `/api/runs/current*` remain focused-run aliases.
+- **Focus.** `POST /api/runs/<run_id>/focus` (`focus_run`) updates
+  `active_run_id` and the mirrored compatibility fields only. Proven not
+  to pause, cancel, or change sibling worker/queue/approval state.
+- **Per-run controls.** `POST /api/runs/<run_id>/{cancel,approval,retry,tick}`
+  call the existing per-run controller methods. No fall-through to the
+  focused sibling. Legacy `/api/runs/current/cancel|retry`,
+  `/api/approval`, `/api/tick` still target focus. Per-run mutating
+  routes are `control` scope.
+- **Additional start UX.** Default Start still omits
+  `additional_session`. **Start additional session** appears when at
+  least one session is live, sends `additional_session: true`, and is
+  disabled at configured cap or while durability-blocked. Header shows
+  `live / max active`.
+- **Dashboard.** Session cards + focused detail. ChatGPT waiting uses
+  wait tone and “This is expected.” Approvals/Stop/Retry bind `run_id`.
+  Conversation-claim conflict is labeled as another session owning the
+  chat; Retry is withheld for that reason and for
+  `reconcile` / `retry_after_fix` / `review_required`. Global durability
+  banner is separate from per-session failures.
+- **SSE / polling.** Selected-run SSE plus JSON progress poll; list
+  refresh via `GET /api/runs`. Focus switch resets progress memory and
+  drops mismatched `run_id` events. No EventSource/localStorage/innerHTML.
+- **Remote.** Same authenticated server and authorization rules. No
+  second remote state model.
 
 ### Acceptance
 
-Contract tests for list, per-id routes, and focus semantics; with the
-additional-session control unused, the old form starts exactly one run
-and the old dashboard flow is unchanged. Browser pass against the
-headless/fake path only — live ChatGPT stays Stage 8.
+Contract tests for list, per-id routes, focus-only switching, isolated
+stop/approve/reject/retry, unknown-id fail-closed, Stage 5 additional
+start, capacity, durability visibility, and queue attribution. Static
+dashboard contracts cover cards, additional start, expected ChatGPT
+wait, per-session actions, and durability banner. With the additional
+control unused, the old form still starts exactly one run.
+`/api/runs/current*` remain aliases. Stage 4/5/6 suites remain green.
+Live ChatGPT stays Stage 8.
 
 ### Files
 
-`agent/local_server.py`, `agent/web_static/app.js`,
-`agent/web_static/index.html`, tests above.
+`agent/local_controller.py`, `agent/local_server.py`, `agent/ledger.py`,
+`agent/web_static/app.js`, `agent/web_static/index.html`,
+`agent/web_static/style.css`, `tests/test_multi_session_dashboard.py`,
+`tests/test_local_server.py`, `tests/test_web_static.py`,
+`tests/test_chatgpt_handoff_queue.py`.
 
 ---
 
@@ -461,12 +601,29 @@ explicit decision, with the default cap still 1 on merge.
 
 ## Open decisions (settle inside the named stage)
 
-1. Stage 5: additional-start route vs flag.
-2. Stage 6: exact durable-write failure detection points.
-3. Stage 8: whether Codex needs serializing after real quota behavior.
+1. Stage 8: whether Codex needs serializing after real quota behavior.
 
 Settled in Stage 3: yield-and-requeue reuses the wait-lane backoff
 (0.5s doubling to a capped 8s); no separate constants were needed.
+
+Settled in Stage 5: additional starts are a boolean flag
+(`additional_session`) on the existing start body, not a dedicated route —
+a legacy body physically cannot carry it. Forced navigation latches per
+run once it has coexisted with a live sibling and never reverts for that
+run. Same-chat uniqueness is atomic per ledger database via the
+conversation claim; cross-worktree uniqueness is documented as out of the
+claim's reach.
+
+Settled in Stage 6: correctness-critical durable writes are detected at
+the controller ledger wrapper (`DurabilityGuardedLedger`) rather than
+scattered try/except blocks; telemetry/progress and the controller
+snapshot are non-critical. Recovery is a dedicated
+`check_durable_write_health` write, not a successful read. `needs_review`
+remains reclaimable for a new start; a resumed/retried run must own the
+conversation claim before advancement and fails closed otherwise. Run
+status `completed` is mid-loop (not queue-terminal, not claim-
+reclaimable); loop-finished is planner `read_model.completed`. Focus on
+restore is UI-only and never determines which sessions exist.
 
 ## Amendment log
 
@@ -504,4 +661,58 @@ Settled in Stage 3: yield-and-requeue reuses the wait-lane backoff
   restore gap (terminal focused run drops live siblings on restore) is
   unchanged and still deferred; snapshot persistence of all live
   runtimes was verified correct.
-- (add entries here as stages complete)
+- 2026-09-16: Stage 5 complete. Audit findings: there was no external way
+  to request an additional session (any over-cap start returned
+  `active_run_exists`); same-chat uniqueness was in-process only
+  (registry check under `_lock`), not atomic across controller instances
+  or processes; destination binding recorded per-run identity with no
+  cross-run uniqueness; navigation flowed from the persisted run-started
+  event through the read model into three supervision call sites; on start
+  failure the created run kept its non-terminal status but was never
+  registered, so no phantom live runtime existed. Delivered: the
+  `additional_session` start flag with a conservative legacy default and
+  `session_capacity_reached`; server/CLI cap exposure
+  (`--max-active-sessions`, clamp to 4 unchanged); the atomic per-ledger
+  conversation claim with liveness/replaceable-status reclaim and release
+  on cancel/hard-terminal/failed-start; and the sticky per-run forced-
+  navigation latch for multi-live mode, persisted and restored. Lane,
+  queue, gate, and Stage 4 registry untouched. New suite
+  `tests/test_multi_session_start.py`; Stage 4 harness now starts siblings
+  explicitly. Known gaps recorded, not absorbed: cross-worktree
+  (separate-ledger) conversation uniqueness is not enforced in code; a
+  needs_review run resumed via retry after its conversation was reclaimed
+  by a new session could produce two live sessions on one chat — this
+  pre-existing replaceable-status semantics was settled in Stage 6
+  (re-verify/reclaim ownership before resumed advancement; fail closed).
+- 2026-09-16: Stage 6 complete. Restore audit confirmed the focused-run
+  early-return bug (terminal focused A dropped live B/C/D) and that
+  `completed` is mid-loop, not queue-terminal or claim-reclaimable.
+  Delivered: independent mixed-state restore from snapshot plus active
+  conversation claims; focus is UI-only; claim-on-resume fail-closed
+  (`conversation_claim_conflict`); queue reconstructed from planner
+  evidence (idempotent enqueue); workers spawned only for proven safe
+  work; global `LedgerDurabilityGuard` on correctness-critical writes
+  with `check_durable_write_health` recovery; snapshot/progress writes
+  classified non-critical. Additional start at cap>1 no longer drops a
+  finished focused sibling. New suite `tests/test_multi_session_restore.py`.
+  Cross-worktree conversation uniqueness remains out of scope.
+- 2026-09-16: Stage 6 recovery-gap patch. Safely retryable restored work
+  now auto-resumes with a fresh capped backoff instead of
+  `manual_retry_required`. Authoritative restore candidates come from
+  `list_restore_candidate_runs` (ledger run rows); snapshot and claims
+  are hints. Loop-finished runs are not resurrected. Authoritative
+  listing failure fail-closes via the durability guard rather than
+  booting empty and healthy. Remaining notes: `retry_after_fix`
+  (deterministic payload/integrity blockers) still does not auto-retry;
+  abandoned `created` runs with no controller-start configuration are
+  not restored; cross-worktree conversation uniqueness is unchanged.
+- 2026-09-16: Stage 7 complete. No Stage 7 architecture conflict with
+  the docs: focus stays UI/default routing; additional start stays the
+  Stage 5 `additional_session` flag; `/current` stays a focused alias.
+  Delivered the session-list read model, per-run read/control/focus
+  routes, dashboard session cards + detail, ChatGPT lane observability
+  from the existing queue/lease, selected-run SSE plus list polling,
+  global durability banner, and conversation-claim visibility. Engine
+  semantics were not redesigned. Remaining: Stage 8 torture and live
+  proof; no historical analytics product; recently terminal runs are
+  visible only while they remain in the in-process registry.

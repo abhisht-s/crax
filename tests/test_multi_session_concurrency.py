@@ -234,6 +234,20 @@ class MultiRunFakeLedger:
         with self._lock:
             return dict(self.controller_snapshot) if self.controller_snapshot else None
 
+    def check_durable_write_health(self) -> bool:
+        # Stage 6 durability probe: the fake ledger is always writable, so a
+        # simulated critical-write failure recovers on the next probe.
+        return True
+
+    def list_restore_candidate_runs(self) -> list[dict[str, str]]:
+        with self._lock:
+            return [
+                {"id": run_id, "status": str(run.get("status") or "")}
+                for run_id, run in self.runs.items()
+                if str(run.get("status") or "")
+                not in {RunStatus.FAILED.value, RunStatus.REJECTED.value}
+            ]
+
 
 @dataclass
 class FakeStepResult:
@@ -434,7 +448,13 @@ class SessionWorld:
     def supervision_step(self, run_id: str, repository_path: str, sandbox: str, **kwargs: Any) -> Any:
         with self._lock:
             self.step_calls.append(
-                {"run_id": run_id, "approval_mode": kwargs.get("approval_mode")}
+                {
+                    "run_id": run_id,
+                    "approval_mode": kwargs.get("approval_mode"),
+                    "allow_destination_navigation": kwargs.get(
+                        "allow_destination_navigation"
+                    ),
+                }
             )
             scripts = self._steps.get(run_id)
             script = scripts.pop(0) if scripts else None
@@ -469,10 +489,11 @@ class _ExecutorRecord:
 class PerRunInitialExecutor:
     """Fake Codex initial executor keyed by run_id (blocking optional)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, block_unconfigured: bool = False) -> None:
         self._lock = threading.Lock()
         self.records: dict[str, _ExecutorRecord] = {}
         self.calls: list[str] = []
+        self.block_unconfigured = block_unconfigured
 
     def configure(self, run_id: str, *, blocking: bool = False, result: Any = None) -> _ExecutorRecord:
         record = _ExecutorRecord(blocking=blocking)
@@ -482,12 +503,21 @@ class PerRunInitialExecutor:
             self.records[run_id] = record
         return record
 
+    def release_all(self) -> None:
+        with self._lock:
+            records = list(self.records.values())
+        for record in records:
+            record.release.set()
+
     def __call__(self, *, run_id: str, **kwargs: Any) -> Any:
         with self._lock:
             self.calls.append(run_id)
             record = self.records.get(run_id)
-        if record is None:
-            return InitialRunExecutionResult(ok=True)
+            if record is None:
+                if not self.block_unconfigured:
+                    return InitialRunExecutionResult(ok=True)
+                record = _ExecutorRecord(blocking=True)
+                self.records[run_id] = record
         record.entered.set()
         if record.blocking:
             record.release.wait(WAIT_TIMEOUT_SECONDS * 2)
@@ -537,13 +567,18 @@ def _start(
     chat: str,
     project: str = "craxii",
     instruction: str = "Task",
+    additional: bool = True,
 ):
+    # Stage 5: sibling starts must be explicit. This harness deliberately
+    # starts additional sessions, so it opts in by default; the legacy
+    # default-start contract is covered by tests/test_multi_session_start.py.
     return controller.start_run(
         repository_path=repo,
         initial_instruction=instruction,
         project_title=project,
         chat_title=chat,
         sandbox="read-only",
+        additional_session=additional,
     )
 
 
@@ -644,7 +679,7 @@ class MultiSessionCapacityTests(unittest.TestCase):
 
             fifth = _start(controller, repo, chat="Chat 5")
             self.assertFalse(fifth.ok)
-            self.assertEqual(fifth.reason_code, "active_run_exists")
+            self.assertEqual(fifth.reason_code, "session_capacity_reached")
 
             for record in records:
                 record.release.set()

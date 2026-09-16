@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import re
 import threading
 import time
 from dataclasses import asdict, is_dataclass
@@ -76,6 +77,7 @@ class LocalControllerServer:
         session: LocalControllerSession | None = None,
         remote_config: RemoteAccessConfig | None = None,
         remote_access: RemoteAccessManager | None = None,
+        max_active_sessions: int | None = None,
     ) -> None:
         if host != LOCAL_SERVER_BIND_HOST:
             raise ValueError("Local controller server must bind to 127.0.0.1.")
@@ -85,7 +87,10 @@ class LocalControllerServer:
             self.controller = controller
             self.session = session or controller.session
         else:
-            self.controller = LocalController(session=session)
+            controller_kwargs: dict[str, Any] = {}
+            if max_active_sessions is not None:
+                controller_kwargs["max_active_sessions"] = max_active_sessions
+            self.controller = LocalController(session=session, **controller_kwargs)
             self.session = self.controller.session
         self.remote_access = remote_access or (
             RemoteAccessManager(remote_config, ledger=self.controller.ledger)
@@ -309,6 +314,48 @@ def _make_handler(server_runtime: LocalControllerServer):
             if path == "/api/chatgpt-ui-lease":
                 self._write_json(200, _operation_payload(server_runtime.controller.get_chatgpt_ui_lease_status()))
                 return
+            if path == "/api/runs":
+                lister = getattr(server_runtime.controller, "list_sessions", None)
+                if not callable(lister):
+                    self._write_error(404, "route_not_found", "API route was not found.")
+                    return
+                self._write_json(200, _runs_list_payload(lister()))
+                return
+            run_resource = _match_run_resource(path)
+            if run_resource is not None:
+                run_id, action = run_resource
+                if action is None:
+                    reader = getattr(server_runtime.controller, "get_run_state", None)
+                    if not callable(reader):
+                        reader = server_runtime.controller.get_current_state
+                    result = reader(run_id)
+                    if getattr(result, "ok", False):
+                        self._write_json(200, _state_payload(result))
+                        return
+                    self._write_operation_result(result, success_status=200)
+                    return
+                if action == "progress":
+                    after_sequence, limit = _progress_query(query)
+                    _require_known_run(server_runtime.controller, run_id)
+                    self._write_json(
+                        200,
+                        _progress_payload(
+                            server_runtime,
+                            after_sequence=after_sequence,
+                            limit=limit,
+                            run_id=run_id,
+                        ),
+                    )
+                    return
+                if action == "events":
+                    after_sequence, limit = _progress_query(query)
+                    _require_known_run(server_runtime.controller, run_id)
+                    self._handle_progress_sse(
+                        after_sequence=after_sequence,
+                        limit=limit,
+                        run_id=run_id,
+                    )
+                    return
             self._write_error(404, "route_not_found", "API route was not found.")
 
         def _handle_post(self, path: str) -> None:
@@ -399,6 +446,104 @@ def _make_handler(server_runtime: LocalControllerServer):
                 self._audit_remote_result(result)
                 self._write_operation_result(result, success_status=202)
                 return
+            run_resource = _match_run_resource(path)
+            if run_resource is not None:
+                run_id, action = run_resource
+                _require_known_run(server_runtime.controller, run_id)
+                if action == "focus":
+                    payload = self._read_json_body(
+                        LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                        require_object=True,
+                        allow_empty=True,
+                    )
+                    if payload:
+                        raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                    focuser = getattr(server_runtime.controller, "focus_run", None)
+                    if not callable(focuser):
+                        self._write_error(404, "route_not_found", "API route was not found.")
+                        return
+                    result = focuser(run_id)
+                    self._audit_remote_result(result)
+                    self._write_operation_result(result, success_status=200)
+                    return
+                if action == "cancel":
+                    payload = self._read_json_body(
+                        LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                        require_object=True,
+                        allow_empty=True,
+                    )
+                    if payload:
+                        raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                    result = server_runtime.controller.request_cancel(run_id)
+                    self._audit_remote_result(result)
+                    self._write_operation_result(result, success_status=202)
+                    return
+                if action == "retry":
+                    payload = self._read_json_body(
+                        LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                        require_object=True,
+                        allow_empty=False,
+                    )
+                    _require_exact_fields(payload, {"failure_event_id"})
+                    failure_event_id = payload["failure_event_id"]
+                    if (
+                        not isinstance(failure_event_id, int)
+                        or isinstance(failure_event_id, bool)
+                        or failure_event_id <= 0
+                    ):
+                        raise LocalServerError(
+                            400,
+                            "invalid_failure_event_id",
+                            "failure_event_id must be a positive integer.",
+                        )
+                    result = server_runtime.controller.retry_failed_action(
+                        failure_event_id,
+                        run_id,
+                    )
+                    self._audit_remote_result(result)
+                    self._write_operation_result(
+                        result,
+                        success_status=202,
+                        default_failure_status=409,
+                    )
+                    return
+                if action == "approval":
+                    payload = self._read_json_body(
+                        LOCAL_SERVER_APPROVAL_BODY_LIMIT,
+                        require_object=True,
+                        allow_empty=False,
+                    )
+                    _require_exact_fields(payload, {"decision"})
+                    if payload["decision"] not in {"approved", "rejected"}:
+                        raise LocalServerError(
+                            400,
+                            "invalid_approval_decision",
+                            "Invalid approval decision. Expected approved or rejected.",
+                        )
+                    result = server_runtime.controller.submit_approval_decision(
+                        payload["decision"],
+                        run_id,
+                    )
+                    self._audit_remote_result(result)
+                    self._write_operation_result(result, success_status=202)
+                    return
+                if action == "tick":
+                    payload = self._read_json_body(
+                        LOCAL_SERVER_GENERIC_BODY_LIMIT,
+                        require_object=True,
+                        allow_empty=True,
+                    )
+                    if payload:
+                        raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                    result = server_runtime.controller.request_automatic_progress(run_id)
+                    self._audit_remote_result(result)
+                    status = 202 if result.ok else 200
+                    self._write_operation_result(
+                        result,
+                        success_status=status,
+                        default_failure_status=200,
+                    )
+                    return
             if path == "/api/remote/devices/revoke":
                 payload = self._read_json_body(
                     LOCAL_SERVER_GENERIC_BODY_LIMIT,
@@ -533,7 +678,13 @@ def _make_handler(server_runtime: LocalControllerServer):
                 status = 501
             self._write_json(status, payload)
 
-        def _handle_progress_sse(self, *, after_sequence: int, limit: int) -> None:
+        def _handle_progress_sse(
+            self,
+            *,
+            after_sequence: int,
+            limit: int,
+            run_id: str | None = None,
+        ) -> None:
             self.send_response(200)
             self.send_header("Content-Type", SSE_CONTENT_TYPE)
             self.send_header("Cache-Control", "no-store")
@@ -547,6 +698,7 @@ def _make_handler(server_runtime: LocalControllerServer):
                     server_runtime,
                     after_sequence=latest_sequence,
                     limit=limit,
+                    run_id=run_id,
                 )
                 progress = payload.get("metadata", {}).get("progress", {})
                 events = progress.get("events") if isinstance(progress, dict) else []
@@ -755,7 +907,74 @@ def _required_scope(method: str, path: str) -> str:
         "/api/runs/current/cancel",
     }:
         return "control"
+    run_resource = _match_run_resource(path)
+    if run_resource is not None:
+        _run_id, action = run_resource
+        if action in {"cancel", "retry", "approval", "tick", "focus"}:
+            return "control"
     return "admin"
+
+
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_RUN_RESOURCE_ACTIONS = {
+    None,
+    "progress",
+    "events",
+    "cancel",
+    "retry",
+    "approval",
+    "tick",
+    "focus",
+}
+
+
+def _match_run_resource(path: str) -> tuple[str, str | None] | None:
+    if not path.startswith("/api/runs/"):
+        return None
+    rest = path[len("/api/runs/") :]
+    if rest in {"start", "current"} or rest.startswith("current/"):
+        return None
+    parts = rest.split("/")
+    if not parts or not parts[0] or len(parts) > 2:
+        return None
+    run_id = parts[0]
+    action = parts[1] if len(parts) == 2 else None
+    if not _RUN_ID_RE.fullmatch(run_id):
+        return None
+    if action not in _RUN_RESOURCE_ACTIONS:
+        return None
+    return run_id, action
+
+
+def _require_known_run(controller: Any, run_id: str) -> None:
+    reader = getattr(controller, "known_session_run_ids", None)
+    if not callable(reader):
+        return
+    known = reader()
+    try:
+        known_ids = set(known)
+    except TypeError:
+        return
+    if run_id not in known_ids:
+        raise LocalServerError(404, "run_not_found", "Unknown or stale run_id.")
+
+
+def _runs_list_payload(result: Any) -> dict[str, Any]:
+    metadata = getattr(result, "metadata", {}) or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "ok": bool(getattr(result, "ok", False)),
+        "reason_code": getattr(result, "reason_code", None),
+        "error_message": getattr(result, "error_message", None),
+        "focused_run_id": metadata.get("focused_run_id"),
+        "max_active_sessions": metadata.get("max_active_sessions"),
+        "live_session_count": metadata.get("live_session_count"),
+        "session_capacity_remaining": metadata.get("session_capacity_remaining"),
+        "ledger_durability": _json_safe(metadata.get("ledger_durability")),
+        "chatgpt_lane": _json_safe(metadata.get("chatgpt_lane") or {}),
+        "sessions": _json_safe(metadata.get("sessions") or []),
+    }
 
 
 def _require_remote_access(server_runtime: LocalControllerServer) -> RemoteAccessManager:
@@ -816,7 +1035,12 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
         "project_title",
         "chat_title",
     }
-    optional = {"model", "allow_destination_navigation", "full_access_confirmation"}
+    optional = {
+        "model",
+        "allow_destination_navigation",
+        "full_access_confirmation",
+        "additional_session",
+    }
     keys = set(payload)
     if missing := required - keys:
         raise LocalServerError(
@@ -869,6 +1093,15 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
                 "allow_destination_navigation must be a boolean.",
             )
         kwargs["allow_destination_navigation"] = allow_navigation
+    if "additional_session" in payload:
+        additional_session = payload["additional_session"]
+        if not isinstance(additional_session, bool):
+            raise LocalServerError(
+                400,
+                "invalid_request_shape",
+                "additional_session must be a boolean.",
+            )
+        kwargs["additional_session"] = additional_session
     return kwargs
 
 
@@ -985,7 +1218,14 @@ def _progress_payload(
     *,
     after_sequence: int,
     limit: int,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
+    if run_id:
+        progress_reader = getattr(server_runtime.controller, "get_run_progress", None)
+        if callable(progress_reader):
+            return _operation_payload(
+                progress_reader(run_id, after_sequence=after_sequence, limit=limit)
+            )
     progress_reader = getattr(server_runtime.controller, "get_current_progress", None)
     if callable(progress_reader):
         return _operation_payload(
@@ -1018,8 +1258,14 @@ def _valid_sha256(value: str) -> bool:
 
 
 def _status_for_reason(reason: str, *, default_failure_status: int | None = None) -> int:
+    if reason == "run_not_found":
+        return 404 if default_failure_status is None else default_failure_status
     if reason in {
         "active_run_exists",
+        "session_capacity_reached",
+        "duplicate_chatgpt_conversation",
+        "conversation_claim_conflict",
+        "ledger_durability_blocked",
         "no_pending_approval",
         "action_already_running",
         "pending_approval_exists",
@@ -1051,6 +1297,7 @@ def _status_for_reason(reason: str, *, default_failure_status: int | None = None
         "destination_required",
         "invalid_destination",
         "no_active_run",
+        "invalid_run_id",
         "no_routine_action_available",
         "manual_stale_lease_confirmation_required",
         "manual_stale_lease_reason_required",
@@ -1253,6 +1500,16 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Allow paired remote admins to request Full Access with a typed per-run confirmation.",
     )
+    parser.add_argument(
+        "--max-active-sessions",
+        type=int,
+        default=None,
+        help=(
+            "Configured cap on concurrent live sessions (1-4, hard product cap 4). "
+            "Default is 1. Additional sessions still require an explicit "
+            "additional_session start request."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.host != LOCAL_SERVER_BIND_HOST:
         parser.exit(2, "error: local server host must be 127.0.0.1\n")
@@ -1270,10 +1527,14 @@ def main(argv: list[str] | None = None) -> None:
     elif args.repository_root or args.allow_remote_full_access:
         parser.error("--repository-root and --allow-remote-full-access require --remote-base-url.")
 
+    if args.max_active_sessions is not None and not 1 <= args.max_active_sessions <= 4:
+        parser.error("--max-active-sessions must be between 1 and 4.")
+
     server = LocalControllerServer(
         host=args.host,
         port=args.port,
         remote_config=remote_config,
+        max_active_sessions=args.max_active_sessions,
     )
     try:
         server.start()

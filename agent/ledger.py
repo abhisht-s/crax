@@ -121,12 +121,53 @@ CHATGPT_UI_LEASE_STALE_OWNER_RECOVERY_SOURCE = "stale_owner_recovery"
 CHATGPT_HANDOFF_CLAIM_OWNER_DEAD_REASON_CODE = "chatgpt_handoff_claim_owner_dead"
 CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE = "chatgpt_handoff_run_terminal"
 # Hard-terminal run states for the handoff queue: a run in one of these states
-# can never legitimately perform a ChatGPT handoff again. needs_review and
-# waiting_for_approval are excluded because a human decision can resume them.
+# can never legitimately perform a ChatGPT handoff again.
+#
+# `completed` is deliberately excluded. Governance maps a successful Codex
+# iteration to run status `completed` as the *mid-loop* "this Codex result is
+# ready to send" state (`can_continue_run` is true; the planner then returns
+# `ask_send_to_gpt`). Treating that status as queue-terminal would refuse the
+# normal send path and Stage 6 queue reconstruction. Loop-finished is the
+# planner STOP reason `extracted_prompt_already_run` (read_model.completed),
+# not this status. needs_review and waiting_for_approval are excluded because
+# a human decision can resume them.
 HANDOFF_TERMINAL_RUN_STATUSES = frozenset(
     {
-        RunStatus.COMPLETED.value,
         RunStatus.FAILED.value,
+        RunStatus.REJECTED.value,
+    }
+)
+# ChatGPT conversation ownership claims (Stage 5). At most one live run may
+# own a given (project_title, chat_title) within this ledger database. A claim
+# held by a run in one of the replaceable statuses below, or by a provably
+# dead process instance, is reclaimable by the next claimer in the same
+# BEGIN IMMEDIATE transaction; a live or unproven owner fails closed.
+CHATGPT_CONVERSATION_CLAIMED_EVENT_TYPE = "chatgpt_conversation_claimed"
+CHATGPT_CONVERSATION_CLAIMED_MESSAGE = "ChatGPT conversation claimed for run."
+CHATGPT_CONVERSATION_CLAIM_RELEASED_EVENT_TYPE = "chatgpt_conversation_claim_released"
+CHATGPT_CONVERSATION_CLAIM_RELEASED_MESSAGE = "ChatGPT conversation claim released."
+CHATGPT_CONVERSATION_CLAIM_SCHEMA_VERSION = 1
+CHATGPT_CONVERSATION_CLAIM_EVENT_TYPES = (
+    CHATGPT_CONVERSATION_CLAIMED_EVENT_TYPE,
+    CHATGPT_CONVERSATION_CLAIM_RELEASED_EVENT_TYPE,
+)
+CONVERSATION_CLAIM_OWNER_RUN_REPLACEABLE_REASON_CODE = (
+    "chatgpt_conversation_claim_owner_run_replaceable"
+)
+CONVERSATION_CLAIM_OWNER_PROCESS_DEAD_REASON_CODE = (
+    "chatgpt_conversation_claim_owner_process_dead"
+)
+# A claim is reclaimable by a *new* start when the owning run is absorbing
+# for start/replacement purposes, or the owner process is provably dead.
+# `completed` is excluded: that status is the normal mid-loop value after
+# Codex governance, so a live/resumable session must keep exclusive ownership
+# until the loop actually finishes (controller releases the claim) or the
+# owner process is dead. needs_review stays reclaimable so a new start may
+# take the chat; resume of the old run then fails closed if the claim is gone.
+CONVERSATION_CLAIM_REPLACEABLE_RUN_STATUSES = frozenset(
+    {
+        RunStatus.FAILED.value,
+        RunStatus.NEEDS_REVIEW.value,
         RunStatus.REJECTED.value,
     }
 )
@@ -163,6 +204,17 @@ class AtomicChatGPTUILeaseStatus(StrEnum):
     TOKEN_MISMATCH = "token_mismatch"
     CONFIRMATION_REQUIRED = "confirmation_required"
     ACTIVE_LEASE_MISMATCH = "active_lease_mismatch"
+    INVALID = "invalid"
+    OPERATIONAL_FAILURE = "operational_failure"
+
+
+class AtomicConversationClaimStatus(StrEnum):
+    RUN_NOT_FOUND = "run_not_found"
+    CLAIMED = "claimed"
+    IDEMPOTENT = "idempotent"
+    DUPLICATE = "duplicate"
+    RELEASED = "released"
+    IDEMPOTENT_RELEASE = "idempotent_release"
     INVALID = "invalid"
     OPERATIONAL_FAILURE = "operational_failure"
 
@@ -245,6 +297,32 @@ class ChatGPTUILeaseTokenRedactionResult:
     metadata: dict | None = None
     reason_code: str | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class AtomicConversationClaimResult:
+    status: AtomicConversationClaimStatus
+    run_id: str
+    project_title: str | None = None
+    chat_title: str | None = None
+    owning_run_id: str | None = None
+    reclaimed_from_run_id: str | None = None
+    reclaim_reason_code: str | None = None
+    event_id: int | None = None
+    event_written: bool = False
+    reason_code: str | None = None
+    error_message: str | None = None
+    event_ids: tuple[int, ...] = ()
+    released_identities: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class _ConversationClaim:
+    project_title: str
+    chat_title: str
+    owning_run_id: str
+    claim_event_id: int
+    owner_identity: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -393,6 +471,53 @@ def _init_schema(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS durability_health (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            checked_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def check_durable_write_health() -> bool:
+    """Prove the ledger currently accepts durable writes.
+
+    Stage 6 durability recovery probe: a deliberate committed write to a
+    dedicated single-row table, not an unrelated read. Returns True only when
+    a `BEGIN IMMEDIATE` transaction commits; any sqlite failure returns False
+    so an unproven recovery keeps the global durability block in place.
+    """
+
+    connection: sqlite3.Connection | None = None
+    transaction_started = False
+    try:
+        connection = _connect()
+        _init_schema(connection)
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        transaction_started = True
+        connection.execute(
+            """
+            INSERT INTO durability_health (singleton_id, checked_at)
+            VALUES (1, ?)
+            ON CONFLICT(singleton_id) DO UPDATE SET
+                checked_at = excluded.checked_at
+            """,
+            (_utc_now(),),
+        )
+        connection.commit()
+        transaction_started = False
+        return True
+    except sqlite3.Error:
+        if connection is not None and transaction_started:
+            with suppress(sqlite3.Error):
+                connection.rollback()
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def init_db() -> None:
@@ -595,6 +720,40 @@ def get_run(run_id: str) -> dict | None:
         ).fetchone()
 
     return dict(row) if row is not None else None
+
+
+def list_restore_candidate_runs() -> list[dict[str, str]]:
+    """Return durable runs that may still need controller recovery.
+
+    The controller snapshot is a convenience read model. This listing is the
+    authoritative candidate source: every run whose status is not absorbing
+    (`failed` / `rejected`). Run status `completed` is included because it is
+    mid-loop after Codex governance; the controller then uses planner
+    completion (`read_model.completed`) to skip truly finished loops.
+
+    Raises ``sqlite3.Error`` when the ledger cannot be read so restore can
+    fail closed instead of booting as an empty healthy controller.
+    """
+
+    init_db()
+    with closing(_connect()) as connection:
+        rows = connection.execute(
+            """
+            SELECT id, status
+            FROM runs
+            WHERE status NOT IN (?, ?)
+            ORDER BY created_at ASC, id ASC
+            """,
+            (RunStatus.FAILED.value, RunStatus.REJECTED.value),
+        ).fetchall()
+    return [
+        {
+            "id": str(row["id"]),
+            "status": str(row["status"] or ""),
+        }
+        for row in rows
+        if row["id"]
+    ]
 
 
 def list_events(run_id: str) -> list[dict]:
@@ -1024,6 +1183,64 @@ def list_chatgpt_handoff_queue_events() -> list[dict]:
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def describe_chatgpt_handoff_queue() -> dict[str, Any]:
+    """Read-only FIFO snapshot of pending/claimed ChatGPT handoff entries.
+
+    This does not claim, expire, or otherwise mutate queue state. Stage 7
+    uses it for dashboard lane observability only.
+    """
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect()
+        _init_schema(connection)
+        connection.commit()
+        rows = _select_handoff_queue_state_rows(connection)
+    except sqlite3.Error as exc:
+        return {
+            "ok": False,
+            "reason_code": "chatgpt_handoff_queue_read_failed",
+            "error_message": f"Failed to read ChatGPT handoff queue: {exc}",
+            "head_run_id": None,
+            "head_status": None,
+            "entries": [],
+        }
+    finally:
+        if connection is not None:
+            connection.close()
+
+    state = _reconstruct_handoff_queue_state(rows)
+    if state.status == AtomicChatGPTHandoffQueueStatus.INVALID:
+        return {
+            "ok": False,
+            "reason_code": state.reason_code,
+            "error_message": state.error_message,
+            "head_run_id": None,
+            "head_status": None,
+            "entries": [],
+        }
+
+    active = [entry for entry in state.entries if entry.status in {"pending", "claimed"}]
+    head = active[0] if active else None
+    entries = [
+        {
+            "run_id": entry.run_id,
+            "position": index,
+            "queue_sequence": entry.queue_sequence,
+            "status": entry.status,
+            "is_head": head is not None and entry.queue_sequence == head.queue_sequence,
+        }
+        for index, entry in enumerate(active, start=1)
+    ]
+    return {
+        "ok": True,
+        "reason_code": "chatgpt_handoff_queue_described",
+        "head_run_id": head.run_id if head is not None else None,
+        "head_status": head.status if head is not None else None,
+        "entries": entries,
+    }
 
 
 def _run_status_for_handoff_queue(
@@ -2424,6 +2641,377 @@ def bind_run_destination(
     finally:
         if connection is not None:
             connection.close()
+
+
+def _conversation_claim_owner_identity(
+    controller_instance_id: str | None,
+) -> dict[str, Any]:
+    pid = os.getpid()
+    pgid = process_group_id(pid)
+    return {
+        "controller_instance_id": controller_instance_id or f"process-{pid}",
+        "boot_id": boot_identity(),
+        "pid": pid,
+        "pgid": pgid if pgid is not None else pid,
+        "process_start_identity": process_start_identity(pid),
+    }
+
+
+def _reconstruct_conversation_claims(
+    rows: list[sqlite3.Row],
+) -> dict[tuple[str, str], _ConversationClaim] | None:
+    """Replay claim/release events into active claims. None means malformed."""
+
+    active: dict[tuple[str, str], _ConversationClaim] = {}
+    for row in rows:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        if metadata.get("schema_version") != CHATGPT_CONVERSATION_CLAIM_SCHEMA_VERSION:
+            return None
+        project_title = metadata.get("project_title")
+        chat_title = metadata.get("chat_title")
+        if not isinstance(project_title, str) or not isinstance(chat_title, str):
+            return None
+        identity_key = (project_title, chat_title)
+        if row["event_type"] == CHATGPT_CONVERSATION_CLAIMED_EVENT_TYPE:
+            owner_identity = metadata.get("owner_identity")
+            active[identity_key] = _ConversationClaim(
+                project_title=project_title,
+                chat_title=chat_title,
+                owning_run_id=str(row["run_id"]),
+                claim_event_id=int(row["id"]),
+                owner_identity=owner_identity if isinstance(owner_identity, dict) else None,
+            )
+            continue
+        released_run_id = metadata.get("owning_run_id")
+        existing = active.get(identity_key)
+        if existing is not None and existing.owning_run_id == released_run_id:
+            del active[identity_key]
+    return active
+
+
+def _select_conversation_claim_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT id, run_id, event_type, metadata_json
+        FROM events
+        WHERE event_type IN (?, ?)
+        ORDER BY id ASC
+        """,
+        CHATGPT_CONVERSATION_CLAIM_EVENT_TYPES,
+    ).fetchall()
+
+
+def _insert_conversation_claim_release_event(
+    connection: sqlite3.Connection,
+    claim: _ConversationClaim,
+    *,
+    reason_code: str,
+    released_by_run_id: str | None,
+) -> int | None:
+    metadata = _compact_optional_metadata(
+        {
+            "schema_version": CHATGPT_CONVERSATION_CLAIM_SCHEMA_VERSION,
+            "project_title": claim.project_title,
+            "chat_title": claim.chat_title,
+            "owning_run_id": claim.owning_run_id,
+            "claim_event_id": claim.claim_event_id,
+            "reason_code": reason_code,
+            "released_by_run_id": released_by_run_id,
+            "released_by_pid": os.getpid(),
+        }
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO events (run_id, created_at, event_type, message, metadata_json)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            claim.owning_run_id,
+            _utc_now(),
+            CHATGPT_CONVERSATION_CLAIM_RELEASED_EVENT_TYPE,
+            CHATGPT_CONVERSATION_CLAIM_RELEASED_MESSAGE,
+            json.dumps(metadata, sort_keys=True),
+        ),
+    )
+    event_id = cursor.lastrowid
+    return event_id if isinstance(event_id, int) else None
+
+
+def claim_chatgpt_conversation(
+    run_id: str,
+    project_title: str,
+    chat_title: str,
+    *,
+    controller_instance_id: str | None = None,
+) -> AtomicConversationClaimResult:
+    """Atomically claim exclusive live ownership of one ChatGPT conversation.
+
+    At most one live run may own a given ``(project_title, chat_title)`` in
+    this ledger database. Racing claimers are serialized by ``BEGIN
+    IMMEDIATE``, so exactly one wins. An existing claim is reclaimed only when
+    the owning run is in a replaceable status or the recorded owner process
+    instance is provably dead; a live or unproven owner of a non-replaceable
+    run fails closed as ``DUPLICATE``. Separate ledger databases (for example
+    separate worktrees) are not covered by this claim.
+    """
+
+    connection: sqlite3.Connection | None = None
+    transaction_started = False
+    try:
+        connection = _connect()
+        _init_schema(connection)
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        transaction_started = True
+
+        run = connection.execute(
+            "SELECT id FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if run is None:
+            connection.rollback()
+            transaction_started = False
+            return AtomicConversationClaimResult(
+                status=AtomicConversationClaimStatus.RUN_NOT_FOUND,
+                run_id=run_id,
+                project_title=project_title,
+                chat_title=chat_title,
+                reason_code="run_not_found",
+                error_message=f"Run not found: {run_id}",
+            )
+
+        claims = _reconstruct_conversation_claims(
+            _select_conversation_claim_rows(connection)
+        )
+        if claims is None:
+            connection.rollback()
+            transaction_started = False
+            return AtomicConversationClaimResult(
+                status=AtomicConversationClaimStatus.INVALID,
+                run_id=run_id,
+                project_title=project_title,
+                chat_title=chat_title,
+                reason_code="malformed_conversation_claim_events",
+                error_message="Conversation claim events could not be reconstructed.",
+            )
+
+        existing = claims.get((project_title, chat_title))
+        reclaimed_from_run_id: str | None = None
+        reclaim_reason_code: str | None = None
+        event_ids: list[int] = []
+        if existing is not None:
+            if existing.owning_run_id == run_id:
+                connection.rollback()
+                transaction_started = False
+                return AtomicConversationClaimResult(
+                    status=AtomicConversationClaimStatus.IDEMPOTENT,
+                    run_id=run_id,
+                    project_title=project_title,
+                    chat_title=chat_title,
+                    owning_run_id=run_id,
+                    event_ids=(existing.claim_event_id,),
+                )
+            owner_row = connection.execute(
+                "SELECT status FROM runs WHERE id = ?",
+                (existing.owning_run_id,),
+            ).fetchone()
+            owner_status = str(owner_row["status"]) if owner_row is not None else ""
+            if owner_status in CONVERSATION_CLAIM_REPLACEABLE_RUN_STATUSES:
+                reclaim_reason_code = CONVERSATION_CLAIM_OWNER_RUN_REPLACEABLE_REASON_CODE
+            elif (
+                process_instance_liveness(existing.owner_identity)
+                == PROCESS_INSTANCE_DEAD
+            ):
+                reclaim_reason_code = CONVERSATION_CLAIM_OWNER_PROCESS_DEAD_REASON_CODE
+            else:
+                connection.rollback()
+                transaction_started = False
+                return AtomicConversationClaimResult(
+                    status=AtomicConversationClaimStatus.DUPLICATE,
+                    run_id=run_id,
+                    project_title=project_title,
+                    chat_title=chat_title,
+                    owning_run_id=existing.owning_run_id,
+                    reason_code="duplicate_chatgpt_conversation",
+                    error_message=(
+                        "A live session already owns this ChatGPT project and chat "
+                        f"(run {existing.owning_run_id})."
+                    ),
+                    event_ids=(existing.claim_event_id,),
+                )
+            reclaimed_from_run_id = existing.owning_run_id
+            release_event_id = _insert_conversation_claim_release_event(
+                connection,
+                existing,
+                reason_code=reclaim_reason_code,
+                released_by_run_id=run_id,
+            )
+            if release_event_id is not None:
+                event_ids.append(release_event_id)
+
+        metadata = _compact_optional_metadata(
+            {
+                "schema_version": CHATGPT_CONVERSATION_CLAIM_SCHEMA_VERSION,
+                "project_title": project_title,
+                "chat_title": chat_title,
+                "owner_identity": _conversation_claim_owner_identity(
+                    controller_instance_id
+                ),
+                "reclaimed_from_run_id": reclaimed_from_run_id,
+                "reclaim_reason_code": reclaim_reason_code,
+            }
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO events (run_id, created_at, event_type, message, metadata_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                _utc_now(),
+                CHATGPT_CONVERSATION_CLAIMED_EVENT_TYPE,
+                CHATGPT_CONVERSATION_CLAIMED_MESSAGE,
+                json.dumps(metadata, sort_keys=True),
+            ),
+        )
+        claim_event_id = cursor.lastrowid
+        if isinstance(claim_event_id, int):
+            event_ids.append(claim_event_id)
+        connection.commit()
+        transaction_started = False
+        return AtomicConversationClaimResult(
+            status=AtomicConversationClaimStatus.CLAIMED,
+            run_id=run_id,
+            project_title=project_title,
+            chat_title=chat_title,
+            owning_run_id=run_id,
+            reclaimed_from_run_id=reclaimed_from_run_id,
+            reclaim_reason_code=reclaim_reason_code,
+            event_id=claim_event_id if isinstance(claim_event_id, int) else None,
+            event_written=True,
+            event_ids=tuple(event_ids),
+        )
+    except sqlite3.Error as exc:
+        if connection is not None and transaction_started:
+            with suppress(sqlite3.Error):
+                connection.rollback()
+        return AtomicConversationClaimResult(
+            status=AtomicConversationClaimStatus.OPERATIONAL_FAILURE,
+            run_id=run_id,
+            project_title=project_title,
+            chat_title=chat_title,
+            reason_code="conversation_claim_transaction_failed",
+            error_message=f"Failed to claim ChatGPT conversation: {exc}",
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def release_chatgpt_conversation_claim(
+    run_id: str,
+    *,
+    reason: str | None = None,
+) -> AtomicConversationClaimResult:
+    """Release every active conversation claim owned by ``run_id``. Idempotent."""
+
+    connection: sqlite3.Connection | None = None
+    transaction_started = False
+    try:
+        connection = _connect()
+        _init_schema(connection)
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        transaction_started = True
+
+        claims = _reconstruct_conversation_claims(
+            _select_conversation_claim_rows(connection)
+        )
+        if claims is None:
+            connection.rollback()
+            transaction_started = False
+            return AtomicConversationClaimResult(
+                status=AtomicConversationClaimStatus.INVALID,
+                run_id=run_id,
+                reason_code="malformed_conversation_claim_events",
+                error_message="Conversation claim events could not be reconstructed.",
+            )
+
+        owned = [
+            claim for claim in claims.values() if claim.owning_run_id == run_id
+        ]
+        if not owned:
+            connection.rollback()
+            transaction_started = False
+            return AtomicConversationClaimResult(
+                status=AtomicConversationClaimStatus.IDEMPOTENT_RELEASE,
+                run_id=run_id,
+            )
+
+        event_ids: list[int] = []
+        released: list[tuple[str, str]] = []
+        for claim in owned:
+            event_id = _insert_conversation_claim_release_event(
+                connection,
+                claim,
+                reason_code=reason or "released_by_owner",
+                released_by_run_id=run_id,
+            )
+            if event_id is not None:
+                event_ids.append(event_id)
+            released.append((claim.project_title, claim.chat_title))
+        connection.commit()
+        transaction_started = False
+        return AtomicConversationClaimResult(
+            status=AtomicConversationClaimStatus.RELEASED,
+            run_id=run_id,
+            event_written=True,
+            event_ids=tuple(event_ids),
+            released_identities=tuple(released),
+        )
+    except sqlite3.Error as exc:
+        if connection is not None and transaction_started:
+            with suppress(sqlite3.Error):
+                connection.rollback()
+        return AtomicConversationClaimResult(
+            status=AtomicConversationClaimStatus.OPERATIONAL_FAILURE,
+            run_id=run_id,
+            reason_code="conversation_claim_release_transaction_failed",
+            error_message=f"Failed to release ChatGPT conversation claim: {exc}",
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def list_active_chatgpt_conversation_claims() -> list[dict[str, str]]:
+    """Return the current conversation-claim owners in this ledger database.
+
+    Stage 6 restore uses this as durable evidence when the controller
+    snapshot is missing or incomplete. Separate ledger databases are not
+    covered. Returns an empty list when events are missing or malformed.
+    """
+
+    init_db()
+    with closing(_connect()) as connection:
+        claims = _reconstruct_conversation_claims(
+            _select_conversation_claim_rows(connection)
+        )
+    if not claims:
+        return []
+    return [
+        {
+            "run_id": claim.owning_run_id,
+            "project_title": claim.project_title,
+            "chat_title": claim.chat_title,
+        }
+        for claim in claims.values()
+    ]
 
 
 def bind_run_execution_profile(

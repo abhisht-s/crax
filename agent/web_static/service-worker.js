@@ -1,4 +1,4 @@
-const SHELL_CACHE = "crax-shell-v1";
+const SHELL_CACHE = "crax-shell-v2";
 const SHELL_ASSETS = [
   "/",
   "/assets/style.css",

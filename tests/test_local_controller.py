@@ -257,6 +257,23 @@ class FakeLedger:
             return None
         return dict(self.controller_snapshot)
 
+    def check_durable_write_health(self) -> bool:
+        # Stage 6: injected operational_failure on bind/profile is a simulated
+        # critical write; the fake ledger itself remains writable, so the next
+        # start may prove recovery without staying globally blocked.
+        return True
+
+    def list_restore_candidate_runs(self) -> list[dict[str, str]]:
+        if self.run is None:
+            return []
+        status = str(self.run.get("status") or "")
+        if status in {RunStatus.FAILED.value, RunStatus.REJECTED.value}:
+            return []
+        run_id = str(self.run.get("id") or "")
+        if not run_id:
+            return []
+        return [{"id": run_id, "status": status}]
+
 
 class Planner:
     def __init__(self, plan: SupervisePlan) -> None:
@@ -1769,7 +1786,9 @@ class LocalControllerStateMachineTests(unittest.TestCase):
         args, kwargs = coordinator.call_args
         self.assertEqual(args[:5], ("run-1", ledger.run, "Task", str(Path(repo).resolve()), "read-only"))
         self.assertIsNone(args[5])
-        self.assertIs(kwargs["ledger"], ledger)
+        # Stage 6: the controller's ledger handle is the durability-guarded
+        # wrapper; delegation still targets the injected ledger underneath.
+        self.assertIs(kwargs["ledger"].wrapped, ledger)
         self.assertEqual(state["controller_state"], "idle")
         self.assertGreaterEqual(len(read_models.calls), 2)
 
@@ -1796,7 +1815,7 @@ class LocalControllerStateMachineTests(unittest.TestCase):
         args, kwargs = coordinator.call_args
         self.assertEqual(args[:5], ("run-1", ledger.run, "Task", str(Path(repo).resolve()), "read-only"))
         self.assertIsNone(args[5])
-        self.assertIs(kwargs["ledger"], ledger)
+        self.assertIs(kwargs["ledger"].wrapped, ledger)
 
     def test_routine_progression_calls_step_once_then_stops_at_approval(self) -> None:
         routine = _model(action="capture_gpt_response", routine=True, stage="routine_action_available")

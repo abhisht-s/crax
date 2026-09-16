@@ -31,10 +31,21 @@ class FakeController:
         self.pending_approval_available = False
         self.start_calls: list[dict] = []
         self.state_calls = 0
+        self.state_run_ids: list[str | None] = []
         self.approval_calls: list[str] = []
+        self.approval_run_ids: list[str | None] = []
         self.tick_calls = 0
+        self.tick_run_ids: list[str | None] = []
         self.retry_calls: list[int] = []
+        self.retry_run_ids: list[str | None] = []
         self.cancel_calls = 0
+        self.cancel_run_ids: list[str | None] = []
+        self.focus_calls: list[str] = []
+        self.list_calls = 0
+        self.progress_run_ids: list[str | None] = []
+        self.known_ids: set[str] = {"run-1"}
+        self.list_result = None
+        self.focus_result = None
         self.lease_status_calls = 0
         self.lease_release_calls: list[dict] = []
         self.progress_calls: list[dict] = []
@@ -113,28 +124,77 @@ class FakeController:
         self.start_calls.append(kwargs)
         return self.start_result
 
-    def get_current_state(self):
+    def known_session_run_ids(self):
+        return set(self.known_ids)
+
+    def list_sessions(self):
+        self.list_calls += 1
+        if self.list_result is not None:
+            return self.list_result
+        return self._result(
+            ok=True,
+            reason="sessions_listed",
+            run_id=self.session.active_run_id,
+            metadata={
+                "focused_run_id": self.session.active_run_id,
+                "max_active_sessions": 1,
+                "live_session_count": 0,
+                "session_capacity_remaining": 1,
+                "ledger_durability": {"blocked": False},
+                "chatgpt_lane": {"lease_active": False, "queue": []},
+                "sessions": [],
+            },
+        )
+
+    def focus_run(self, run_id: str):
+        self.focus_calls.append(run_id)
+        if self.focus_result is not None:
+            return self.focus_result
+        self.session.active_run_id = run_id
+        return self._result(ok=True, reason="run_focused", run_id=run_id)
+
+    def get_current_state(self, run_id: str | None = None):
         self.state_calls += 1
+        self.state_run_ids.append(run_id)
         return self.state_result
 
-    def submit_approval_decision(self, decision: str):
+    def get_run_state(self, run_id: str):
+        self.state_calls += 1
+        self.state_run_ids.append(run_id)
+        if run_id not in self.known_ids:
+            return self._result(ok=False, reason="run_not_found", error="Unknown or stale run_id.")
+        return self.state_result
+
+    def submit_approval_decision(self, decision: str, run_id: str | None = None):
         self.approval_calls.append(decision)
+        self.approval_run_ids.append(run_id)
         return self.approval_result
 
-    def request_automatic_progress(self):
+    def request_automatic_progress(self, run_id: str | None = None):
         self.tick_calls += 1
+        self.tick_run_ids.append(run_id)
         return self.tick_result
 
-    def retry_failed_action(self, failure_event_id: int):
+    def retry_failed_action(self, failure_event_id: int, run_id: str | None = None):
         self.retry_calls.append(failure_event_id)
+        self.retry_run_ids.append(run_id)
         return self.retry_result
 
-    def request_cancel(self):
+    def request_cancel(self, run_id: str | None = None):
         self.cancel_calls += 1
+        self.cancel_run_ids.append(run_id)
         return self.cancel_result
 
     def get_current_progress(self, *, after_sequence: int = 0, limit: int = 100):
         self.progress_calls.append({"after_sequence": after_sequence, "limit": limit})
+        self.progress_run_ids.append(None)
+        return self.progress_result
+
+    def get_run_progress(self, run_id: str, *, after_sequence: int = 0, limit: int = 100):
+        self.progress_calls.append(
+            {"run_id": run_id, "after_sequence": after_sequence, "limit": limit}
+        )
+        self.progress_run_ids.append(run_id)
         return self.progress_result
 
     def get_chatgpt_ui_lease_status(self):
@@ -267,12 +327,16 @@ class LocalServerAuthHostAndHeaderTests(LocalServerHTTPTestCase):
             ("GET", "/api/runs/current"),
             ("GET", "/api/runs/current/progress"),
             ("GET", "/api/runs/current/events"),
+            ("GET", "/api/runs"),
+            ("GET", "/api/runs/run-1"),
             ("GET", "/api/chatgpt-ui-lease"),
             ("POST", "/api/runs/start"),
             ("POST", "/api/repository/pick"),
             ("POST", "/api/approval"),
             ("POST", "/api/tick"),
             ("POST", "/api/runs/current/retry"),
+            ("POST", "/api/runs/run-1/cancel"),
+            ("POST", "/api/runs/run-1/focus"),
             ("POST", "/api/chatgpt-ui-lease/release-stale"),
         ):
             with self.subTest(path=path):
@@ -558,6 +622,59 @@ class LocalServerEndpointTests(LocalServerHTTPTestCase):
         )
         self.assertEqual(status, 409)
         self.assertEqual(payload["reason_code"], "active_run_exists")
+
+    def test_additional_session_start_contract_over_http(self) -> None:
+        # Legacy body: the additional_session kwarg is not forwarded, so the
+        # controller default (False) applies and a cached client can never
+        # request a sibling by accident.
+        status, _headers, _payload = self.request(
+            "POST",
+            "/api/runs/start",
+            body=_start_body(),
+            token=self.token,
+        )
+        self.assertEqual(status, 202)
+        self.assertNotIn("additional_session", self.controller.start_calls[-1])
+
+        # Explicit additional start is forwarded verbatim.
+        status, _headers, _payload = self.request(
+            "POST",
+            "/api/runs/start",
+            body=_start_body(additional_session=True),
+            token=self.token,
+        )
+        self.assertEqual(status, 202)
+        self.assertIs(self.controller.start_calls[-1]["additional_session"], True)
+
+        # Non-boolean flags are rejected before the controller is reached.
+        calls_before = len(self.controller.start_calls)
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/start",
+            body=_start_body(additional_session="yes"),
+            token=self.token,
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["reason_code"], "invalid_request_shape")
+        self.assertEqual(len(self.controller.start_calls), calls_before)
+
+        # Stage 5 failure reasons map to conflict responses.
+        for reason in ("session_capacity_reached", "duplicate_chatgpt_conversation"):
+            with self.subTest(reason=reason):
+                self.controller.start_result = self.controller._result(
+                    ok=False,
+                    reason=reason,
+                    run_id="run-1",
+                    error="rejected",
+                )
+                status, _headers, payload = self.request(
+                    "POST",
+                    "/api/runs/start",
+                    body=_start_body(additional_session=True),
+                    token=self.token,
+                )
+                self.assertEqual(status, 409)
+                self.assertEqual(payload["reason_code"], reason)
 
     def test_start_request_validation_rejections(self) -> None:
         cases = [
@@ -1057,6 +1174,184 @@ class LocalServerExecutionProfileContractTests(unittest.TestCase):
         with self.assertRaises(local_server.LocalServerError) as raised:
             _start_run_kwargs({**base, "allow_destination_navigation": "yes"})
         self.assertEqual(raised.exception.reason_code, "invalid_request_shape")
+
+    def test_start_kwargs_additional_session_flag_default_and_explicit_and_type_checked(self) -> None:
+        import agent.local_server as local_server
+
+        base = {
+            "repository_path": "/tmp/repo",
+            "initial_instruction": "Task",
+            "project_title": "Project",
+            "chat_title": "Chat",
+            "sandbox": "read-only",
+        }
+
+        # Omitted: the conservative controller default (False) applies, so a
+        # legacy body can never request an additional session.
+        self.assertNotIn("additional_session", _start_run_kwargs(dict(base)))
+
+        enabled = _start_run_kwargs({**base, "additional_session": True})
+        self.assertIs(enabled["additional_session"], True)
+
+        disabled = _start_run_kwargs({**base, "additional_session": False})
+        self.assertIs(disabled["additional_session"], False)
+
+        with self.assertRaises(local_server.LocalServerError) as raised:
+            _start_run_kwargs({**base, "additional_session": 1})
+        self.assertEqual(raised.exception.reason_code, "invalid_request_shape")
+
+
+class MaxActiveSessionsConfigTests(unittest.TestCase):
+    def test_server_forwards_max_active_sessions_to_the_controller(self) -> None:
+        fake_controller = FakeController()
+        with mock.patch(
+            "agent.local_server.LocalController", return_value=fake_controller
+        ) as constructor:
+            LocalControllerServer(port=0, max_active_sessions=3)
+        constructor.assert_called_once_with(session=None, max_active_sessions=3)
+
+    def test_server_omits_max_active_sessions_by_default(self) -> None:
+        fake_controller = FakeController()
+        with mock.patch(
+            "agent.local_server.LocalController", return_value=fake_controller
+        ) as constructor:
+            LocalControllerServer(port=0)
+        constructor.assert_called_once_with(session=None)
+
+
+class MultiSessionHttpContractTests(LocalServerHTTPTestCase):
+    def test_get_runs_returns_session_list_payload(self) -> None:
+        self.controller.session.active_run_id = "run-1"
+        self.controller.list_result = self.controller._result(
+            ok=True,
+            reason="sessions_listed",
+            run_id="run-1",
+            metadata={
+                "focused_run_id": "run-1",
+                "max_active_sessions": 4,
+                "live_session_count": 2,
+                "session_capacity_remaining": 2,
+                "ledger_durability": {"blocked": False, "reason_code": None},
+                "chatgpt_lane": {
+                    "lease_active": True,
+                    "lease_owning_run_id": "run-1",
+                    "queue": [{"run_id": "run-2", "position": 2, "status": "pending", "is_head": False}],
+                },
+                "sessions": [
+                    {"run_id": "run-1", "focused": True, "live": True, "chatgpt_owns_lease": True},
+                    {"run_id": "run-2", "focused": False, "live": True, "waiting_for_chatgpt": True},
+                ],
+            },
+        )
+        status, _headers, payload = self.request("GET", "/api/runs", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["focused_run_id"], "run-1")
+        self.assertEqual(payload["max_active_sessions"], 4)
+        self.assertEqual(payload["live_session_count"], 2)
+        self.assertEqual(payload["session_capacity_remaining"], 2)
+        self.assertEqual(len(payload["sessions"]), 2)
+        self.assertEqual(payload["chatgpt_lane"]["lease_owning_run_id"], "run-1")
+        self.assertEqual(self.controller.list_calls, 1)
+
+    def test_per_run_reads_and_controls_target_explicit_run_id(self) -> None:
+        self.controller.known_ids = {"run-a", "run-b"}
+        self.controller.state_result = self.controller._result(
+            ok=True, reason="state_loaded", run_id="run-a"
+        )
+        status, _headers, payload = self.request("GET", "/api/runs/run-a", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.state_run_ids[-1], "run-a")
+        self.assertEqual(payload["run_id"], "run-a")
+
+        status, _headers, _payload = self.request(
+            "GET", "/api/runs/run-a/progress?after_sequence=0", token=self.token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.progress_run_ids[-1], "run-a")
+
+        status, _headers, _payload = self.request(
+            "POST", "/api/runs/run-a/focus", body={}, token=self.token
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.focus_calls, ["run-a"])
+        self.assertEqual(self.controller.session.active_run_id, "run-a")
+
+        status, _headers, _payload = self.request(
+            "POST", "/api/runs/run-a/cancel", body={}, token=self.token
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self.controller.cancel_run_ids[-1], "run-a")
+
+        status, _headers, _payload = self.request(
+            "POST",
+            "/api/runs/run-a/approval",
+            body={"decision": "approved"},
+            token=self.token,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self.controller.approval_calls[-1], "approved")
+        self.assertEqual(self.controller.approval_run_ids[-1], "run-a")
+
+        status, _headers, _payload = self.request(
+            "POST",
+            "/api/runs/run-b/approval",
+            body={"decision": "rejected"},
+            token=self.token,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self.controller.approval_run_ids[-1], "run-b")
+
+        status, _headers, _payload = self.request(
+            "POST",
+            "/api/runs/run-a/retry",
+            body={"failure_event_id": 9},
+            token=self.token,
+        )
+        self.assertEqual(status, 202)
+        self.assertEqual(self.controller.retry_calls[-1], 9)
+        self.assertEqual(self.controller.retry_run_ids[-1], "run-a")
+
+    def test_unknown_run_ids_fail_closed(self) -> None:
+        self.controller.known_ids = {"run-1"}
+        status, _headers, payload = self.request("GET", "/api/runs/missing", token=self.token)
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["reason_code"], "run_not_found")
+
+        status, _headers, payload = self.request(
+            "GET", "/api/runs/missing/progress?after_sequence=0", token=self.token
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["reason_code"], "run_not_found")
+
+        cancel_before = self.controller.cancel_calls
+        status, _headers, payload = self.request(
+            "POST", "/api/runs/missing/cancel", body={}, token=self.token
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["reason_code"], "run_not_found")
+        self.assertEqual(self.controller.cancel_calls, cancel_before)
+
+        approval_before = list(self.controller.approval_calls)
+        status, _headers, payload = self.request(
+            "POST",
+            "/api/runs/missing/approval",
+            body={"decision": "approved"},
+            token=self.token,
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(self.controller.approval_calls, approval_before)
+
+    def test_current_routes_remain_focused_aliases(self) -> None:
+        status, _headers, _payload = self.request("GET", "/api/runs/current", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.controller.state_run_ids[-1])
+
+        status, _headers, _payload = self.request(
+            "POST", "/api/runs/current/cancel", body={}, token=self.token
+        )
+        self.assertEqual(status, 202)
+        self.assertIsNone(self.controller.cancel_run_ids[-1])
 
 
 if __name__ == "__main__":

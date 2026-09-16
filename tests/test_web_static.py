@@ -100,6 +100,14 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="reasoning-lock"',
             'id="approval-lock"',
             'id="start-button"',
+            'id="start-additional-button"',
+            'id="session-list-panel"',
+            'id="session-list"',
+            'id="session-capacity"',
+            'id="durability-banner"',
+            'id="chatgpt-lane-status"',
+            'id="approval-session"',
+            'id="failure-session"',
             'id="active-run-panel"',
             'id="run-project-title"',
             'id="run-chat-title"',
@@ -125,9 +133,12 @@ class StaticSourceContractTests(unittest.TestCase):
             'id="lease-release-button"',
             'id="codex-live-panel"',
             'id="codex-live-state"',
+            'id="codex-live-session-id"',
+            'id="codex-live-quota-wait"',
             'id="codex-live-final"',
             'id="codex-live-error"',
             'id="codex-live-events"',
+            'id="codex-live-plan"',
             'id="approval-panel"',
             'id="approve-button"',
             'id="reject-button"',
@@ -144,8 +155,8 @@ class StaticSourceContractTests(unittest.TestCase):
             self.assertIn(required, self.html)
 
         self.assertIn("Codex Permission Preset", self.html)
-        self.assertIn("<title>Agent Controller</title>", self.html)
-        self.assertIn("<h1>Agent Controller</h1>", self.html)
+        self.assertIn("<title>Crax</title>", self.html)
+        self.assertIn("<h1>Crax</h1>", self.html)
         self.assertIn('class="connection-label">Controller connection</p>', self.html)
         self.assertIn('class="panel disclosure-panel"', self.html)
         self.assertIn("Run details and controls", self.html)
@@ -188,7 +199,17 @@ class StaticSourceContractTests(unittest.TestCase):
             'requestJson("POST", "/api/runs/current/retry"',
             "failure_event_id: failureEventId",
             "model.latest_failure",
-            "renderFailure(model, runtime)",
+            "renderFailure(model, runtime, selectedRunId)",
+            'elements["codex-live-quota-wait"]',
+            "quotaWaitClientMessage(quotaWait)",
+            "quotaResumeIsLive(runtime)",
+            'id="quota-force-continue-button"',
+            "Force continue",
+            'requestJson("POST", "/api/runs/current/quota-resume"',
+            "currentCodexSessionId || quotaWaitThreadId",
+            "injects a continue prompt into the same Codex session",
+            "Codex limits ran out. Reset in ${hh}:${mm} hours",
+            "Waiting for Codex reset",
             "Paused — ready for manual retry",
             "Paused — manual review required",
             "Retry unavailable — review required",
@@ -222,7 +243,9 @@ class StaticSourceContractTests(unittest.TestCase):
             "ENABLE FULL ACCESS",
             'elements["sandbox-select"].value = "danger-full-access"',
             '"needs_review",',
-            "(activeRun && !activeRunReplaceable)",
+            "capacityFull",
+            "additional_session: true",
+            "Start additional session",
         ):
             self.assertIn(required, self.all_static)
 
@@ -372,6 +395,19 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn("POLL_IDLE_MS = 5000", self.js)
         self.assertIn("POLL_FAILURE_MAX_MS = 10000", self.js)
         self.assertIn('requestJson("GET", "/api/runs/current")', self.js)
+        self.assertIn('requestJson("GET", "/api/runs")', self.js)
+        self.assertIn("additional_session: true", self.js)
+        self.assertIn("renderSessionList(listResult)", self.js)
+        self.assertIn("operator_status === \"waiting_for_chatgpt\"", self.js)
+        self.assertIn("This is expected.", self.js)
+        self.assertIn("ledger_durability", self.js)
+        self.assertIn("CRAX paused new Codex and ChatGPT mutations", self.js)
+        self.assertIn("conversation_claim_conflict", self.js)
+        self.assertIn("function sessionRetryIsSafe(session)", self.js)
+        self.assertIn("classification === \"reconcile\"", self.js)
+        self.assertIn("onCancelRun(session.run_id)", self.js)
+        self.assertIn("onApproval(\"approved\", session.run_id)", self.js)
+        self.assertIn("liveCount >= maxSessions", self.js)
         self.assertIn('requestJson("POST", "/api/runs/start", payload)', self.js)
         self.assertIn('requestJson("POST", "/api/repository/pick", {})', self.js)
         self.assertIn('requestJson("GET", "/api/default-greeting")', self.js)
@@ -380,8 +416,13 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn('requestJson("GET", "/api/chatgpt-ui-lease")', self.js)
         self.assertIn('requestJson("POST", "/api/chatgpt-ui-lease/release-stale", payload)', self.js)
         self.assertIn('requestJson("GET", `/api/runs/current/progress?after_sequence=${cursor}`)', self.js)
-        self.assertIn('fetch(`/api/runs/current/events?after_sequence=${cursor}`', self.js)
-        self.assertIn("renderCodexLiveProgress(runtime)", self.js)
+        self.assertIn("/api/runs/current/events?after_sequence=${cursor}", self.js)
+        self.assertIn("/api/runs/${encodeURIComponent(expectedRunId)}/events?after_sequence=${cursor}", self.js)
+        self.assertIn("/api/runs/${encodeURIComponent(runId)}/progress?after_sequence=${cursor}", self.js)
+        self.assertIn("renderCodexLiveProgress(runtime, model)", self.js)
+        self.assertIn("renderCodexPlan()", self.js)
+        self.assertIn("codexSessionIdFromProgressEvent(event)", self.js)
+        self.assertIn("codexPlanFromProgressEvent(event)", self.js)
         self.assertIn('event.kind === "assistant_commentary"', self.js)
         self.assertIn(".slice(-PROGRESS_EVENT_RENDER_LIMIT)", self.js)
         self.assertIn("Codex Working Notes", self.html)

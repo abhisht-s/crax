@@ -53,10 +53,14 @@
   let tickRequestInFlight = false;
   let retryRequestInFlight = false;
   let cancelRequestInFlight = false;
+  let quotaContinueRequestInFlight = false;
   let leaseRequestInFlight = false;
   let leaseReleaseRequestInFlight = false;
   let currentLeasePayload = null;
   let displayedLeaseIdentity = "";
+  let sessionListPayload = null;
+  let selectedRunId = "";
+  let selectedRunIdExplicit = false;
   let progressEvents = [];
   let progressAfterSequence = 0;
   let progressRunId = "";
@@ -64,6 +68,8 @@
   let progressStreamActive = false;
   let progressPollTimer = null;
   let progressRequestInFlight = false;
+  let currentCodexSessionId = "";
+  let currentCodexPlan = [];
 
   document.addEventListener("DOMContentLoaded", async () => {
     collectElements();
@@ -119,7 +125,15 @@
       "full-access-confirmation-label",
       "full-access-confirmation",
       "start-button",
+      "start-additional-button",
       "startup-status",
+      "session-list-panel",
+      "session-list-heading",
+      "session-list",
+      "session-list-empty",
+      "session-capacity",
+      "chatgpt-lane-status",
+      "durability-banner",
       "run-id",
       "run-repository",
       "run-project-title",
@@ -140,10 +154,16 @@
       "planner-reason",
       "actionable-error",
       "codex-live-state",
+      "codex-live-session-id",
+      "codex-live-quota-wait",
+      "quota-force-continue-button",
+      "quota-force-continue-status",
       "codex-live-final",
       "codex-live-error",
       "codex-live-events",
+      "codex-live-plan",
       "approval-panel",
+      "approval-session",
       "approval-kind",
       "approve-button",
       "reject-button",
@@ -153,6 +173,7 @@
       "tick-button",
       "tick-status",
       "failure-panel",
+      "failure-session",
       "failure-summary",
       "failure-action",
       "failure-event-id",
@@ -188,7 +209,8 @@
   function wireEvents() {
     elements["pair-button"].addEventListener("click", onPairDevice);
     elements["refresh-devices-button"].addEventListener("click", refreshRemoteDevices);
-    elements["start-button"].addEventListener("click", onStartRun);
+    elements["start-button"].addEventListener("click", () => onStartRun(false));
+    elements["start-additional-button"].addEventListener("click", () => onStartRun(true));
     elements["repository-browse-button"].addEventListener("click", onBrowseRepository);
     elements["repository-path"].addEventListener("input", updateControlState);
     elements["repository-catalog"].addEventListener("change", () => {
@@ -214,6 +236,7 @@
     elements["tick-button"].addEventListener("click", onTick);
     elements["retry-button"].addEventListener("click", onRetry);
     elements["cancel-run-button"].addEventListener("click", onCancelRun);
+    elements["quota-force-continue-button"].addEventListener("click", onForceQuotaContinue);
     elements["lease-confirm-stale"].addEventListener("change", updateControlState);
     elements["lease-release-reason"].addEventListener("input", updateControlState);
     elements["lease-allow-owner-pid-alive"].addEventListener("change", updateControlState);
@@ -376,9 +399,22 @@
     return requestJson("GET", "/api/runs/current");
   }
 
+  async function getSessionList() {
+    return requestJson("GET", "/api/runs");
+  }
+
+  async function getRunState(runId) {
+    return requestJson("GET", `/api/runs/${encodeURIComponent(runId)}`);
+  }
+
   async function getCurrentProgress(afterSequence) {
     const cursor = encodeURIComponent(String(afterSequence || 0));
     return requestJson("GET", `/api/runs/current/progress?after_sequence=${cursor}`);
+  }
+
+  async function getRunProgress(runId, afterSequence) {
+    const cursor = encodeURIComponent(String(afterSequence || 0));
+    return requestJson("GET", `/api/runs/${encodeURIComponent(runId)}/progress?after_sequence=${cursor}`);
   }
 
   async function getProfileOptions() {
@@ -401,22 +437,48 @@
     return requestJson("GET", "/api/default-greeting");
   }
 
-  async function submitApproval(decision) {
+  async function submitApproval(decision, runId) {
+    if (runId) {
+      return requestJson("POST", `/api/runs/${encodeURIComponent(runId)}/approval`, { decision });
+    }
     return requestJson("POST", "/api/approval", { decision });
   }
 
-  async function requestTick() {
+  async function requestTick(runId) {
+    if (runId) {
+      return requestJson("POST", `/api/runs/${encodeURIComponent(runId)}/tick`, {});
+    }
     return requestJson("POST", "/api/tick", {});
   }
 
-  async function requestRetry(failureEventId) {
+  async function requestRetry(failureEventId, runId) {
+    if (runId) {
+      return requestJson("POST", `/api/runs/${encodeURIComponent(runId)}/retry`, {
+        failure_event_id: failureEventId,
+      });
+    }
     return requestJson("POST", "/api/runs/current/retry", {
       failure_event_id: failureEventId,
     });
   }
 
-  async function requestCancel() {
+  async function requestCancel(runId) {
+    if (runId) {
+      return requestJson("POST", `/api/runs/${encodeURIComponent(runId)}/cancel`, {});
+    }
     return requestJson("POST", "/api/runs/current/cancel", {});
+  }
+
+  async function requestForceQuotaResume(runId) {
+    const target = runId || selectedRunId;
+    if (target) {
+      return requestJson("POST", `/api/runs/${encodeURIComponent(target)}/quota-resume`, {});
+    }
+    return requestJson("POST", "/api/runs/current/quota-resume", {});
+  }
+
+  async function focusRun(runId) {
+    return requestJson("POST", `/api/runs/${encodeURIComponent(runId)}/focus`, {});
   }
 
   async function getChatGPTUILease() {
@@ -494,7 +556,39 @@
       return;
     }
     stateRequestInFlight = true;
-    const result = await getCurrentState();
+    const listResult = await getSessionList();
+    if (pollingStopped) {
+      stateRequestInFlight = false;
+      return;
+    }
+    if (listResult.status === 401) {
+      stateRequestInFlight = false;
+      return;
+    }
+    if (!listResult.ok && listResult.reason_code === "temporary_read_failure") {
+      stateRequestInFlight = false;
+      setConnectionState("temporary-failure", "Temporary polling failure");
+      transientFailureDelay = Math.min(
+        transientFailureDelay ? transientFailureDelay * 2 : 2000,
+        POLL_FAILURE_MAX_MS,
+      );
+      scheduleNextPoll(transientFailureDelay);
+      return;
+    }
+    if (listResult.ok) {
+      sessionListPayload = listResult;
+      renderSessionList(listResult);
+      renderDurabilityBanner(listResult);
+      renderChatGPTLaneStatus(listResult);
+      renderSessionCapacity(listResult);
+    }
+    const targetRunId = resolveSelectedRunId(listResult);
+    let result;
+    if (targetRunId) {
+      result = await getRunState(targetRunId);
+    } else {
+      result = await getCurrentState();
+    }
     stateRequestInFlight = false;
     if (pollingStopped) {
       return;
@@ -513,13 +607,28 @@
     }
     transientFailureDelay = 0;
     currentStatePayload = result;
-    setConnectionState("connected", "Connected");
+    setConnectionState("connected", remoteDevice ? "Remote connected" : "Connected");
     renderState(result);
     await refreshLeaseStatus();
     if (pollingStopped) {
       return;
     }
     scheduleNextPoll(nextPollInterval(result));
+  }
+
+  function resolveSelectedRunId(listResult) {
+    const sessions = listResult && Array.isArray(listResult.sessions) ? listResult.sessions : [];
+    const ids = sessions.map((session) => session && session.run_id).filter(Boolean);
+    if (selectedRunId && ids.indexOf(selectedRunId) !== -1) {
+      return selectedRunId;
+    }
+    selectedRunIdExplicit = false;
+    if (listResult && listResult.focused_run_id && ids.indexOf(listResult.focused_run_id) !== -1) {
+      selectedRunId = listResult.focused_run_id;
+      return selectedRunId;
+    }
+    selectedRunId = ids.length ? ids[0] : "";
+    return selectedRunId;
   }
 
   async function refreshLeaseStatus() {
@@ -571,6 +680,17 @@
   }
 
   function nextPollInterval(payload) {
+    if (sessionListPayload && Array.isArray(sessionListPayload.sessions)) {
+      const anyRunning = sessionListPayload.sessions.some(
+        (session) => session && (session.action_running || session.codex_running),
+      );
+      if (anyRunning) {
+        return POLL_RUNNING_MS;
+      }
+      if (sessionListPayload.live_session_count > 0) {
+        return POLL_ACTIVE_MS;
+      }
+    }
     const model = payload.state || null;
     const runtime = model && model.controller_runtime ? model.controller_runtime : {};
     if (runtime.action_running === true) {
@@ -582,7 +702,7 @@
     return POLL_IDLE_MS;
   }
 
-  async function onStartRun() {
+  async function onStartRun(additionalSession) {
     if (startRequestInFlight || !authenticated) {
       return;
     }
@@ -612,7 +732,7 @@
     }
     startRequestInFlight = true;
     updateControlState();
-    setText(elements["startup-status"], "Starting run...");
+    setText(elements["startup-status"], additionalSession ? "Starting additional session..." : "Starting run...");
     const result = await startRun({
       repository_path: repositoryPath,
       initial_instruction: initialInstruction,
@@ -621,12 +741,17 @@
       sandbox,
       model,
       allow_destination_navigation: allowDestinationNavigation,
+      ...(additionalSession ? { additional_session: true } : {}),
       ...(sandbox === "danger-full-access"
         ? { full_access_confirmation: fullAccessConfirmation }
         : {}),
     });
     startRequestInFlight = false;
-    setText(elements["startup-status"], result.ok ? "Run started." : safeMessage(result));
+    setText(elements["startup-status"], result.ok ? (additionalSession ? "Additional session started." : "Run started.") : safeMessage(result));
+    if (result.ok && result.run_id) {
+      selectedRunId = result.run_id;
+      selectedRunIdExplicit = true;
+    }
     if (result.status !== 401) {
       await forceRefresh();
     }
@@ -739,14 +864,15 @@
     updateControlState();
   }
 
-  async function onApproval(decision) {
+  async function onApproval(decision, runId) {
     if (approvalRequestInFlight || !authenticated) {
       return;
     }
+    const targetRunId = runId || selectedRunId;
     approvalRequestInFlight = true;
     updateControlState();
     setText(elements["approval-status"], decision === "approved" ? "Approving..." : "Rejecting...");
-    const result = await submitApproval(decision);
+    const result = await submitApproval(decision, targetRunId);
     approvalRequestInFlight = false;
     setText(elements["approval-status"], result.ok ? "Decision submitted." : safeMessage(result));
     if (result.status !== 401) {
@@ -762,7 +888,7 @@
     tickRequestInFlight = true;
     updateControlState();
     setText(elements["tick-status"], "Requesting progress...");
-    const result = await requestTick();
+    const result = await requestTick(selectedRunId);
     tickRequestInFlight = false;
     setText(elements["tick-status"], result.ok ? "Progress requested." : safeMessage(result));
     if (result.status !== 401) {
@@ -771,22 +897,23 @@
     updateControlState();
   }
 
-  async function onRetry() {
+  async function onRetry(runId, failureEventIdFromCard) {
     if (retryRequestInFlight || !authenticated) {
       return;
     }
+    const targetRunId = runId || selectedRunId;
     const model = currentStatePayload && currentStatePayload.state
       ? currentStatePayload.state
       : null;
     const failure = model && model.latest_failure ? model.latest_failure : null;
-    const failureEventId = failure && Number.isInteger(failure.event_id)
-      ? failure.event_id
-      : 0;
+    const failureEventId = failureEventIdFromCard || (
+      failure && Number.isInteger(failure.event_id) ? failure.event_id : 0
+    );
     if (!failureEventId) {
       setText(elements["retry-status"], "No current failure is available to retry.");
       return;
     }
-    if (failure.retryable !== true) {
+    if (!failureEventIdFromCard && failure && failure.retryable !== true) {
       setText(
         elements["retry-status"],
         failure.recovery_message || "This action requires review before it can be retried safely.",
@@ -797,7 +924,7 @@
     retryRequestInFlight = true;
     updateControlState();
     setText(elements["retry-status"], "Retrying the failed action...");
-    const result = await requestRetry(failureEventId);
+    const result = await requestRetry(failureEventId, targetRunId);
     retryRequestInFlight = false;
     setText(
       elements["retry-status"],
@@ -809,17 +936,21 @@
     updateControlState();
   }
 
-  async function onCancelRun() {
+  async function onCancelRun(runId) {
     if (cancelRequestInFlight || !authenticated) {
       return;
     }
-    if (!window.confirm("Stop the current CRAX run and terminate an active Codex process?")) {
+    const targetRunId = runId || selectedRunId;
+    const confirmMessage = targetRunId
+      ? `Stop session ${targetRunId} and terminate its Codex process? Unrelated sessions keep running.`
+      : "Stop the current CRAX run and terminate an active Codex process?";
+    if (!window.confirm(confirmMessage)) {
       return;
     }
     cancelRequestInFlight = true;
     updateControlState();
     setText(elements["cancel-run-status"], "Stopping run...");
-    const result = await requestCancel();
+    const result = await requestCancel(targetRunId);
     cancelRequestInFlight = false;
     setText(
       elements["cancel-run-status"],
@@ -829,6 +960,38 @@
       await forceRefresh();
     }
     updateControlState();
+  }
+
+  async function onForceQuotaContinue() {
+    if (quotaContinueRequestInFlight || !authenticated) {
+      return;
+    }
+    quotaContinueRequestInFlight = true;
+    updateControlState();
+    setText(elements["quota-force-continue-status"], "Resuming Codex...");
+    const result = await requestForceQuotaResume(selectedRunId);
+    quotaContinueRequestInFlight = false;
+    setText(
+      elements["quota-force-continue-status"],
+      result.ok ? "Continue started." : safeMessage(result),
+    );
+    if (result.status !== 401) {
+      await forceRefresh();
+    }
+    updateControlState();
+  }
+
+  async function onSelectSession(runId) {
+    if (!runId || !authenticated) {
+      return;
+    }
+    selectedRunId = runId;
+    selectedRunIdExplicit = true;
+    renderSessionList(sessionListPayload);
+    const result = await focusRun(runId);
+    if (result.status !== 401) {
+      await forceRefresh();
+    }
   }
 
   async function onReleaseStaleLease() {
@@ -898,14 +1061,14 @@
       stopProgressStream();
       clearProgressPollTimer();
       resetProgress("");
-      renderCodexLiveProgress({});
+      renderCodexLiveProgress({}, currentReadModel());
       return;
     }
     if (normalizedRunId !== progressRunId) {
       stopProgressStream();
       clearProgressPollTimer();
       resetProgress(normalizedRunId);
-      renderCodexLiveProgress({});
+      renderCodexLiveProgress({}, currentReadModel());
       startProgressStream();
       scheduleProgressPoll(PROGRESS_POLL_MS);
       return;
@@ -920,6 +1083,8 @@
     progressRunId = runId;
     progressEvents = [];
     progressAfterSequence = 0;
+    currentCodexSessionId = "";
+    currentCodexPlan = [];
   }
 
   function startProgressStream() {
@@ -946,7 +1111,10 @@
 
   async function readProgressStream(expectedRunId, afterSequence, controller) {
     const cursor = encodeURIComponent(String(afterSequence || 0));
-    const response = await fetch(`/api/runs/current/events?after_sequence=${cursor}`, {
+    const path = expectedRunId
+      ? `/api/runs/${encodeURIComponent(expectedRunId)}/events?after_sequence=${cursor}`
+      : `/api/runs/current/events?after_sequence=${cursor}`;
+    const response = await fetch(path, {
       method: "GET",
       headers: controllerToken ? { "X-Controller-Token": controllerToken } : {},
       cache: "no-store",
@@ -992,6 +1160,9 @@
   }
 
   function handleProgressFrame(frame, expectedRunId) {
+    if (expectedRunId && progressRunId && String(expectedRunId) !== String(progressRunId)) {
+      return;
+    }
     const lines = frame.split(/\r?\n/);
     let eventName = "";
     const dataLines = [];
@@ -1016,10 +1187,12 @@
     }
     if (eventName === "progress") {
       appendProgressEvent(payload, expectedRunId);
-      renderCodexLiveProgress({});
+      renderCodexLiveProgress({}, currentReadModel());
+      updateControlState();
     } else if (eventName === "progress_state") {
       applyProgressPayload(payload);
-      renderCodexLiveProgress({});
+      renderCodexLiveProgress({}, currentReadModel());
+      updateControlState();
     }
   }
 
@@ -1028,14 +1201,17 @@
       return;
     }
     progressRequestInFlight = true;
-    const result = await getCurrentProgress(progressAfterSequence);
+    const result = progressRunId
+      ? await getRunProgress(progressRunId, progressAfterSequence)
+      : await getCurrentProgress(progressAfterSequence);
     progressRequestInFlight = false;
     if (result.status === 401) {
       return;
     }
     if (result.ok) {
       applyProgressPayload(result);
-      renderCodexLiveProgress({});
+      renderCodexLiveProgress({}, currentReadModel());
+      updateControlState();
     }
     if (!progressStreamActive && progressRunId) {
       scheduleProgressPoll(PROGRESS_POLL_MS);
@@ -1093,6 +1269,18 @@
     if (sequence && progressEvents.some((item) => item.sequence === sequence)) {
       return;
     }
+    if (event.kind === "process_started") {
+      currentCodexSessionId = "";
+      currentCodexPlan = [];
+    }
+    const sessionId = codexSessionIdFromProgressEvent(event);
+    if (sessionId) {
+      currentCodexSessionId = sessionId;
+    }
+    const plan = codexPlanFromProgressEvent(event);
+    if (plan !== null) {
+      currentCodexPlan = plan;
+    }
     progressEvents.push(event);
     if (sequence) {
       progressAfterSequence = Math.max(progressAfterSequence, sequence);
@@ -1100,6 +1288,239 @@
     if (progressEvents.length > PROGRESS_EVENT_MEMORY_LIMIT) {
       progressEvents = progressEvents.slice(-PROGRESS_EVENT_MEMORY_LIMIT);
     }
+  }
+
+  function currentReadModel() {
+    return currentStatePayload && currentStatePayload.state ? currentStatePayload.state : null;
+  }
+
+  function codexSessionIdFromProgressEvent(event) {
+    const metadata = event && event.metadata && typeof event.metadata === "object"
+      ? event.metadata
+      : {};
+    if (metadata.event_type !== "thread.started") {
+      return "";
+    }
+    const summary = metadata.value_summary && typeof metadata.value_summary === "object"
+      ? metadata.value_summary
+      : {};
+    return typeof summary.codex_session_id === "string" ? summary.codex_session_id : "";
+  }
+
+  function codexPlanFromProgressEvent(event) {
+    const metadata = event && event.metadata && typeof event.metadata === "object"
+      ? event.metadata
+      : {};
+    const summary = metadata.value_summary && typeof metadata.value_summary === "object"
+      ? metadata.value_summary
+      : {};
+    if (summary.item_type !== "todo_list" || !Array.isArray(summary.plan_items)) {
+      return null;
+    }
+    return summary.plan_items
+      .filter(
+        (item) => item && typeof item.label === "string" && typeof item.completed === "boolean",
+      )
+      .map((item) => ({ label: item.label, completed: item.completed }));
+  }
+
+  function sessionIdentityLabel(runId, model) {
+    const sessions = sessionListPayload && Array.isArray(sessionListPayload.sessions)
+      ? sessionListPayload.sessions
+      : [];
+    const match = sessions.find((session) => session && session.run_id === runId);
+    const project = (match && match.project_title)
+      || (model && model.destination_binding && model.destination_binding.project_title)
+      || "";
+    const chat = (match && match.chat_title)
+      || (model && model.destination_binding && model.destination_binding.chat_title)
+      || "";
+    if (project && chat) {
+      return `${chat} / ${project}`;
+    }
+    return runId || "None";
+  }
+
+  function renderSessionCapacity(listResult) {
+    const liveCount = Number(listResult && listResult.live_session_count || 0);
+    const maxSessions = Number(listResult && listResult.max_active_sessions || 1);
+    setText(elements["session-capacity"], `${liveCount} / ${maxSessions} active`);
+    elements["session-capacity"].className = liveCount >= maxSessions
+      ? "status-badge status-warn"
+      : "status-badge status-muted";
+  }
+
+  function renderDurabilityBanner(listResult) {
+    const durability = listResult && listResult.ledger_durability
+      ? listResult.ledger_durability
+      : null;
+    const blocked = Boolean(durability && durability.blocked);
+    elements["durability-banner"].classList.toggle("hidden", !blocked);
+    if (!blocked) {
+      setText(elements["durability-banner"], "");
+      return;
+    }
+    const reason = durability.reason_code || "ledger_durability_blocked";
+    setText(
+      elements["durability-banner"],
+      `CRAX paused new Codex and ChatGPT mutations because the ledger is unhealthy (${reason}). Session logical states are unchanged.`,
+    );
+  }
+
+  function renderChatGPTLaneStatus(listResult) {
+    const lane = listResult && listResult.chatgpt_lane ? listResult.chatgpt_lane : {};
+    const owner = lane.lease_owning_run_id;
+    const queue = Array.isArray(lane.queue) ? lane.queue : [];
+    if (owner) {
+      setText(
+        elements["chatgpt-lane-status"],
+        `ChatGPT in use by ${sessionIdentityLabel(owner)}. Queue: ${queue.length} waiting or claimed.`,
+      );
+      return;
+    }
+    if (queue.length) {
+      const head = queue[0];
+      setText(
+        elements["chatgpt-lane-status"],
+        `ChatGPT lane idle. Next in queue: ${sessionIdentityLabel(head && head.run_id)}.`,
+      );
+      return;
+    }
+    setText(elements["chatgpt-lane-status"], "ChatGPT lane is idle.");
+  }
+
+  function sessionRetryIsSafe(session) {
+    const failure = session && session.latest_failure && typeof session.latest_failure === "object"
+      ? session.latest_failure
+      : null;
+    if (!failure || failure.retryable !== true) {
+      return false;
+    }
+    const classification = failure.retry_classification;
+    if (
+      classification === "reconcile" ||
+      classification === "retry_after_fix" ||
+      classification === "review_required"
+    ) {
+      return false;
+    }
+    return failure.reason_code !== "conversation_claim_conflict";
+  }
+
+  function renderSessionList(listResult) {
+    const list = elements["session-list"];
+    const sessions = listResult && Array.isArray(listResult.sessions) ? listResult.sessions : [];
+    elements["session-list-empty"].classList.toggle("hidden", sessions.length > 0);
+    list.replaceChildren();
+    for (const session of sessions) {
+      if (!session || !session.run_id) {
+        continue;
+      }
+      list.appendChild(buildSessionCard(session));
+    }
+  }
+
+  function buildSessionCard(session) {
+    const card = document.createElement("article");
+    const focused = session.run_id === selectedRunId || session.focused;
+    card.className = focused ? "session-card focused" : "session-card";
+    card.setAttribute("data-run-id", session.run_id);
+    card.addEventListener("click", () => onSelectSession(session.run_id));
+
+    const title = document.createElement("p");
+    title.className = "session-card-title";
+    const project = session.project_title || "No project";
+    const chat = session.chat_title || "No chat";
+    setText(title, `${chat} · ${project}`);
+    card.appendChild(title);
+
+    const repo = document.createElement("p");
+    repo.className = "session-card-meta";
+    setText(repo, session.repository_path || "No repository");
+    card.appendChild(repo);
+
+    const badge = document.createElement("p");
+    const tone = session.operator_tone === "error"
+      ? "status-bad"
+      : session.operator_tone === "attention"
+        ? "status-warn"
+        : session.operator_tone === "wait"
+          ? "status-muted"
+          : "status-ok";
+    badge.className = `status-badge ${tone}`;
+    setText(badge, session.operator_status_label || session.controller_state || "Idle");
+    card.appendChild(badge);
+
+    if (session.waiting_for_chatgpt && session.operator_status === "waiting_for_chatgpt") {
+      const wait = document.createElement("p");
+      wait.className = "session-card-wait";
+      const position = session.chatgpt_queue_position
+        ? ` Queue position ${session.chatgpt_queue_position}.`
+        : "";
+      setText(wait, `Waiting for ChatGPT.${position} This is expected.`);
+      card.appendChild(wait);
+    } else if (session.chatgpt_owns_lease) {
+      const wait = document.createElement("p");
+      wait.className = "session-card-wait";
+      setText(wait, "Currently using ChatGPT.");
+      card.appendChild(wait);
+    }
+
+    if (session.latest_reason_code === "conversation_claim_conflict") {
+      const conflict = document.createElement("p");
+      conflict.className = "session-card-wait";
+      setText(conflict, "Another session owns this ChatGPT conversation.");
+      card.appendChild(conflict);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "session-card-actions";
+    actions.addEventListener("click", (event) => event.stopPropagation());
+
+    if (!session.terminal) {
+      const stop = document.createElement("button");
+      stop.type = "button";
+      stop.className = "danger";
+      setText(stop, "Stop");
+      stop.addEventListener("click", (event) => {
+        event.stopPropagation();
+        onCancelRun(session.run_id);
+      });
+      actions.appendChild(stop);
+    }
+    if (session.waiting_for_approval) {
+      const approve = document.createElement("button");
+      approve.type = "button";
+      setText(approve, "Approve");
+      approve.addEventListener("click", (event) => {
+        event.stopPropagation();
+        onApproval("approved", session.run_id);
+      });
+      const reject = document.createElement("button");
+      reject.type = "button";
+      reject.className = "secondary";
+      setText(reject, "Reject");
+      reject.addEventListener("click", (event) => {
+        event.stopPropagation();
+        onApproval("rejected", session.run_id);
+      });
+      actions.appendChild(approve);
+      actions.appendChild(reject);
+    }
+    if (sessionRetryIsSafe(session)) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      setText(retry, "Retry");
+      retry.addEventListener("click", (event) => {
+        event.stopPropagation();
+        onRetry(session.run_id, session.latest_failure.event_id);
+      });
+      actions.appendChild(retry);
+    }
+    if (actions.childNodes.length) {
+      card.appendChild(actions);
+    }
+    return card;
   }
 
   function renderState(payload) {
@@ -1123,10 +1544,10 @@
     setText(elements["actionable-error"], valueOrNone(model && model.actionable_error_message));
 
     ensureProgressTransport(rawActiveRunId);
-    renderCodexLiveProgress(runtime);
-    renderApproval(model, runtime);
+    renderCodexLiveProgress(runtime, model);
+    renderApproval(model, runtime, rawActiveRunId);
     renderProgress(model, runtime);
-    renderFailure(model, runtime);
+    renderFailure(model, runtime, rawActiveRunId);
     renderTerminal(model, runtime);
     updateControlState();
   }
@@ -1275,11 +1696,24 @@
     ].join("|");
   }
 
-  function renderCodexLiveProgress(runtime) {
+  function renderCodexLiveProgress(runtime, model) {
     const latest = progressEvents.length ? progressEvents[progressEvents.length - 1] : null;
-    const label = codexLiveLabel(latest, runtime || {});
+    const label = codexLiveLabel(latest, runtime || {}, model);
     setText(elements["codex-live-state"], label.text);
     elements["codex-live-state"].className = `status-badge ${label.className}`;
+    setText(
+      elements["codex-live-session-id"],
+      currentCodexSessionId || (progressRunId ? "Not available yet" : "None"),
+    );
+    const quotaWait = model && model.quota_wait && typeof model.quota_wait === "object"
+      ? model.quota_wait
+      : null;
+    const quotaResumeLive = quotaResumeIsLive(runtime);
+    if (quotaWait && quotaWait.resume_at && !quotaResumeLive) {
+      setText(elements["codex-live-quota-wait"], quotaWaitClientMessage(quotaWait));
+    } else {
+      setText(elements["codex-live-quota-wait"], "None");
+    }
 
     const finalEvent = latestProgressEventOfKind("final_message_available");
     if (finalEvent) {
@@ -1294,8 +1728,12 @@
     }
 
     const issue = latestIssueProgressEvent();
-    setText(elements["codex-live-error"], issue ? progressEventLabel(issue) : "None");
+    setText(
+      elements["codex-live-error"],
+      quotaWait && !quotaResumeLive ? "None" : (issue ? progressEventLabel(issue) : "None"),
+    );
     renderProgressEvents();
+    renderCodexPlan();
   }
 
   function renderProgressEvents() {
@@ -1325,7 +1763,75 @@
     }
   }
 
-  function codexLiveLabel(latest, runtime) {
+  function renderCodexPlan() {
+    const list = elements["codex-live-plan"];
+    list.replaceChildren();
+    if (!currentCodexPlan.length) {
+      const item = document.createElement("li");
+      item.className = "codex-plan-empty";
+      setText(item, progressRunId ? "No plan published yet." : "No active run.");
+      list.append(item);
+      return;
+    }
+    for (const planItem of currentCodexPlan) {
+      const item = document.createElement("li");
+      item.className = planItem.completed ? "codex-plan-item completed" : "codex-plan-item";
+      item.setAttribute(
+        "aria-label",
+        `${planItem.completed ? "Completed" : "Pending"}: ${planItem.label}`,
+      );
+
+      const marker = document.createElement("span");
+      marker.className = "codex-plan-marker";
+      marker.setAttribute("aria-hidden", "true");
+      setText(marker, planItem.completed ? "✓" : "○");
+
+      const label = document.createElement("span");
+      label.className = "codex-plan-label";
+      setText(label, planItem.label);
+
+      item.append(marker, label);
+      list.append(item);
+    }
+  }
+
+  function quotaResumeIsLive(runtime) {
+    return Boolean(
+      runtime &&
+        (runtime.current_action_kind === "quota_resume" ||
+          (runtime.action_running && runtime.controller_state === "running_routine_action")),
+    );
+  }
+
+  function quotaWaitClientMessage(quotaWait) {
+    const until = Date.parse(quotaWait && quotaWait.resume_at ? quotaWait.resume_at : "");
+    if (Number.isFinite(until)) {
+      const remainingMs = until - Date.now();
+      if (remainingMs <= 0) {
+        return "Codex limits ran out. Resuming shortly.";
+      }
+      const totalMinutes = Math.ceil(remainingMs / 60000);
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      const hh = String(hours).padStart(2, "0");
+      const mm = String(minutes).padStart(2, "0");
+      return `Codex limits ran out. Reset in ${hh}:${mm} hours`;
+    }
+    if (quotaWait && typeof quotaWait.message === "string" && quotaWait.message.trim()) {
+      return quotaWait.message;
+    }
+    return "Codex limits ran out. Waiting for reset.";
+  }
+
+  function codexLiveLabel(latest, runtime, model) {
+    if (
+      model &&
+      model.quota_wait &&
+      model.quota_wait.resume_at &&
+      !quotaResumeIsLive(runtime)
+    ) {
+      return { text: "Waiting for Codex reset", className: "status-warn" };
+    }
     if (!progressRunId) {
       return { text: "No active run", className: "status-muted" };
     }
@@ -1373,11 +1879,21 @@
       return "Unknown progress event";
     }
     const title = valueOrNone(event.title);
-    const summary = event.summary ? `: ${event.summary}` : "";
+    const metadata = event.metadata && typeof event.metadata === "object" ? event.metadata : {};
+    const valueSummary =
+      metadata.value_summary && typeof metadata.value_summary === "object"
+        ? metadata.value_summary
+        : {};
+    const nestedError =
+      typeof valueSummary.error === "string" && valueSummary.error.trim()
+        ? valueSummary.error.trim()
+        : "";
+    const summaryText = nestedError || event.summary;
+    const summary = summaryText ? `: ${summaryText}` : "";
     return `${title}${summary}`;
   }
 
-  function renderApproval(model, runtime) {
+  function renderApproval(model, runtime, runId) {
     const required = Boolean(
       model &&
         model.requires_human_approval &&
@@ -1385,6 +1901,8 @@
     );
     elements["approval-panel"].classList.toggle("hidden", !required);
     const kind = model && model.approval_kind ? model.approval_kind.replaceAll("_", " ") : "approval";
+    const identity = sessionIdentityLabel(runId, model);
+    setText(elements["approval-session"], required ? `Session: ${identity}` : "No session selected.");
     setText(elements["approval-kind"], required ? `Approval required: ${kind}` : "No approval is pending.");
     const disabled = !required || runtime.action_running || approvalRequestInFlight || !authenticated;
     elements["approve-button"].disabled = disabled;
@@ -1448,11 +1966,15 @@
     elements["tick-button"].disabled = !available || tickRequestInFlight || !authenticated;
   }
 
-  function renderFailure(model, runtime) {
+  function renderFailure(model, runtime, runId) {
     const failure = model && model.latest_failure && typeof model.latest_failure === "object"
       ? model.latest_failure
       : null;
     elements["failure-panel"].classList.toggle("hidden", !failure);
+    setText(
+      elements["failure-session"],
+      failure ? `Session: ${sessionIdentityLabel(runId, model)}` : "No session selected.",
+    );
     if (!failure) {
       elements["retry-button"].disabled = true;
       setText(elements["retry-status"], "");
@@ -1461,9 +1983,14 @@
 
     const retryable = failure.retryable === true;
     const classification = valueOrNone(failure.retry_classification);
+    const conversationConflict = failure.reason_code === "conversation_claim_conflict";
     setText(
       elements["failure-summary"],
-      retryable ? "Paused — ready for manual retry" : "Paused — manual review required",
+      conversationConflict
+        ? "Paused — another session owns this ChatGPT conversation"
+        : retryable
+          ? "Paused — ready for manual retry"
+          : "Paused — manual review required",
     );
     elements["failure-summary"].className =
       `status-badge ${retryable ? "status-warn" : "status-bad"}`;
@@ -1484,12 +2011,17 @@
     );
     elements["retry-button"].disabled =
       !retryable ||
+      conversationConflict ||
       Boolean(runtime.action_running) ||
       retryRequestInFlight ||
       !authenticated;
     setText(
       elements["retry-button"],
-      retryable ? "Retry failed action" : "Retry unavailable — review required",
+      conversationConflict
+        ? "Retry unavailable — conversation owned elsewhere"
+        : retryable
+          ? "Retry failed action"
+          : "Retry unavailable — review required",
     );
   }
 
@@ -1502,13 +2034,21 @@
   function updateControlState() {
     const model = currentStatePayload && currentStatePayload.state ? currentStatePayload.state : null;
     const runtime = model && model.controller_runtime ? model.controller_runtime : {};
-    const activeRun = Boolean((model && model.run_id) || runtime.active_run_id);
+    const activeRun = Boolean((model && model.run_id) || runtime.active_run_id || selectedRunId);
     const running = Boolean(runtime.action_running);
     const activeRunReplaceable = Boolean(
       activeRun &&
       !running &&
       model &&
       REPLACEABLE_RUN_STATUSES.has(model.run_status),
+    );
+    const liveCount = Number(sessionListPayload && sessionListPayload.live_session_count || 0);
+    const maxSessions = Number(sessionListPayload && sessionListPayload.max_active_sessions || 1);
+    const capacityFull = liveCount >= maxSessions;
+    const durabilityBlocked = Boolean(
+      sessionListPayload &&
+      sessionListPayload.ledger_durability &&
+      sessionListPayload.ledger_durability.blocked,
     );
     const optionsUnavailable = optionsRequestInFlight || !profileOptions;
     const invalidSelection = !profileSelectionValid();
@@ -1523,8 +2063,6 @@
       !elements["chat-title"].value.trim();
     const disableInputs =
       !authenticated ||
-      (activeRun && !activeRunReplaceable) ||
-      running ||
       startRequestInFlight ||
       repositoryPickerRequestInFlight ||
       defaultGreetingRequestInFlight;
@@ -1533,7 +2071,18 @@
       optionsUnavailable ||
       invalidSelection ||
       requiredFieldsMissing ||
-      fullAccessConfirmationMissing;
+      fullAccessConfirmationMissing ||
+      liveCount > 0 ||
+      durabilityBlocked;
+    const disableAdditional =
+      disableInputs ||
+      optionsUnavailable ||
+      invalidSelection ||
+      requiredFieldsMissing ||
+      fullAccessConfirmationMissing ||
+      liveCount < 1 ||
+      capacityFull ||
+      durabilityBlocked;
     elements["repository-path"].disabled = disableInputs;
     elements["repository-browse-button"].disabled = disableInputs;
     elements["repository-catalog"].disabled = disableInputs;
@@ -1547,19 +2096,41 @@
     elements["model-select"].disabled = disableInputs || optionsUnavailable;
     elements["full-access-confirmation"].disabled = disableInputs;
     elements["start-button"].disabled = disableStart;
+    elements["start-additional-button"].classList.toggle("hidden", liveCount < 1);
+    elements["start-additional-button"].disabled = disableAdditional;
     elements["cancel-run-button"].disabled =
       !authenticated || !activeRun || cancelRequestInFlight || Boolean(model && model.terminal);
+    const quotaWaitThreadId = String(
+      (model && model.quota_wait && model.quota_wait.thread_id) || "",
+    ).trim();
+    const knownCodexSessionId = Boolean(currentCodexSessionId || quotaWaitThreadId);
+    const quotaWaitActive = Boolean(
+      model &&
+      model.quota_wait &&
+      model.quota_wait.resume_at &&
+      !quotaResumeIsLive(runtime),
+    );
+    const forceContinueAvailable = Boolean(
+      authenticated &&
+      model &&
+      knownCodexSessionId &&
+      quotaWaitActive &&
+      !running &&
+      !quotaContinueRequestInFlight,
+    );
+    elements["quota-force-continue-button"].disabled = !forceContinueAvailable;
 
     if (model) {
-      renderApproval(model, runtime);
+      renderApproval(model, runtime, selectedRunId);
       renderProgress(model, runtime);
-      renderFailure(model, runtime);
+      renderFailure(model, runtime, selectedRunId);
     } else {
       elements["approve-button"].disabled = true;
       elements["reject-button"].disabled = true;
       elements["tick-button"].disabled = true;
       elements["retry-button"].disabled = true;
       elements["cancel-run-button"].disabled = true;
+      elements["quota-force-continue-button"].disabled = true;
     }
     updateLeaseControlState();
   }
@@ -1604,11 +2175,13 @@
       "model-select",
       "full-access-confirmation",
       "start-button",
+      "start-additional-button",
       "approve-button",
       "reject-button",
       "tick-button",
       "retry-button",
       "cancel-run-button",
+      "quota-force-continue-button",
       "lease-confirm-stale",
       "lease-release-reason",
       "lease-allow-owner-pid-alive",

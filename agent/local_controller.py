@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import threading
 import time
 import uuid
@@ -14,7 +15,12 @@ from typing import Any, Callable
 
 from agent import ledger as default_ledger
 from agent.chatgpt_desktop_mutex import ChatGPTDesktopMutex
-from agent.codex_invocation import STATUS_LIVE, STATUS_UNCERTAIN, latest_open_invocation
+from agent.codex_invocation import (
+    STATUS_COMPLETE,
+    STATUS_LIVE,
+    STATUS_UNCERTAIN,
+    latest_open_invocation,
+)
 from agent.codex_services import reconcile_codex_invocation
 from agent.codex_terminal import terminate_codex_run
 from agent.initial_codex_run_services import execute_initial_direct_codex_run_service
@@ -36,6 +42,7 @@ from agent.run_state import RunStatus
 from agent.supervise import SuperviseAction, SupervisePlan, detect_next_supervise_action
 from agent.supervision_services import run_supervision_step as run_supervision_step_service
 from agent.supervision_services import send_plan_auto_safe
+from agent.supervision_services import CHATGPT_WAIT_REASON_CODES
 
 
 LOCAL_CONTROLLER_ALLOWED_SANDBOXES = (
@@ -92,6 +99,265 @@ REPLACEABLE_RUN_STATUSES = frozenset(
         RunStatus.REJECTED.value,
     }
 )
+# Stage 6: restore-time absorbing run statuses. failed/rejected runs can never
+# advance again, so restore never registers a runtime for them. completed is
+# deliberately NOT here: it is the normal mid-loop status between planner
+# steps; restore distinguishes a finished loop from a mid-loop session through
+# the planner (read model `completed`), not the run status alone.
+RESTORE_ABSORBING_RUN_STATUSES = frozenset(
+    {
+        RunStatus.FAILED.value,
+        RunStatus.REJECTED.value,
+    }
+)
+LOCAL_CONTROLLER_RESTORE_RESUME_ACTION_KIND = "restore_resume"
+CONVERSATION_CLAIM_CONFLICT_REASON_CODE = "conversation_claim_conflict"
+LEDGER_DURABILITY_BLOCKED_REASON_CODE = "ledger_durability_blocked"
+SESSION_OPERATOR_STATUS_LABELS = {
+    "codex_working": "Codex working",
+    "waiting_for_chatgpt": "Waiting for ChatGPT",
+    "using_chatgpt": "Using ChatGPT",
+    "waiting_for_approval": "Waiting for approval",
+    "retrying": "Retrying",
+    "reconciliation_needed": "Reconciliation needed",
+    "conversation_claim_conflict": "Conversation owned by another session",
+    "retry_after_fix": "Fix required before retry",
+    "review_required": "Manual review required",
+    "stopped": "Stopped",
+    "failed": "Failed",
+    "finished": "Finished",
+    "blocked": "Blocked",
+    "working": "Working",
+    "idle": "Idle",
+}
+CODEX_RUNNING_ACTION_KINDS = frozenset(
+    {
+        "initial_codex",
+        "approval_run_prompt",
+        LOCAL_CONTROLLER_RESTORE_RESUME_ACTION_KIND,
+    }
+)
+# Side effects that must never be auto-retried after restore: the action may
+# already have mutated ChatGPT/Codex/identity state.
+RESTORE_RECONCILE_REASON_CODES = frozenset(
+    {
+        "chatgpt_submission_ambiguous",
+        "chatgpt_submission_not_verified",
+        "chatgpt_submission_uncertain",
+        "extracted_prompt_run_incomplete",
+        "extracted_codex_prompt_run_failed",
+        "retry_planner_action_changed",
+        "codex_invocation_uncertain",
+        CONVERSATION_CLAIM_CONFLICT_REASON_CODE,
+        "captured_response_integrity_failed",
+        "invalid_extracted_prompt",
+        "selected_prompt_sha_validation_failed",
+        "extracted_prompt_changed_after_approval",
+    }
+)
+# Planner actions whose execution mutates external state (paste/submit/capture
+# in the bound ChatGPT conversation, or a new Codex process). A resumed or
+# advancing session must own its conversation claim before any of these run.
+CONVERSATION_OWNERSHIP_REQUIRED_ACTIONS = frozenset(
+    {
+        "ask_send_to_gpt",
+        "capture_gpt_response",
+        "ask_run_prompt",
+    }
+)
+# Correctness-critical durable writes: losing one of these means CRAX could
+# not reconstruct an external side effect (or the intent for one) after a
+# crash. A failure on any of these activates the global durability block.
+CRITICAL_LEDGER_WRITE_METHODS = frozenset(
+    {
+        "create_run",
+        "add_event",
+        "update_run_status",
+        "enqueue_chatgpt_handoff",
+        "claim_chatgpt_handoff_for_run",
+        "claim_next_chatgpt_handoff",
+        "complete_chatgpt_handoff",
+        "block_chatgpt_handoff",
+        "acquire_chatgpt_ui_lease",
+        "release_chatgpt_ui_lease",
+        "manual_release_stale_chatgpt_ui_lease",
+        "claim_chatgpt_conversation",
+        "release_chatgpt_conversation_claim",
+        "bind_run_destination",
+        "bind_run_execution_profile",
+    }
+)
+# Telemetry/read-model writes: failure is surfaced but does not by itself
+# imply an unrecorded external action. Codex progress events are UI telemetry
+# (Stage 1 execution evidence lives in codex_exec_started/finished events and
+# durable invocation artifacts); the controller snapshot is a convenience
+# read model reconstructable from the event ledger.
+NONCRITICAL_LEDGER_WRITE_METHODS = frozenset(
+    {
+        "add_codex_progress_event",
+        "save_local_controller_snapshot",
+    }
+)
+_OPERATIONAL_FAILURE_STATUS_VALUE = "operational_failure"
+
+
+class LedgerDurabilityGuard:
+    """Process-global durability safety state (Stage 6).
+
+    When a correctness-critical ledger write fails, the guard blocks every
+    new external side effect (Codex start, ChatGPT paste/submit) across all
+    sessions until a deliberate safe write proves the ledger is healthy
+    again. Sessions keep their logical state while blocked; nothing becomes
+    terminal merely because persistence is temporarily unavailable.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._blocked = False
+        self._reason_code: str | None = None
+        self._error_message: str | None = None
+        self._failed_method: str | None = None
+        self._blocked_at: str | None = None
+        self._critical_failure_count = 0
+        self._noncritical_failure_count = 0
+        self._last_noncritical: dict[str, Any] | None = None
+        self._recovered_at: str | None = None
+
+    @property
+    def is_blocked(self) -> bool:
+        with self._lock:
+            return self._blocked
+
+    def record_critical_failure(self, method_name: str, error_message: str) -> None:
+        with self._lock:
+            self._blocked = True
+            self._reason_code = LEDGER_DURABILITY_BLOCKED_REASON_CODE
+            self._failed_method = method_name
+            self._error_message = _bounded_string(error_message)
+            self._blocked_at = datetime.now(UTC).isoformat()
+            self._critical_failure_count += 1
+
+    def record_noncritical_failure(self, method_name: str, error_message: str) -> None:
+        with self._lock:
+            self._noncritical_failure_count += 1
+            self._last_noncritical = {
+                "method": method_name,
+                "error_message": _bounded_string(error_message),
+                "at": datetime.now(UTC).isoformat(),
+            }
+
+    def try_recover(self, ledger: Any) -> bool:
+        """Attempt to prove the ledger is writable again.
+
+        Recovery requires a deliberate safe write at the ledger layer
+        (`check_durable_write_health`). A ledger without the probe cannot
+        prove recovery, so the guard stays blocked. Never treats an
+        unrelated successful read as proof.
+        """
+
+        with self._lock:
+            if not self._blocked:
+                return True
+        target = ledger.wrapped if isinstance(ledger, DurabilityGuardedLedger) else ledger
+        probe = getattr(target, "check_durable_write_health", None)
+        if not callable(probe):
+            return False
+        try:
+            healthy = bool(probe())
+        except Exception:
+            return False
+        if not healthy:
+            return False
+        with self._lock:
+            self._blocked = False
+            self._reason_code = None
+            self._failed_method = None
+            self._error_message = None
+            self._recovered_at = datetime.now(UTC).isoformat()
+        return True
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "blocked": self._blocked,
+                "reason_code": self._reason_code,
+                "failed_method": self._failed_method,
+                "error_message": self._error_message,
+                "blocked_at": self._blocked_at,
+                "critical_failure_count": self._critical_failure_count,
+                "noncritical_failure_count": self._noncritical_failure_count,
+                "last_noncritical_failure": self._last_noncritical,
+                "recovered_at": self._recovered_at,
+            }
+
+
+class DurabilityGuardedLedger:
+    """Transparent ledger wrapper that feeds the durability guard.
+
+    This is the single detection point for durable-write failures: every
+    controller and service write flows through the controller's ledger
+    handle, so wrapping it once avoids scattering try/except blocks. Only
+    sqlite3 errors (raised) and atomic-result operational failures count;
+    behavior of every call is otherwise unchanged and failures still
+    propagate to the caller exactly as before.
+    """
+
+    def __init__(self, ledger: Any, guard: LedgerDurabilityGuard) -> None:
+        self._wrapped_ledger = ledger
+        self._durability_guard = guard
+
+    @property
+    def wrapped(self) -> Any:
+        return self._wrapped_ledger
+
+    @property
+    def durability_guard(self) -> LedgerDurabilityGuard:
+        return self._durability_guard
+
+    def __getattr__(self, name: str) -> Any:
+        value = getattr(self._wrapped_ledger, name)
+        if not callable(value):
+            return value
+        if name in CRITICAL_LEDGER_WRITE_METHODS:
+            return self._wrap_critical(name, value)
+        if name in NONCRITICAL_LEDGER_WRITE_METHODS:
+            return self._wrap_noncritical(name, value)
+        return value
+
+    def _wrap_critical(self, name: str, func: Callable[..., Any]) -> Callable[..., Any]:
+        guard = self._durability_guard
+
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            try:
+                result = func(*args, **kwargs)
+            except sqlite3.Error as exc:
+                guard.record_critical_failure(name, str(exc))
+                raise
+            status = getattr(result, "status", None)
+            if status is not None and str(status) == _OPERATIONAL_FAILURE_STATUS_VALUE:
+                guard.record_critical_failure(
+                    name,
+                    str(
+                        getattr(result, "error_message", None)
+                        or getattr(result, "reason_code", None)
+                        or _OPERATIONAL_FAILURE_STATUS_VALUE
+                    ),
+                )
+            return result
+
+        return guarded
+
+    def _wrap_noncritical(self, name: str, func: Callable[..., Any]) -> Callable[..., Any]:
+        guard = self._durability_guard
+
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.Error as exc:
+                guard.record_noncritical_failure(name, str(exc))
+                raise
+
+        return guarded
 
 EVENT_METADATA_PREVIEW_LIMIT = 1200
 TEXT_METADATA_PREVIEW_LIMIT = 240
@@ -168,6 +434,11 @@ class ControllerSessionRuntime:
     project_title: str | None = None
     chat_title: str | None = None
     allow_destination_navigation: bool = False
+    # Latched the first time this run coexists with another live session.
+    # From then on every ChatGPT handoff for this run must navigate, even
+    # after the sibling stops: the run can no longer assume ChatGPT is
+    # already sitting on its bound conversation.
+    navigation_forced_multi_live: bool = False
     waiting_for_chatgpt: bool = False
     chatgpt_wait_count: int = 0
 
@@ -332,7 +603,12 @@ class LocalController:
     ) -> None:
         restore_persisted_session = session is None
         self.session = session or LocalControllerSession()
-        self.ledger = ledger
+        if isinstance(ledger, DurabilityGuardedLedger):
+            self.ledger = ledger
+            self.durability = ledger.durability_guard
+        else:
+            self.durability = LedgerDurabilityGuard()
+            self.ledger = DurabilityGuardedLedger(ledger, self.durability)
         self.read_model_builder = read_model_builder or build_local_controller_read_model
         self.run_supervision_step = supervision_step
         self.initial_run_executor = initial_run_executor or (
@@ -356,8 +632,6 @@ class LocalController:
         self.automatic_burst_reason: str | None = None
         if restore_persisted_session:
             self._restore_persisted_session()
-            for run_id in list(self._sessions):
-                self._reconcile_open_codex_invocation(run_id)
         elif self.session.active_run_id:
             self._hydrate_injected_session()
 
@@ -422,6 +696,21 @@ class LocalController:
             if isinstance(active_run, dict)
             else ""
         )
+        if runtime is not None:
+            # A registered runtime is replaceable only when the *loop* is
+            # finished or the ledger status is absorbing for start purposes.
+            # Run status `completed` alone is the normal mid-loop value after
+            # Codex governance and must not evict a live/resumable session.
+            if runtime.controller_state in {
+                LOCAL_CONTROLLER_STATE_COMPLETED,
+                LOCAL_CONTROLLER_STATE_FAILED,
+            }:
+                return True
+            return active_status in {
+                RunStatus.FAILED.value,
+                RunStatus.REJECTED.value,
+                RunStatus.NEEDS_REVIEW.value,
+            }
         return active_status in REPLACEABLE_RUN_STATUSES
 
     def _live_session_ids_locked(self) -> list[str]:
@@ -450,8 +739,132 @@ class LocalController:
                 identities.append((run_id, project, chat))
         return identities
 
+    def _release_conversation_claim_if_hard_terminal(
+        self,
+        run_id: str,
+        *,
+        loop_finished: bool = False,
+    ) -> None:
+        """Release the durable conversation claim once a run is absorbing.
+
+        needs_review is deliberately excluded: a human decision can resume
+        that run, so its claim stays until a new start reclaims it (the claim
+        transaction treats replaceable owners as reclaimable). `completed`
+        run status is also excluded: it is the mid-loop Codex-finished value.
+        Pass ``loop_finished=True`` when the planner says the loop itself is
+        done (`read_model.completed`).
+        """
+
+        run = self.ledger.get_run(run_id)
+        status = str(run.get("status") or "") if isinstance(run, dict) else ""
+        if loop_finished or status in {
+            RunStatus.FAILED.value,
+            RunStatus.REJECTED.value,
+        }:
+            reason = "run_completed" if loop_finished else f"run_{status}"
+            _release_run_conversation_claim(self.ledger, run_id, reason=reason)
+
+    def _conversation_identity_for_run(self, run_id: str) -> tuple[str, str] | None:
+        runtime = self._sessions.get(run_id)
+        project = runtime.project_title if runtime is not None else None
+        chat = runtime.chat_title if runtime is not None else None
+        if not project or not chat:
+            try:
+                lookup = get_run_destination_binding(run_id, ledger=self.ledger)
+            except Exception:
+                return None
+            binding = getattr(lookup, "binding", None)
+            if binding is not None:
+                project = binding.project_title
+                chat = binding.chat_title
+        if not project or not chat:
+            return None
+        return (project, chat)
+
+    def _verify_conversation_claim_for_advancement(
+        self, run_id: str
+    ) -> _ConversationClaimOutcome:
+        """Fail closed unless this run owns its conversation claim right now.
+
+        Stage 6 invariant: before any non-terminal/resumed session advances
+        again (new ChatGPT paste/submit/capture or new Codex process), it must
+        own the durable claim for its bound chat. The atomic claim primitive
+        is idempotent for the current owner, reacquires a claim whose owner is
+        replaceable or provably dead, and fails closed (`DUPLICATE`) when a
+        live sibling owns the conversation — which maps to a
+        conversation_claim_conflict here. Ledgers without the claim primitive
+        (test fakes) and runs without a resolvable destination pass through.
+        """
+
+        claim_fn = getattr(self.ledger, "claim_chatgpt_conversation", None)
+        if not callable(claim_fn):
+            return _ConversationClaimOutcome(ok=True)
+        identity = self._conversation_identity_for_run(run_id)
+        if identity is None:
+            return _ConversationClaimOutcome(ok=True)
+        outcome = _claim_run_conversation(
+            self.ledger,
+            run_id,
+            identity[0],
+            identity[1],
+            controller_instance_id=self.session.session_id,
+        )
+        if outcome.ok:
+            return outcome
+        return _ConversationClaimOutcome(
+            ok=False,
+            reason_code=CONVERSATION_CLAIM_CONFLICT_REASON_CODE,
+            error_message=(
+                outcome.error_message
+                or "Another live session owns this ChatGPT conversation."
+            ),
+        )
+
+    def _wait_for_durability(self, run_id: str) -> bool:
+        """Patiently wait until durable persistence is provably healthy.
+
+        Returns False only when the run was cancelled while waiting. While
+        blocked no new external side effect may begin; the session keeps its
+        logical state, exposes why progress is paused, and backs off with the
+        same capped exponential delays as the ChatGPT lane wait (no
+        busy-spinning, no persisted monotonic deadlines). After a proven
+        recovery the open Codex invocation is reconciled before new
+        mutations are allowed.
+        """
+
+        wait_count = 0
+        while self.durability.is_blocked:
+            if self._cancel_requested_for(run_id):
+                return False
+            if self.durability.try_recover(self.ledger):
+                try:
+                    self._reconcile_open_codex_invocation(run_id)
+                except Exception:
+                    pass
+                return True
+            wait_count += 1
+            with self._lock:
+                runtime = self._get_or_create_session(run_id)
+                runtime.last_action_result_summary = {
+                    "kind": "durability_wait",
+                    "ok": True,
+                    "reason_code": LEDGER_DURABILITY_BLOCKED_REASON_CODE,
+                    "wait_count": wait_count,
+                    "durability": self.durability.status(),
+                }
+                self._touch_runtime_locked(runtime)
+            self._chatgpt_wait_sleeper(self._chatgpt_wait_delay_seconds(wait_count))
+        return True
+
     def _drop_session_locked(self, run_id: str) -> None:
-        self._sessions.pop(run_id, None)
+        runtime = self._sessions.pop(run_id, None)
+        loop_finished = (
+            runtime is not None
+            and runtime.controller_state == LOCAL_CONTROLLER_STATE_COMPLETED
+        )
+        self._release_conversation_claim_if_hard_terminal(
+            run_id, loop_finished=loop_finished
+        )
         if self.session.active_run_id != run_id:
             return
         self.session.active_run_id = None
@@ -481,6 +894,7 @@ class LocalController:
         sandbox: str | None = None,
         model: str | None = None,
         allow_destination_navigation: bool = False,
+        additional_session: bool = False,
         timeout_seconds: float | None = None,
     ) -> LocalControllerOperationResult:
         del timeout_seconds
@@ -501,14 +915,46 @@ class LocalController:
                 controller_state=self.session.controller_state,
             )
 
+        # Global durability boundary: while the ledger cannot durably record
+        # intent/evidence, no new run (and therefore no new Codex process)
+        # may start. A start attempt may prove recovery via the safe probe.
+        if self.durability.is_blocked and not self.durability.try_recover(self.ledger):
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code=LEDGER_DURABILITY_BLOCKED_REASON_CODE,
+                error_message=(
+                    "Durable ledger writes are failing; new sessions cannot "
+                    "start until persistence is healthy again."
+                ),
+                controller_state=self.session.controller_state,
+                metadata={"ledger_durability": self.durability.status()},
+            )
+
         with self._lock:
             live_ids = self._live_session_ids_locked()
-            if len(live_ids) >= self.max_active_sessions:
+            # The legacy/default start body stays conservative: whenever any
+            # live session exists it is rejected, so a stale client, a second
+            # tab, or a repeated submit can never silently create a sibling.
+            # Only an explicit additional-session request may consume another
+            # available slot, and only below the configured cap.
+            if live_ids and not additional_session:
                 active_run_id = self.session.active_run_id or live_ids[0]
                 return LocalControllerOperationResult(
                     ok=False,
                     reason_code="active_run_exists",
                     error_message="A local controller run is already active.",
+                    run_id=active_run_id,
+                    controller_state=self.session.controller_state,
+                )
+            if len(live_ids) >= self.max_active_sessions:
+                active_run_id = self.session.active_run_id or live_ids[0]
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="session_capacity_reached",
+                    error_message=(
+                        "All configured session slots are in use "
+                        f"({len(live_ids)} live, cap {self.max_active_sessions})."
+                    ),
                     run_id=active_run_id,
                     controller_state=self.session.controller_state,
                 )
@@ -528,19 +974,28 @@ class LocalController:
                     controller_state=self.session.controller_state,
                 )
             # Only a replaceable (terminal) focused session may be dropped to
-            # make room. A live focused session must survive a sibling start:
-            # with capacity above one, starting B while A is live would
-            # otherwise evict A's runtime and orphan its worker.
-            if self.session.active_run_id is not None and self._session_is_replaceable_locked(
-                self.session.active_run_id
+            # make room. A live focused session must survive a sibling start.
+            # An additional start at cap>1 also keeps a finished focused
+            # sibling in the registry: dropping it would erase a completed
+            # session merely because a new one started. Cap-1 and legacy
+            # replacement still clear the focused slot.
+            focused_id = self.session.active_run_id
+            if (
+                focused_id is not None
+                and self._session_is_replaceable_locked(focused_id)
+                and (
+                    not additional_session
+                    or self.max_active_sessions <= 1
+                )
             ):
-                self._drop_session_locked(self.session.active_run_id)
+                self._drop_session_locked(focused_id)
                 self._persist_session_locked()
 
             start_result = start_local_controller_run(
                 self.session,
                 validation,
                 ledger=self.ledger,
+                controller_instance_id=self.session.session_id,
             )
             if not start_result.ok:
                 return LocalControllerOperationResult(
@@ -580,6 +1035,16 @@ class LocalController:
             )
             runtime.current_worker = worker
             self._apply_focused_runtime(runtime)
+            # With more than one live session no run may assume ChatGPT is
+            # already on its conversation, so latch forced navigation for
+            # every live runtime (including the new one) before any of them
+            # performs another handoff.
+            live_after_start = self._live_session_ids_locked()
+            if len(live_after_start) > 1:
+                for live_run_id in live_after_start:
+                    live_runtime = self._sessions.get(live_run_id)
+                    if live_runtime is not None:
+                        live_runtime.navigation_forced_multi_live = True
             self._persist_session_locked()
             worker.start()
 
@@ -802,6 +1267,7 @@ class LocalController:
             )
         except (AttributeError, TypeError):
             pass
+        self._release_conversation_claim_if_hard_terminal(target_run_id)
         return LocalControllerOperationResult(
             ok=True,
             reason_code="cancel_requested",
@@ -870,6 +1336,24 @@ class LocalController:
                         failure.get("recovery_message")
                         or "This failure cannot be retried safely without review."
                     ),
+                    run_id=target_run_id,
+                    controller_state=runtime.controller_state,
+                    metadata={"latest_failure": failure},
+                )
+
+            # A retry can resume a needs_review run, so it must first prove
+            # exclusive ownership of the bound conversation. If another live
+            # session reclaimed the chat while this run was replaceable, the
+            # retry fails closed instead of producing two live owners.
+            claim_outcome = self._verify_conversation_claim_for_advancement(
+                target_run_id
+            )
+            if not claim_outcome.ok:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code=claim_outcome.reason_code
+                    or CONVERSATION_CLAIM_CONFLICT_REASON_CODE,
+                    error_message=claim_outcome.error_message,
                     run_id=target_run_id,
                     controller_state=runtime.controller_state,
                     metadata={"latest_failure": failure},
@@ -1174,34 +1658,353 @@ class LocalController:
         after_sequence: int = 0,
         limit: int = default_ledger.CODEX_PROGRESS_DEFAULT_LIMIT,
     ) -> LocalControllerOperationResult:
-        try:
-            events = self.ledger.list_codex_progress_events(
-                run_id,
-                after_sequence=after_sequence,
-                limit=limit,
+        target = str(run_id or "").strip()
+        if not target:
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="invalid_run_id",
+                error_message="run_id is required.",
+                controller_state=self.session.controller_state,
             )
-        except AttributeError:
-            events = []
         with self._lock:
-            runtime = self._sessions.get(run_id)
+            known = set(self._known_session_run_ids_locked())
+            runtime = self._sessions.get(target)
             controller_state = (
                 runtime.controller_state
                 if runtime is not None
                 else self.session.controller_state
             )
+        if target not in known:
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="run_not_found",
+                error_message="Unknown or stale run_id.",
+                run_id=target,
+                controller_state=self.session.controller_state,
+            )
+        try:
+            events = self.ledger.list_codex_progress_events(
+                target,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        except AttributeError:
+            events = []
         return LocalControllerOperationResult(
             ok=True,
             reason_code="progress_loaded",
-            run_id=run_id,
+            run_id=target,
             controller_state=controller_state,
             metadata={
                 "progress": _codex_progress_payload(
-                    run_id,
+                    target,
                     events,
                     after_sequence=after_sequence,
                 )
             },
         )
+
+    def known_session_run_ids(self) -> list[str]:
+        with self._lock:
+            return self._known_session_run_ids_locked()
+
+    def _known_session_run_ids_locked(self) -> list[str]:
+        ids: list[str] = []
+        seen: set[str] = set()
+        for run_id in self._sessions:
+            if run_id not in seen:
+                ids.append(run_id)
+                seen.add(run_id)
+        focused = self.session.active_run_id
+        if focused and focused not in seen:
+            ids.append(focused)
+        return ids
+
+    def focus_run(self, run_id: str) -> LocalControllerOperationResult:
+        """Switch dashboard/legacy /current focus. Does not touch workers."""
+
+        target = str(run_id or "").strip()
+        if not target:
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="invalid_run_id",
+                error_message="run_id is required.",
+                controller_state=self.session.controller_state,
+            )
+        with self._lock:
+            runtime = self._sessions.get(target)
+            if runtime is None:
+                return LocalControllerOperationResult(
+                    ok=False,
+                    reason_code="run_not_found",
+                    error_message="Unknown or stale run_id.",
+                    run_id=target,
+                    controller_state=self.session.controller_state,
+                )
+            previous_focus = self.session.active_run_id
+            sibling_worker_states = {
+                other_id: {
+                    "controller_state": other.controller_state,
+                    "action_running": other.action_running,
+                    "current_action_kind": other.current_action_kind,
+                    "waiting_for_chatgpt": other.waiting_for_chatgpt,
+                    "pending_approval_available": other.pending_approval is not None,
+                    "cancel_requested": other.cancel_requested.is_set(),
+                }
+                for other_id, other in self._sessions.items()
+                if other_id != target
+            }
+            self._apply_focused_runtime(runtime)
+            self._persist_session_locked()
+            focused_worker = {
+                "controller_state": runtime.controller_state,
+                "action_running": runtime.action_running,
+                "current_action_kind": runtime.current_action_kind,
+                "waiting_for_chatgpt": runtime.waiting_for_chatgpt,
+            }
+        return LocalControllerOperationResult(
+            ok=True,
+            reason_code="run_focused",
+            run_id=target,
+            controller_state=runtime.controller_state,
+            read_model=self.get_current_state(target).read_model,
+            metadata={
+                "previous_focused_run_id": previous_focus,
+                "focused_run_id": target,
+                "focused_worker": focused_worker,
+                "sibling_worker_states": sibling_worker_states,
+            },
+        )
+
+    def get_run_state(self, run_id: str) -> LocalControllerOperationResult:
+        target = str(run_id or "").strip()
+        if not target:
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="invalid_run_id",
+                error_message="run_id is required.",
+                controller_state=self.session.controller_state,
+            )
+        with self._lock:
+            known = set(self._known_session_run_ids_locked())
+        if target not in known:
+            return LocalControllerOperationResult(
+                ok=False,
+                reason_code="run_not_found",
+                error_message="Unknown or stale run_id.",
+                run_id=target,
+                controller_state=self.session.controller_state,
+            )
+        return self.get_current_state(target)
+
+    def list_sessions(self) -> LocalControllerOperationResult:
+        """Stable operator read model for live/resumable registered sessions."""
+
+        with self._lock:
+            run_ids = self._known_session_run_ids_locked()
+            focused_run_id = self.session.active_run_id
+            live_ids = set(self._live_session_ids_locked())
+            max_active = self.max_active_sessions
+            controller_state = self.session.controller_state
+            durability = self.durability.status()
+
+        lease_payload = self._chatgpt_lease_snapshot()
+        queue_payload = self._chatgpt_queue_snapshot()
+        queue_by_run = {
+            str(entry.get("run_id")): entry
+            for entry in queue_payload.get("entries") or []
+            if isinstance(entry, dict) and entry.get("run_id")
+        }
+        lease_owner = lease_payload.get("owning_run_id") if lease_payload.get("active") else None
+
+        sessions: list[dict[str, Any]] = []
+        for run_id in run_ids:
+            state = self.get_current_state(run_id)
+            sessions.append(
+                self._session_list_entry(
+                    run_id,
+                    state=state,
+                    focused_run_id=focused_run_id,
+                    live=run_id in live_ids,
+                    lease_owner=lease_owner if isinstance(lease_owner, str) else None,
+                    queue_entry=queue_by_run.get(run_id),
+                )
+            )
+
+        live_count = len(live_ids)
+        remaining = max(0, max_active - live_count)
+        return LocalControllerOperationResult(
+            ok=True,
+            reason_code="sessions_listed",
+            run_id=focused_run_id,
+            controller_state=controller_state,
+            metadata={
+                "focused_run_id": focused_run_id,
+                "max_active_sessions": max_active,
+                "live_session_count": live_count,
+                "session_capacity_remaining": remaining,
+                "ledger_durability": durability,
+                "chatgpt_lane": {
+                    "lease_active": bool(lease_payload.get("active")),
+                    "lease_owning_run_id": lease_owner if isinstance(lease_owner, str) else None,
+                    "queue": queue_payload.get("entries") or [],
+                    "queue_head_run_id": queue_payload.get("head_run_id"),
+                    "queue_ok": bool(queue_payload.get("ok", True)),
+                },
+                "sessions": sessions,
+            },
+        )
+
+    def _chatgpt_lease_snapshot(self) -> dict[str, Any]:
+        try:
+            result = self.get_chatgpt_ui_lease_status()
+        except Exception:
+            return {"active": False, "owning_run_id": None}
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        lease = metadata.get("chatgpt_ui_lease")
+        return lease if isinstance(lease, dict) else {"active": False, "owning_run_id": None}
+
+    def _chatgpt_queue_snapshot(self) -> dict[str, Any]:
+        describe = getattr(self.ledger, "describe_chatgpt_handoff_queue", None)
+        if not callable(describe):
+            return {"ok": True, "head_run_id": None, "entries": []}
+        try:
+            snapshot = describe()
+        except Exception:
+            return {"ok": False, "head_run_id": None, "entries": []}
+        return snapshot if isinstance(snapshot, dict) else {"ok": True, "head_run_id": None, "entries": []}
+
+    def _session_list_entry(
+        self,
+        run_id: str,
+        *,
+        state: LocalControllerOperationResult,
+        focused_run_id: str | None,
+        live: bool,
+        lease_owner: str | None,
+        queue_entry: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        read_model = state.read_model
+        runtime = (
+            read_model.controller_runtime
+            if read_model is not None and isinstance(read_model.controller_runtime, dict)
+            else {}
+        )
+        destination = (
+            read_model.destination_binding
+            if read_model is not None and isinstance(read_model.destination_binding, dict)
+            else {}
+        )
+        registered = self._sessions.get(run_id)
+        project_title = None
+        chat_title = None
+        repository_path = None
+        sandbox = None
+        if registered is not None:
+            project_title = registered.project_title
+            chat_title = registered.chat_title
+            repository_path = registered.repository_path
+            sandbox = registered.sandbox
+        if read_model is not None:
+            project_title = project_title or (
+                destination.get("project_title") if destination else None
+            )
+            chat_title = chat_title or (destination.get("chat_title") if destination else None)
+            repository_path = repository_path or read_model.repository_path
+            sandbox = sandbox or read_model.sandbox
+
+        failure = read_model.latest_failure if read_model is not None else None
+        last_summary = runtime.get("last_action_result_summary")
+        wait_reason = None
+        if isinstance(last_summary, dict) and last_summary.get("waiting_for_chatgpt"):
+            wait_reason = last_summary.get("reason_code")
+        elif isinstance(last_summary, dict) and last_summary.get("reason_code") in CHATGPT_WAIT_REASON_CODES:
+            wait_reason = last_summary.get("reason_code")
+
+        waiting_for_chatgpt = bool(runtime.get("waiting_for_chatgpt"))
+        owns_lease = bool(lease_owner and lease_owner == run_id)
+        queue_position = queue_entry.get("position") if isinstance(queue_entry, dict) else None
+        queue_status = queue_entry.get("status") if isinstance(queue_entry, dict) else None
+        queue_is_head = bool(queue_entry.get("is_head")) if isinstance(queue_entry, dict) else False
+        controller_state = str(
+            runtime.get("controller_state")
+            or (registered.controller_state if registered is not None else LOCAL_CONTROLLER_STATE_IDLE)
+        )
+
+        operator = session_operator_view(
+            controller_state=controller_state,
+            runtime=runtime,
+            read_model=read_model,
+            waiting_for_chatgpt=waiting_for_chatgpt,
+            owns_lease=owns_lease,
+            queue_is_head=queue_is_head,
+            queue_status=queue_status if isinstance(queue_status, str) else None,
+        )
+
+        updated_at = None
+        created_at = None
+        try:
+            run_row = self.ledger.get_run(run_id)
+        except Exception:
+            run_row = None
+        if isinstance(run_row, dict):
+            updated_at = run_row.get("updated_at")
+            created_at = run_row.get("created_at")
+
+        terminal = bool(getattr(read_model, "terminal", False)) if read_model is not None else (
+            controller_state in LOCAL_CONTROLLER_TERMINAL_STATES
+        )
+        return {
+            "run_id": run_id,
+            "focused": run_id == focused_run_id,
+            "live": live,
+            "terminal": terminal,
+            "project_title": project_title,
+            "chat_title": chat_title,
+            "repository_path": repository_path,
+            "sandbox": sandbox,
+            "controller_state": controller_state,
+            "run_status": getattr(read_model, "run_status", None) if read_model is not None else None,
+            "current_stage": getattr(read_model, "current_stage", None) if read_model is not None else None,
+            "planner_action": getattr(read_model, "planner_action", None) if read_model is not None else None,
+            "planner_reason_code": (
+                getattr(read_model, "planner_reason_code", None) if read_model is not None else None
+            ),
+            "action_running": bool(runtime.get("action_running")),
+            "current_action_kind": runtime.get("current_action_kind"),
+            "current_action_started_at": runtime.get("current_action_started_at"),
+            "codex_running": _session_codex_running(controller_state, runtime),
+            "waiting_for_chatgpt": waiting_for_chatgpt,
+            "chatgpt_wait_count": runtime.get("chatgpt_wait_count") or 0,
+            "chatgpt_wait_reason_code": wait_reason,
+            "chatgpt_owns_lease": owns_lease,
+            "chatgpt_queue_position": queue_position,
+            "chatgpt_queue_status": queue_status,
+            "chatgpt_queue_is_head": queue_is_head,
+            "waiting_for_approval": bool(
+                runtime.get("pending_approval_available")
+                or (read_model is not None and read_model.requires_human_approval)
+            ),
+            "approval_kind": runtime.get("pending_approval_kind")
+            or (getattr(read_model, "approval_kind", None) if read_model is not None else None),
+            "retrying": operator["operator_status"] == "retrying",
+            "reconciliation_needed": operator["operator_status"]
+            in {
+                "reconciliation_needed",
+                "conversation_claim_conflict",
+                "retry_after_fix",
+                "review_required",
+            },
+            "needs_user_action": operator["needs_user_action"],
+            "latest_reason_code": operator["latest_reason_code"],
+            "latest_failure_summary": operator["latest_failure_summary"],
+            "latest_failure": _session_failure_preview(failure),
+            "operator_status": operator["operator_status"],
+            "operator_status_label": operator["operator_status_label"],
+            "operator_tone": operator["operator_tone"],
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
 
     def _initial_worker(
         self,
@@ -1212,6 +2015,8 @@ class LocalController:
         timeout_seconds: float | None,
     ) -> None:
         try:
+            if not self._wait_for_durability(run_id):
+                return
             run = self.ledger.get_run(run_id)
             result = self.initial_run_executor(
                 run_id=run_id,
@@ -1276,6 +2081,8 @@ class LocalController:
         failure: dict[str, Any],
     ) -> None:
         try:
+            if not self._wait_for_durability(run_id):
+                return
             action_key = str(failure.get("action_key") or "")
             if action_key == "initial_codex":
                 self._retry_initial_codex(run_id, failure_event_id, failure)
@@ -1323,7 +2130,9 @@ class LocalController:
                 expected_prompt_sha256=_string_or_none(
                     read_model.planner_metadata.get("prompt_sha")
                 ),
-                allow_destination_navigation=read_model.allow_destination_navigation,
+                allow_destination_navigation=self._navigation_for_handoff(
+                    run_id, read_model.allow_destination_navigation
+                ),
                 ledger=self.ledger,
                 **self._supervision_handoff_kwargs(),
             )
@@ -1457,12 +2266,33 @@ class LocalController:
 
     def _approval_worker(self, snapshot: PendingApprovalSnapshot, decision: str) -> None:
         try:
+            if not self._wait_for_durability(snapshot.run_id):
+                return
             with self._lock:
                 runtime = self._sessions.get(snapshot.run_id)
                 if runtime is not None and runtime.pending_approval == snapshot:
                     runtime.pending_approval = None
                     self._touch_runtime_locked(runtime)
             read_model = self._build_read_model(snapshot.run_id)
+            if decision == "approved":
+                claim_outcome = self._verify_conversation_claim_for_advancement(
+                    snapshot.run_id
+                )
+                if not claim_outcome.ok:
+                    self._pause_for_action_failure(
+                        snapshot.run_id,
+                        action_key=snapshot.planner_action,
+                        result=_controller_failure_result(
+                            claim_outcome.reason_code
+                            or CONVERSATION_CLAIM_CONFLICT_REASON_CODE,
+                            claim_outcome.error_message
+                            or "Another live session owns this ChatGPT conversation.",
+                            retryable=False,
+                        ),
+                        run_status_before_action=read_model.run_status,
+                        source="conversation_claim_gate",
+                    )
+                    return
             if not read_model.configuration_complete or not read_model.repository_path or not read_model.sandbox:
                 self._pause_for_action_failure(
                     snapshot.run_id,
@@ -1486,7 +2316,9 @@ class LocalController:
                 expected_planner_action=snapshot.planner_action,
                 expected_event_ids=event_ids,
                 expected_prompt_sha256=snapshot.expected_prompt_sha256,
-                allow_destination_navigation=read_model.allow_destination_navigation,
+                allow_destination_navigation=self._navigation_for_handoff(
+                    snapshot.run_id, read_model.allow_destination_navigation
+                ),
                 ledger=self.ledger,
                 **self._supervision_handoff_kwargs(),
             )
@@ -1526,6 +2358,11 @@ class LocalController:
         while True:
             if self._cancel_requested_for(run_id):
                 return
+            # Global durability boundary: no new external side effect while
+            # durable persistence is unproven. Waiting here is patient and
+            # per-run; the session never becomes terminal because of it.
+            if not self._wait_for_durability(run_id):
+                return
             read_model = self._build_read_model(run_id)
             if read_model.requires_human_approval:
                 self._store_pending_approval(read_model)
@@ -1549,6 +2386,26 @@ class LocalController:
                 )
                 return
 
+            if (
+                read_model.planner_action in CONVERSATION_OWNERSHIP_REQUIRED_ACTIONS
+            ):
+                claim_outcome = self._verify_conversation_claim_for_advancement(run_id)
+                if not claim_outcome.ok:
+                    self._pause_for_action_failure(
+                        run_id,
+                        action_key=read_model.planner_action or "routine_progress",
+                        result=_controller_failure_result(
+                            claim_outcome.reason_code
+                            or CONVERSATION_CLAIM_CONFLICT_REASON_CODE,
+                            claim_outcome.error_message
+                            or "Another live session owns this ChatGPT conversation.",
+                            retryable=False,
+                        ),
+                        run_status_before_action=read_model.run_status,
+                        source="conversation_claim_gate",
+                    )
+                    return
+
             with self._lock:
                 runtime = self._get_or_create_session(run_id)
                 runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
@@ -1560,7 +2417,9 @@ class LocalController:
                 read_model.repository_path,
                 read_model.sandbox,
                 approval_mode="auto",
-                allow_destination_navigation=read_model.allow_destination_navigation,
+                allow_destination_navigation=self._navigation_for_handoff(
+                    run_id, read_model.allow_destination_navigation
+                ),
                 ledger=self.ledger,
                 **self._supervision_handoff_kwargs(),
             )
@@ -1605,6 +2464,28 @@ class LocalController:
             "controller_instance_id": self.session.session_id,
         }
 
+    def _navigation_for_handoff(self, run_id: str, configured: bool) -> bool:
+        """Effective navigation policy for one ChatGPT lane slice.
+
+        A single live session keeps its operator-approved checkbox behavior.
+        With more than one live session every slice must navigate to and
+        re-prove the bound destination, and that forced mode latches for the
+        run's remaining lifetime: after a sibling has ever been able to move
+        ChatGPT, "already on my chat" can never again be assumed. Navigation
+        is still followed by the read-only destination gate before any paste,
+        submit, or capture.
+        """
+
+        with self._lock:
+            runtime = self._get_or_create_session(run_id)
+            if (
+                not runtime.navigation_forced_multi_live
+                and len(self._live_session_ids_locked()) > 1
+            ):
+                runtime.navigation_forced_multi_live = True
+                self._persist_session_locked()
+            return bool(configured or runtime.navigation_forced_multi_live)
+
     def _chatgpt_wait_delay_seconds(self, wait_count: int) -> float:
         exponent = max(0, wait_count - 1)
         return min(
@@ -1614,6 +2495,8 @@ class LocalController:
 
     def _wait_for_chatgpt_lane(self, run_id: str, result: Any) -> None:
         with self._lock:
+            if self._cancel_requested_for(run_id):
+                return
             runtime = self._get_or_create_session(run_id)
             runtime.waiting_for_chatgpt = True
             runtime.chatgpt_wait_count += 1
@@ -1629,6 +2512,29 @@ class LocalController:
             self._touch_runtime_locked(runtime)
         delay = self._chatgpt_wait_delay_seconds(wait_count)
         self._chatgpt_wait_sleeper(delay)
+
+    def _wait_for_safe_retry_backoff(self, run_id: str) -> None:
+        """Restart a capped exponential backoff after process restart.
+
+        Monotonic deadlines are process-relative and must not be reused.
+        Wait-count starts at 1 (0.5s, doubling to 8s). Cancel returns without
+        sleeping further.
+        """
+
+        with self._lock:
+            if self._cancel_requested_for(run_id):
+                return
+            runtime = self._get_or_create_session(run_id)
+            runtime.chatgpt_wait_count += 1
+            wait_count = runtime.chatgpt_wait_count
+            runtime.last_action_result_summary = {
+                "kind": "restore_auto_retry_wait",
+                "ok": True,
+                "reason_code": "restore_auto_retry",
+                "wait_count": wait_count,
+            }
+            self._touch_runtime_locked(runtime)
+        self._chatgpt_wait_sleeper(self._chatgpt_wait_delay_seconds(wait_count))
 
     def _commit_state_from_read_model(
         self,
@@ -1649,6 +2555,11 @@ class LocalController:
                 runtime.controller_state = LOCAL_CONTROLLER_STATE_IDLE
             self._touch_runtime_locked(runtime)
             self._persist_session_locked()
+        if read_model.completed or read_model.terminal:
+            self._release_conversation_claim_if_hard_terminal(
+                read_model.run_id,
+                loop_finished=bool(read_model.completed),
+            )
 
     def _store_pending_approval(self, read_model: LocalControllerReadModel) -> None:
         snapshot_result = create_pending_approval_snapshot(read_model)
@@ -1741,6 +2652,7 @@ class LocalController:
                 "project_title": runtime.project_title,
                 "chat_title": runtime.chat_title,
                 "allow_destination_navigation": runtime.allow_destination_navigation,
+                "navigation_forced_multi_live": runtime.navigation_forced_multi_live,
             }
         try:
             writer(
@@ -1757,53 +2669,468 @@ class LocalController:
             return
 
     def _restore_persisted_session(self) -> None:
-        reader = getattr(self.ledger, "load_local_controller_snapshot", None)
-        if not callable(reader):
-            return
-        try:
-            snapshot = reader()
-        except Exception:
-            return
-        if not isinstance(snapshot, dict):
-            return
-        active_run_id = snapshot.get("active_run_id")
-        if not isinstance(active_run_id, str) or not active_run_id:
-            return
-        active_run = self.ledger.get_run(active_run_id)
-        if active_run is None:
-            return
-        active_status = str(active_run.get("status") or "")
-        if active_status in REPLACEABLE_RUN_STATUSES:
-            self._persist_session_locked()
+        """Reconstruct every persisted session independently from durable evidence.
+
+        Stage 6 contract:
+        - The snapshot is a convenience read model. Authoritative candidate
+          discovery is ledger run rows (via ``list_restore_candidate_runs``),
+          then planner/event evidence, with conversation claims as additional
+          ownership hints.
+        - Every persisted session is reconciled independently. The focused
+          run is UI/default-route state only: a terminal or missing focused
+          run must never drop live siblings.
+        - Safely retryable failures resume automatically with a fresh capped
+          backoff. Uncertain side effects stay blocked. Loop-finished and
+          failed/rejected runs are not resurrected.
+        - If authoritative run listing fails, restore fails closed: no new
+          external side effects, durability-blocked, never a healthy-empty boot.
+        """
+
+        payloads, previous_focus, discovery_unhealthy = self._collect_restore_payloads()
+        if not payloads:
+            if discovery_unhealthy:
+                self._persist_session_locked()
             return
 
+        resume_run_ids: list[str] = []
+        for run_id, payload in payloads.items():
+            try:
+                run = self.ledger.get_run(run_id)
+            except Exception:
+                run = None
+            if not isinstance(run, dict):
+                continue
+            run_status = str(run.get("status") or "")
+            if run_status in RESTORE_ABSORBING_RUN_STATUSES:
+                # Absorbing: never revived. Release any leftover claim.
+                self._release_conversation_claim_if_hard_terminal(run_id)
+                continue
+            runtime, should_resume = self._reconstruct_session_from_evidence(
+                run_id,
+                payload,
+            )
+            if runtime is None:
+                continue
+            self._sessions[run_id] = runtime
+            if should_resume and not discovery_unhealthy:
+                resume_run_ids.append(run_id)
+
+        focused: ControllerSessionRuntime | None = None
+        if (
+            isinstance(previous_focus, str)
+            and previous_focus in self._sessions
+            and not self._session_is_replaceable_locked(previous_focus)
+        ):
+            focused = self._sessions[previous_focus]
+        else:
+            # Focus is UI/default-route state only. A terminal/replaceable
+            # focused run must not veto siblings; pick the first remaining
+            # live session in snapshot order, else the first restored
+            # session (so /current still has something to address).
+            for run_id, runtime in self._sessions.items():
+                if not self._session_is_replaceable_locked(run_id):
+                    focused = runtime
+                    break
+            if focused is None and self._sessions:
+                focused = next(iter(self._sessions.values()))
+        if focused is not None:
+            self._apply_focused_runtime(focused)
+        else:
+            self.session.active_run_id = None
+            self.session.controller_state = LOCAL_CONTROLLER_STATE_IDLE
+            self.session.pending_approval = None
+        self._persist_session_locked()
+
+        # Workers last, once the registry and focus are fully constructed.
+        # Discovery failure keeps sessions visible but must not start work.
+        if discovery_unhealthy:
+            return
+        for run_id in resume_run_ids:
+            self._spawn_restore_worker(run_id)
+
+    def _collect_restore_payloads(
+        self,
+    ) -> tuple[dict[str, dict[str, Any]], str | None, bool]:
+        """Build restore candidates from ledger truth, then snapshot/claims.
+
+        Returns (payloads, previous_focus, discovery_unhealthy).
+        """
+
+        snapshot: dict[str, Any] = {}
+        reader = getattr(self.ledger, "load_local_controller_snapshot", None)
+        if callable(reader):
+            try:
+                loaded = reader()
+            except Exception:
+                loaded = None
+            if isinstance(loaded, dict):
+                snapshot = loaded
+
+        previous_focus = snapshot.get("active_run_id")
         payloads: dict[str, dict[str, Any]] = {}
         raw_sessions = snapshot.get("sessions")
         if isinstance(raw_sessions, dict):
             for key, value in raw_sessions.items():
-                if isinstance(key, str) and isinstance(value, dict):
+                if isinstance(key, str) and key and isinstance(value, dict):
                     payloads[key] = value
-        if active_run_id not in payloads:
-            payloads[active_run_id] = {
+        if (
+            isinstance(previous_focus, str)
+            and previous_focus
+            and previous_focus not in payloads
+        ):
+            # Legacy snapshot without a sessions map.
+            payloads[previous_focus] = {
                 "controller_state": snapshot.get("controller_state"),
                 "pending_approval": snapshot.get("pending_approval"),
             }
 
-        focused = self._runtime_from_restore_payload(
-            active_run_id,
-            payloads.get(active_run_id, {}),
+        discovery_unhealthy = False
+        run_lister = getattr(self.ledger, "list_restore_candidate_runs", None)
+        if callable(run_lister):
+            try:
+                listed = run_lister()
+            except Exception as exc:
+                discovery_unhealthy = True
+                self.durability.record_critical_failure(
+                    "list_restore_candidate_runs",
+                    str(exc),
+                )
+                listed = []
+            if isinstance(listed, list):
+                for item in listed:
+                    if not isinstance(item, dict):
+                        continue
+                    run_id = item.get("id") or item.get("run_id")
+                    if not isinstance(run_id, str) or not run_id:
+                        continue
+                    if run_id not in payloads:
+                        payloads[run_id] = self._restore_payload_for_run(run_id)
+                    else:
+                        self._fill_restore_payload_identity(run_id, payloads[run_id])
+
+        claim_lister = getattr(
+            self.ledger, "list_active_chatgpt_conversation_claims", None
         )
-        self._sessions[active_run_id] = focused
-        for run_id, payload in payloads.items():
-            if run_id == active_run_id:
-                continue
-            other = self.ledger.get_run(run_id)
-            if other is None:
-                continue
-            if str(other.get("status") or "") in REPLACEABLE_RUN_STATUSES:
-                continue
-            self._sessions[run_id] = self._runtime_from_restore_payload(run_id, payload)
-        self._apply_focused_runtime(focused)
+        if callable(claim_lister):
+            try:
+                claims = claim_lister()
+            except Exception:
+                claims = []
+            if isinstance(claims, list):
+                for claim in claims:
+                    if not isinstance(claim, dict):
+                        continue
+                    run_id = claim.get("run_id")
+                    if not isinstance(run_id, str) or not run_id:
+                        continue
+                    existing = payloads.get(run_id)
+                    if existing is None:
+                        payloads[run_id] = {
+                            "controller_state": LOCAL_CONTROLLER_STATE_IDLE,
+                            "pending_approval": None,
+                            "project_title": claim.get("project_title"),
+                            "chat_title": claim.get("chat_title"),
+                        }
+                    else:
+                        if not existing.get("project_title"):
+                            existing["project_title"] = claim.get("project_title")
+                        if not existing.get("chat_title"):
+                            existing["chat_title"] = claim.get("chat_title")
+        return payloads, previous_focus if isinstance(previous_focus, str) else None, discovery_unhealthy
+
+    def _restore_payload_for_run(self, run_id: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "controller_state": LOCAL_CONTROLLER_STATE_IDLE,
+            "pending_approval": None,
+        }
+        self._fill_restore_payload_identity(run_id, payload)
+        return payload
+
+    def _fill_restore_payload_identity(
+        self, run_id: str, payload: dict[str, Any]
+    ) -> None:
+        if payload.get("project_title") and payload.get("chat_title"):
+            return
+        try:
+            lookup = get_run_destination_binding(run_id, ledger=self.ledger)
+        except Exception:
+            return
+        binding = getattr(lookup, "binding", None)
+        if binding is None:
+            return
+        if not payload.get("project_title"):
+            payload["project_title"] = binding.project_title
+        if not payload.get("chat_title"):
+            payload["chat_title"] = binding.chat_title
+
+    def _reconstruct_session_from_evidence(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+    ) -> tuple[ControllerSessionRuntime | None, bool]:
+        """Rebuild one session runtime from snapshot payload plus ledger truth.
+
+        Returns (runtime, should_resume). runtime None means the session is
+        absorbing and must not be registered. should_resume True means
+        durable evidence proves safe continuable work for a resume worker.
+        """
+
+        runtime = self._runtime_from_restore_payload(run_id, payload)
+        snapshot_state = _string_or_none(payload.get("controller_state")) or ""
+
+        # Stage 1 first: durable Codex invocation evidence outranks both the
+        # snapshot and the planner read model.
+        open_item = None
+        try:
+            events = self.ledger.list_events(run_id)
+        except Exception:
+            events = None
+        if events is not None:
+            open_item = latest_open_invocation(run_id, events=events)
+
+        if open_item is not None and open_item.status == STATUS_COMPLETE:
+            # Finalize idempotently from durable artifacts, then re-derive.
+            try:
+                reconcile_codex_invocation(run_id, ledger=self.ledger)
+            except Exception:
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                runtime.pending_approval = None
+                return runtime, False
+            open_item = None
+
+        if open_item is not None and open_item.status == STATUS_UNCERTAIN:
+            # Uncertain external side effect: reconciliation-needed, never
+            # replayed. reconcile_codex_invocation records the durable
+            # uncertain marker idempotently.
+            try:
+                reconcile_codex_invocation(run_id, ledger=self.ledger)
+            except Exception:
+                pass
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            runtime.pending_approval = None
+            runtime.last_action_result_summary = {
+                "kind": "restore",
+                "ok": False,
+                "reason_code": "codex_invocation_uncertain",
+                "codex_invocation_id": open_item.invocation_id,
+            }
+            return runtime, False
+
+        if open_item is not None and open_item.status == STATUS_LIVE:
+            # A previous process's Codex may still be running (or its pid is
+            # provably dead); Stage 1 reconciliation in the resume worker
+            # observes or finalizes it without ever replaying.
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            runtime.pending_approval = None
+            return runtime, True
+
+        try:
+            read_model = self._build_read_model(run_id)
+        except Exception:
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            runtime.pending_approval = None
+            return runtime, False
+
+        if read_model.completed:
+            # The loop itself finished. Do not resurrect it into the registry.
+            self._release_conversation_claim_if_hard_terminal(
+                run_id, loop_finished=True
+            )
+            return None, False
+
+        if read_model.requires_human_approval:
+            pending = runtime.pending_approval
+            if pending is not None and self._restored_approval_is_valid(
+                pending, read_model
+            ):
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
+                return runtime, False
+            # A stale approval snapshot is never resurrected. A fresh one is
+            # rebuilt from current durable evidence, which the decision path
+            # re-validates against the planner before executing.
+            runtime.pending_approval = None
+            snapshot_result = create_pending_approval_snapshot(read_model)
+            if snapshot_result.ok:
+                runtime.pending_approval = snapshot_result.snapshot
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_APPROVAL
+            else:
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            return runtime, False
+
+        # Approval evidence no longer requires approval: whatever snapshot
+        # approval existed is stale by definition.
+        runtime.pending_approval = None
+
+        if _restore_requires_reconciliation(read_model):
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            runtime.last_action_result_summary = {
+                "kind": "restore",
+                "ok": False,
+                "reason_code": _restore_reconciliation_reason(read_model),
+            }
+            return runtime, False
+
+        if _failure_is_automatically_retryable(read_model.latest_failure):
+            restore_status = self._restore_retryable_run_status(
+                run_id, read_model.latest_failure or {}
+            )
+            if restore_status is not None:
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                return runtime, False
+            try:
+                read_model = self._build_read_model(run_id)
+            except Exception:
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                return runtime, False
+            if _restore_requires_reconciliation(read_model):
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                return runtime, False
+            if read_model.blocked or read_model.terminal or read_model.completed:
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                return runtime, False
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY
+            runtime.last_action_result_summary = {
+                "kind": "restore_auto_retry",
+                "ok": True,
+                "reason_code": _string_or_none(
+                    (read_model.latest_failure or {}).get("reason_code")
+                ),
+            }
+            return runtime, bool(read_model.routine_action_available)
+
+        if (
+            snapshot_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY
+            and read_model.latest_failure is not None
+        ):
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY
+            return runtime, False
+
+        if read_model.blocked or read_model.terminal:
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+            return runtime, False
+
+        if read_model.routine_action_available:
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            return runtime, True
+
+        # Created/idle with no configuration and no continuable work is not a
+        # live session. Leave it out of the registry rather than resurrecting
+        # every historical abandoned start.
+        if not read_model.configuration_complete and snapshot_state in {
+            "",
+            LOCAL_CONTROLLER_STATE_IDLE,
+        }:
+            return None, False
+
+        # No provably safe work to continue (for example status `created`
+        # with no Codex evidence). In-flight snapshot states were already
+        # mapped to blocked by _runtime_from_restore_payload; anything else
+        # keeps its mapped state and waits for the operator.
+        return runtime, False
+
+    def _restored_approval_is_valid(
+        self,
+        pending: PendingApprovalSnapshot,
+        read_model: LocalControllerReadModel,
+    ) -> bool:
+        """True only when the persisted approval still matches durable evidence."""
+
+        if pending.run_id != read_model.run_id:
+            return False
+        if not read_model.requires_human_approval:
+            return False
+        if pending.planner_action != str(read_model.planner_action or ""):
+            return False
+        expected_ids = read_model.planner_metadata.get("event_ids")
+        expected_ids = expected_ids if isinstance(expected_ids, dict) else {}
+        snapshot_ids = pending.planner_metadata.get("event_ids")
+        snapshot_ids = snapshot_ids if isinstance(snapshot_ids, dict) else {}
+        for key, value in snapshot_ids.items():
+            if _int_or_none(expected_ids.get(key)) != _int_or_none(value):
+                return False
+        current_prompt_sha = _string_or_none(read_model.planner_metadata.get("prompt_sha"))
+        if pending.expected_prompt_sha256 != current_prompt_sha:
+            return False
+        prompt_text = read_model.planner_metadata.get("prompt_text")
+        current_text_sha = (
+            _sha256_text(prompt_text)
+            if isinstance(prompt_text, str) and prompt_text
+            else None
+        )
+        if pending.expected_prompt_text_sha256 != current_text_sha:
+            return False
+        return True
+
+    def _spawn_restore_worker(self, run_id: str) -> None:
+        with self._lock:
+            runtime = self._sessions.get(run_id)
+            if runtime is None or runtime.action_running:
+                return
+            worker = self._new_worker(self._restore_worker, run_id)
+            self._mark_action_running_locked(
+                run_id, LOCAL_CONTROLLER_RESTORE_RESUME_ACTION_KIND
+            )
+            runtime.current_worker = worker
+            self._touch_runtime_locked(runtime)
+        worker.start()
+
+    def _restore_worker(self, run_id: str) -> None:
+        """Resume one restored session from durable evidence.
+
+        Order: durability gate -> Stage 1 Codex reconciliation (observe live,
+        finalize complete, block uncertain) -> normal automatic progress,
+        which re-verifies conversation ownership before any externally
+        mutating action and re-enters the ChatGPT lane through the Stage 3
+        queue rather than trusting stale queue state.
+        """
+
+        try:
+            if not self._wait_for_durability(run_id):
+                return
+            try:
+                read_model = self._build_read_model(run_id)
+            except Exception:
+                read_model = None
+            if read_model is not None and _failure_is_automatically_retryable(
+                read_model.latest_failure
+            ):
+                # Fresh capped backoff after process restart. Do not trust
+                # persisted monotonic deadlines and do not require Retry.
+                self._wait_for_safe_retry_backoff(run_id)
+                if self._cancel_requested_for(run_id):
+                    return
+            try:
+                events = self.ledger.list_events(run_id)
+            except Exception:
+                events = []
+            open_item = latest_open_invocation(run_id, events=events)
+            if open_item is not None:
+                run_before = self.ledger.get_run(run_id)
+                result = reconcile_codex_invocation(run_id, ledger=self.ledger)
+                if self._cancel_requested_for(run_id):
+                    return
+                if result is not None and not _result_ok(result):
+                    self._pause_for_action_failure(
+                        run_id,
+                        action_key="codex_reconcile",
+                        result=result,
+                        run_status_before_action=(
+                            str(run_before.get("status") or "")
+                            if isinstance(run_before, dict)
+                            else None
+                        ),
+                        source=LOCAL_CONTROLLER_RESTORE_RESUME_ACTION_KIND,
+                    )
+                    return
+            self._automatic_progress_loop(run_id, starting_burst_count=0)
+        except Exception as exc:
+            self._record_worker_exception(
+                exc,
+                run_id=run_id,
+                action_key=LOCAL_CONTROLLER_RESTORE_RESUME_ACTION_KIND,
+            )
+        finally:
+            self._clear_action_running(run_id)
 
     def _runtime_from_restore_payload(
         self,
@@ -1843,6 +3170,7 @@ class LocalController:
             project_title=_string_or_none(payload.get("project_title")),
             chat_title=_string_or_none(payload.get("chat_title")),
             allow_destination_navigation=payload.get("allow_destination_navigation") is True,
+            navigation_forced_multi_live=payload.get("navigation_forced_multi_live") is True,
         )
 
     def _reconcile_open_codex_invocation(self, run_id: str) -> None:
@@ -1929,12 +3257,20 @@ class LocalController:
             "supersedes_failure_event_id": supersedes_failure_event_id,
             "retry_context": _safe_preview_value(retry_context or {}),
         }
-        self.ledger.add_event(
-            run_id,
-            LOCAL_CONTROLLER_ACTION_FAILED_EVENT_TYPE,
-            LOCAL_CONTROLLER_ACTION_FAILED_MESSAGE,
-            metadata,
-        )
+        try:
+            self.ledger.add_event(
+                run_id,
+                LOCAL_CONTROLLER_ACTION_FAILED_EVENT_TYPE,
+                LOCAL_CONTROLLER_ACTION_FAILED_MESSAGE,
+                metadata,
+            )
+        except sqlite3.Error:
+            # Durable persistence is failing (the guarded ledger has already
+            # flipped the global durability block). Keep the session's
+            # logical pause state in memory instead of killing the worker;
+            # the failure event itself is telemetry for the retry UI and the
+            # session cannot advance anyway until durability recovers.
+            metadata["failure_event_persisted"] = False
         with self._lock:
             runtime = self._get_or_create_session(run_id)
             runtime.last_action_result_summary = {
@@ -2064,6 +3400,7 @@ class LocalController:
                     if target_run_id == self.session.active_run_id
                     else None
                 ),
+                "ledger_durability": self.durability.status(),
             }
         pending = runtime.pending_approval
         return {
@@ -2081,6 +3418,7 @@ class LocalController:
             "automatic_burst_reason": runtime.automatic_burst_reason,
             "waiting_for_chatgpt": runtime.waiting_for_chatgpt,
             "chatgpt_wait_count": runtime.chatgpt_wait_count,
+            "ledger_durability": self.durability.status(),
         }
 
 
@@ -2213,12 +3551,79 @@ def _validate_destination_titles(
     )
 
 
+@dataclass(frozen=True)
+class _ConversationClaimOutcome:
+    ok: bool
+    reason_code: str | None = None
+    error_message: str | None = None
+
+
+def _claim_run_conversation(
+    ledger: Any,
+    run_id: str,
+    project_title: str,
+    chat_title: str,
+    *,
+    controller_instance_id: str | None,
+) -> _ConversationClaimOutcome:
+    """Take the durable per-ledger conversation claim for a new run.
+
+    Ledgers without the claim primitive (for example test fakes) skip the
+    durable claim; the in-process live-conversation check still applies.
+    """
+
+    claim_fn = getattr(ledger, "claim_chatgpt_conversation", None)
+    if not callable(claim_fn):
+        return _ConversationClaimOutcome(ok=True)
+    result = claim_fn(
+        run_id,
+        project_title,
+        chat_title,
+        controller_instance_id=controller_instance_id,
+    )
+    status = getattr(result, "status", None)
+    if status in {
+        default_ledger.AtomicConversationClaimStatus.CLAIMED,
+        default_ledger.AtomicConversationClaimStatus.IDEMPOTENT,
+    }:
+        return _ConversationClaimOutcome(ok=True)
+    if status == default_ledger.AtomicConversationClaimStatus.DUPLICATE:
+        return _ConversationClaimOutcome(
+            ok=False,
+            reason_code="duplicate_chatgpt_conversation",
+            error_message=(
+                getattr(result, "error_message", None)
+                or "A live session already uses this ChatGPT project and chat."
+            ),
+        )
+    return _ConversationClaimOutcome(
+        ok=False,
+        reason_code=getattr(result, "reason_code", None) or "conversation_claim_failed",
+        error_message=(
+            getattr(result, "error_message", None)
+            or "The ChatGPT conversation claim could not be recorded."
+        ),
+    )
+
+
+def _release_run_conversation_claim(
+    ledger: Any,
+    run_id: str,
+    *,
+    reason: str | None = None,
+) -> None:
+    release_fn = getattr(ledger, "release_chatgpt_conversation_claim", None)
+    if callable(release_fn):
+        release_fn(run_id, reason=reason)
+
+
 def start_local_controller_run(
     session: LocalControllerSession,
     start_request: StartRequestValidationResult,
     *,
     ledger: Any = default_ledger,
     create_run: Callable[..., Any] = create_run_service,
+    controller_instance_id: str | None = None,
 ) -> LocalControllerRunStartResult:
     if not start_request.ok:
         return LocalControllerRunStartResult(
@@ -2267,6 +3672,38 @@ def start_local_controller_run(
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("create_run returned no run_id")
 
+    # Durable same-chat uniqueness: exactly one of two racing starts for the
+    # same (project_title, chat_title) wins this atomic ledger claim. The
+    # loser never binds, never registers a runtime, and never starts Codex.
+    claim_outcome = _claim_run_conversation(
+        ledger,
+        run_id,
+        start_request.project_title,
+        start_request.chat_title,
+        controller_instance_id=controller_instance_id,
+    )
+    if not claim_outcome.ok:
+        reason_code = claim_outcome.reason_code or "conversation_claim_failed"
+        error_message = (
+            claim_outcome.error_message
+            or "The ChatGPT conversation claim could not be recorded."
+        )
+        _record_local_controller_start_failure(
+            ledger,
+            run_id,
+            reason_code,
+            error_message,
+        )
+        return LocalControllerRunStartResult(
+            ok=False,
+            run_id=run_id,
+            repository_path=start_request.repository_path,
+            sandbox=start_request.sandbox,
+            initial_instruction=start_request.initial_instruction,
+            reason_code=reason_code,
+            error_message=error_message,
+        )
+
     try:
         profile = RunExecutionProfile(
             sandbox=start_request.sandbox,
@@ -2280,6 +3717,7 @@ def start_local_controller_run(
             profile_source=profile_source,
         )
     except (TypeError, ValueError) as exc:
+        _release_run_conversation_claim(ledger, run_id, reason="run_start_failed")
         _record_local_controller_start_failure(
             ledger,
             run_id,
@@ -2300,6 +3738,7 @@ def start_local_controller_run(
     if not profile_result.ok:
         reason_code = profile_result.reason_code or "execution_profile_selection_failed"
         error_message = profile_result.error_message or "Failed to select run execution profile."
+        _release_run_conversation_claim(ledger, run_id, reason="run_start_failed")
         _record_local_controller_start_failure(
             ledger,
             run_id,
@@ -2328,6 +3767,7 @@ def start_local_controller_run(
             destination_result.error_message
             or "Failed to bind run destination."
         )
+        _release_run_conversation_claim(ledger, run_id, reason="run_start_failed")
         _record_local_controller_start_failure(
             ledger,
             run_id,
@@ -2720,6 +4160,130 @@ def _chatgpt_ui_lease_status(*, ledger: Any) -> dict[str, Any]:
         "release_block_reason": block_reason,
         "event_ids": list(state.event_ids),
         "latest_denial": latest_denial,
+    }
+
+
+def _session_codex_running(controller_state: str, runtime: dict[str, Any]) -> bool:
+    if controller_state == LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX:
+        return True
+    kind = str(runtime.get("current_action_kind") or "")
+    if kind in CODEX_RUNNING_ACTION_KINDS or kind.endswith("_run_prompt"):
+        return True
+    return False
+
+
+def _session_failure_preview(failure: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(failure, dict):
+        return None
+    return {
+        "event_id": failure.get("event_id"),
+        "reason_code": failure.get("reason_code"),
+        "retryable": failure.get("retryable"),
+        "retry_classification": failure.get("retry_classification"),
+        "error_message": failure.get("error_message") or failure.get("message"),
+        "timestamp": failure.get("timestamp"),
+    }
+
+
+def session_operator_view(
+    *,
+    controller_state: str,
+    runtime: dict[str, Any],
+    read_model: LocalControllerReadModel | None,
+    waiting_for_chatgpt: bool,
+    owns_lease: bool,
+    queue_is_head: bool,
+    queue_status: str | None,
+) -> dict[str, Any]:
+    """Human-facing session status derived from backend fields.
+
+    Waiting on the ChatGPT lane is a normal wait, never an error tone.
+    """
+
+    failure = read_model.latest_failure if read_model is not None else None
+    reason_code = None
+    classification = None
+    retryable = False
+    failure_summary = None
+    if isinstance(failure, dict):
+        reason_code = failure.get("reason_code")
+        classification = failure.get("retry_classification")
+        retryable = failure.get("retryable") is True
+        failure_summary = failure.get("error_message") or failure.get("message") or reason_code
+
+    completed = bool(getattr(read_model, "completed", False)) if read_model is not None else False
+    terminal = bool(getattr(read_model, "terminal", False)) if read_model is not None else False
+    requires_approval = bool(
+        runtime.get("pending_approval_available")
+        or (read_model is not None and read_model.requires_human_approval)
+    )
+    action_running = bool(runtime.get("action_running"))
+    status = "idle"
+    tone = "ok"
+    needs_user_action = False
+
+    if reason_code == CONVERSATION_CLAIM_CONFLICT_REASON_CODE:
+        status = "conversation_claim_conflict"
+        tone = "attention"
+        needs_user_action = True
+    elif classification == "reconcile" or (
+        isinstance(reason_code, str) and reason_code in RESTORE_RECONCILE_REASON_CODES
+    ):
+        status = "reconciliation_needed"
+        tone = "attention"
+        needs_user_action = True
+    elif classification == "retry_after_fix":
+        status = "retry_after_fix"
+        tone = "attention"
+        needs_user_action = True
+    elif classification == "review_required":
+        status = "review_required"
+        tone = "attention"
+        needs_user_action = True
+    elif requires_approval:
+        status = "waiting_for_approval"
+        tone = "attention"
+        needs_user_action = True
+    elif owns_lease or (queue_is_head and queue_status == "claimed" and waiting_for_chatgpt):
+        status = "using_chatgpt"
+        tone = "ok"
+    elif waiting_for_chatgpt:
+        status = "waiting_for_chatgpt"
+        tone = "wait"
+    elif controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY and retryable:
+        status = "retrying"
+        tone = "attention"
+        needs_user_action = True
+    elif controller_state == LOCAL_CONTROLLER_STATE_WAITING_FOR_RETRY:
+        status = "reconciliation_needed"
+        tone = "attention"
+        needs_user_action = True
+    elif _session_codex_running(controller_state, runtime):
+        status = "codex_working"
+        tone = "ok"
+    elif action_running:
+        status = "working"
+        tone = "ok"
+    elif completed or controller_state == LOCAL_CONTROLLER_STATE_COMPLETED:
+        status = "finished"
+        tone = "ok"
+    elif controller_state == LOCAL_CONTROLLER_STATE_FAILED:
+        status = "failed"
+        tone = "error"
+    elif terminal or controller_state in LOCAL_CONTROLLER_TERMINAL_STATES:
+        status = "stopped"
+        tone = "error"
+    elif controller_state == LOCAL_CONTROLLER_STATE_BLOCKED:
+        status = "blocked"
+        tone = "error"
+
+    return {
+        "operator_status": status,
+        "operator_status_label": SESSION_OPERATOR_STATUS_LABELS.get(status, status),
+        "operator_tone": tone,
+        "needs_user_action": needs_user_action,
+        "latest_reason_code": reason_code,
+        "latest_failure_summary": failure_summary,
     }
 
 
@@ -3302,6 +4866,57 @@ def _planner_event_ids(read_model: LocalControllerReadModel) -> dict[str, int]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def _failure_is_automatically_retryable(failure: dict[str, Any] | None) -> bool:
+    """True when retrying cannot duplicate an external side effect."""
+
+    if not isinstance(failure, dict) or not failure:
+        return False
+    reason = str(failure.get("reason_code") or "")
+    classification = str(failure.get("retry_classification") or "")
+    if reason in RESTORE_RECONCILE_REASON_CODES:
+        return False
+    if classification in {"reconcile", "review_required", "retry_after_fix"}:
+        return False
+    if failure.get("action_executed") is True:
+        return False
+    if reason in CHATGPT_WAIT_REASON_CODES:
+        return True
+    return failure.get("retryable") is True
+
+
+def _restore_requires_reconciliation(read_model: LocalControllerReadModel) -> bool:
+    failure = read_model.latest_failure
+    if isinstance(failure, dict) and failure:
+        reason = str(failure.get("reason_code") or "")
+        classification = str(failure.get("retry_classification") or "")
+        if reason in RESTORE_RECONCILE_REASON_CODES:
+            return True
+        if classification in {"reconcile", "review_required"}:
+            return True
+    submission = read_model.latest_chatgpt_submission
+    if isinstance(submission, dict) and str(submission.get("status") or "") in {
+        "ambiguous",
+        "uncertain",
+    }:
+        return True
+    return False
+
+
+def _restore_reconciliation_reason(read_model: LocalControllerReadModel) -> str:
+    failure = read_model.latest_failure
+    if isinstance(failure, dict):
+        reason = _string_or_none(failure.get("reason_code"))
+        if reason:
+            return reason
+    submission = read_model.latest_chatgpt_submission
+    if isinstance(submission, dict) and str(submission.get("status") or "") in {
+        "ambiguous",
+        "uncertain",
+    }:
+        return "chatgpt_submission_ambiguous"
+    return "restore_reconciliation_needed"
 
 
 def _failure_retry_classification(
