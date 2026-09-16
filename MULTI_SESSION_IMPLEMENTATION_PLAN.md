@@ -1,465 +1,507 @@
-# Multi-session CRAX: implementation plan
+# Multi-session CRAX: implementation plan (v2)
 
 Staged, executable plan for [MULTI_SESSION_FEATURE.md](MULTI_SESSION_FEATURE.md).
-Design notes live in [MULTI_SESSION_CONCLUSIONS.md](MULTI_SESSION_CONCLUSIONS.md).
-If those disagree, **the feature doc wins** on product rules; this file wins on
-build order.
+Shared context every stage agent must read first:
+[MULTI_SESSION_CONTEXT.md](MULTI_SESSION_CONTEXT.md). Design-audit history:
+[MULTI_SESSION_CONCLUSIONS.md](MULTI_SESSION_CONCLUSIONS.md).
+
+Precedence: the feature doc wins on product rules; this file wins on build
+order and scope. Where the conclusions doc says the target is two sessions,
+this plan supersedes it: the **capability target is four** concurrent
+sessions, proven live at two before the cap is raised to four (Stage 8).
+
+This plan replaces the previous A–H plan. Mapping from the old stages:
+
+| Old | Fate |
+|---|---|
+| A (characterize) | Done; tests landed with Stages 1–2 |
+| B (SQLite busy timeout) | Done; `PRAGMA busy_timeout` = 10s, no WAL needed so far |
+| C (wait, not failure) | Done; absorbed into Stage 3's already-built portion |
+| D (session registry, max 1) | Done; this plan's Stage 2 |
+| E (second session) | Split into Stages 3, 4, and 5 |
+| F (dashboard + HTTP) | This plan's Stage 7 |
+| G (live proof) | This plan's Stage 8b |
+| H (merge decision) | Unchanged; after Stage 8 |
+| X (capture slicing) | Dropped from scope; only the Stage 8b probe survives |
 
 Work only in `/Users/abhisht/Documents/crax-multi-session` on
-`feature/multi-session`. Do not implement a stage until the previous stage’s
-acceptance is met and we agree to start the next one.
+`feature/multi-session`. Do not implement a stage until the previous
+stage's acceptance is met and the operator agrees to start the next one.
 
-**[C]** means current code. **[T]** means this plan.
-
----
-
-## Product rules this plan must not violate
-
-From the feature doc:
-
-- A session is one ChatGPT **conversation** (project title + chat title) plus a
-  repo.
-- Two live sessions **must not** share that conversation pair.
-- Two live sessions **may** share a ChatGPT project.
-- Two live sessions **may** share a repository, including two writers.
-- Starting or stopping one session must not take the other down.
-- A single session, run alone, must keep behaving as it does today.
+**[C]** means confirmed current code. **[T]** means target.
 
 ---
 
-## What “executable” means here
+## Invariants no stage may violate
 
-The previous draft treated “shorten the ChatGPT capture wait” as the unlock.
-Walking it against the code, that is **not** what makes two sessions possible,
-and it can make them worse.
+From the feature doc and the context doc:
 
-**[C]** Two facts that decide the order:
-
-1. `_ACTIVE_CODEX_PROCESSES` is already keyed by `run_id`. Two Codex jobs can
-   exist. The controller never starts the second one (`active_run_exists`, one
-   `current_worker`, one `action_running`, one `cancel_requested`).
-2. If ChatGPT UI lease acquire fails, `_chatgpt_lease_denied_result` returns
-   `ok=False` and `blocked=True`. `_automatic_progress_loop` then calls
-   `_pause_for_action_failure` and **returns**. That session is dead until a
-   human hits retry. A second session that needs ChatGPT while the first is
-   capturing would not wait. It would fail.
-
-So the feature lands when:
-
-- each session has its own worker, cancel, and approval;
-- Codex on session B runs while session A is in Codex **or** waiting on
-  ChatGPT;
-- needing ChatGPT while the lease is held is a **wait**, not a failure;
-- the only uniqueness check is the live ChatGPT conversation.
-
-Releasing the lease during ChatGPT “thinking,” then switching chats, is an
-**optional later improvement**. It is not required for the feature. It is also
-unsafe until we know whether Classic ChatGPT **keeps generating after you leave
-the chat**. If it does not, slicing capture would abort replies. That probe is
-Stage G-adjacent, not Stage C.
+1. A session is one ChatGPT conversation (`project_title` + `chat_title`)
+   plus a repository. Two live sessions must never share that conversation
+   pair. Sharing a ChatGPT project or a repository is allowed.
+2. Starting or stopping one session must not disturb another.
+3. A single session, run alone, must keep behaving as it does today.
+4. Waiting on the ChatGPT lane is a normal state, never a failure.
+5. Never replay a Codex execution or ChatGPT submission unless the
+   previous attempt provably did not happen. Uncertain means pause and
+   reconcile, not retry.
+6. Destination verification fails closed. No unproven paste, ever.
+7. No lease or mutex is taken from an owner that is provably alive.
+8. The ledger is the source of truth. Terminal states are absorbing.
+9. Never hold `LocalController._lock` across Codex or ChatGPT UI work.
+10. No live desktop automation unless the stage says so and the operator
+    approves it.
 
 ---
 
-## Operating rules
+## Stage status
 
-1. Leave `/Users/abhisht/Documents/agent-gpt-codex-loop` (`main`) alone.
-2. Do not start this worktree’s dashboard/handoff while the live loop is using
-   ChatGPT Desktop.
-3. Create this worktree’s own `.venv` before running tests (it is not copied
-   from `main`).
-4. Characterization tests before each behavior change.
-5. Default `max_active_sessions = 1` until Stage E’s explicit additional-session
-   start. Accidental double-submit of today’s Start button still hits
-   `active_run_exists`.
-6. First ship target is **two** sessions.
-7. Never hold `LocalController._lock` across Codex or ChatGPT UI.
-8. No live ChatGPT automation unless the stage says so and you approve it.
-9. Do not invoke Codex from inside Codex (`AGENTS.md`).
+| Stage | Title | Status |
+|---|---|---|
+| 1 | Durable Codex execution | **Done** |
+| 2 | Per-run session runtime | **Done** |
+| 3 | Shared ChatGPT lane | **Done** |
+| 4 | Real concurrent session workers | **Done** |
+| 5 | Multi-session start and identity rules | **Next** |
+| 6 | Restart and durability recovery | Not started |
+| 7 | Backend API and dashboard | Not started |
+| 8 | Torture testing and live proof | Not started |
 
-Commands in this document use literal ASCII flags such as `--help` and
-`--confirm-run`.
-
----
-
-## Stage map
-
-```text
-A  Characterize current locks, lease-denied = hard fail, unused handoff queue
-B  SQLite busy timeout (WAL only if tests still get SQLITE_BUSY)
-C  ChatGPT contention is wait, not failure; extract does not take the lease
-D  Session registry with max_active_sessions = 1 (one worker per run_id)
-E  Second session: conversation uniqueness, same repo allowed, queue + wait
-F  Dashboard + HTTP for two sessions
-G  Live proof (production loop stopped)
-H  Merge decision (later; default still one session)
-X  Optional later: capture slices / switch-during-think, only after a probe
-```
-
-Do not start F before E. Do not do X before G’s probe. Do not skip C before E:
-without C, the second session dies the first time it needs ChatGPT.
+Per-stage workflow (all stages): read the root docs fully -> audit the
+post-previous-stage code -> confirm the stage still matches the docs ->
+implement only that stage -> run focused validation -> review the actual
+diff before moving on.
 
 ---
 
-## Stage A — Characterize (no product change)
+## Stage 1 — Durable Codex execution — DONE
+
+One Codex invocation is restart-safe before any concurrency exists.
+
+Delivered **[C]**:
+
+- `agent/codex_invocation.py`, `agent/codex_invocation_wrapper.py`:
+  per-invocation wrapper; durable stdout/stderr/final-message/exit
+  artifacts; reuse-safe process identity (pid + boot id + start identity
+  + pgid); idempotent finalization.
+- `reconcile_codex_invocation` on restore: finalize from artifacts when
+  provably finished, fail when provably dead, **pause for reconciliation
+  when uncertain**. An uncertain execution is never replayed.
+- Shutdown handlers terminate active invocations
+  (`install_codex_shutdown_handlers`,
+  `terminate_all_active_codex_invocations`).
+
+Evidence: `tests/test_codex_invocation.py`, `tests/test_codex_services.py`
+pass.
+
+---
+
+## Stage 2 — Per-run session runtime — DONE
+
+Run-specific state is keyed by `run_id`; concurrency is not enabled.
+
+Delivered **[C]**:
+
+- `ControllerSessionRuntime` and `LocalController._sessions` registry:
+  per-run worker, cancel event, approval snapshot, controller state,
+  retry state, `action_running`, destination, repo, sandbox, navigation
+  flag.
+- `active_run_id` demoted to the **focused** run; `/api/runs/current*`
+  and mirrored controller fields unchanged for one session.
+- `DEFAULT_MAX_ACTIVE_SESSIONS = 1`; second start still returns
+  `active_run_exists`.
+- Live-conversation collision check (`duplicate_chatgpt_conversation`)
+  and comma rejection in `RunDestinationBinding` (identity parse needs
+  exactly one comma).
+- Registry persisted in the controller snapshot (`sessions` map) and
+  restored on restart; in-flight sessions restore as `blocked`.
+- Internal cancel/approve/retry take `run_id`.
+
+Evidence: `tests/test_local_controller.py`, `tests/test_run_services.py`,
+`tests/test_local_server.py` pass (one-run contracts intact).
+
+---
+
+## Stage 3 — Shared ChatGPT lane — DONE
+
+The coordination primitive for the one physical ChatGPT Desktop is
+complete, fair, and proven under contention with synthetic run ids —
+while still only one real session runs (`max_active_sessions` stays 1).
+
+Delivered **[C]**:
+
+- Three-layer lane in `_run_chatgpt_handoff_transaction`:
+  FIFO handoff queue (enqueue -> claim-if-head) -> machine-global desktop
+  mutex (`fcntl` file lock with owner liveness identity) -> UI lease.
+  Wrong layer order or a second scheduler is a regression.
+- Contention on any layer returns `waiting_for_chatgpt=True`
+  (`CHATGPT_WAIT_REASON_CODES`); the controller backs off 0.5s doubling
+  to 8s (`_wait_for_chatgpt_lane`) and re-plans. No `waiting_for_retry`.
+- **Pre-submit lane yielding** (predates this stage's final slice; the
+  earlier "remaining work" note claiming it was missing was a stale
+  audit): navigation failure, gate failure, and retryable submit failure
+  complete the queue entry with
+  `chatgpt_handoff_yielded_retryable_ui_failure`, release lease and
+  mutex, and return a retryable wait. Uncertain submissions block for
+  reconciliation and are never replayed. In-slice attempt budgets bound
+  lane occupancy only; the session itself never hard-fails on a
+  temporarily unusable UI.
+- **Fairness**: oldest ready entry goes first; completion frees the head;
+  immediate re-enqueue joins the tail; a fast rerequester cannot starve
+  an older waiter; simultaneous claims have one winner
+  (`BEGIN IMMEDIATE` serialization).
+- **Stale-owner recovery** (liveness evidence only, never elapsed time;
+  `process_instance_liveness` three-state verdict, unknown fails closed):
+  - Desktop mutex: dead owner's flock evaporates with the process;
+    recovery is the normal kernel-atomic acquisition path.
+  - UI lease: acquire events now record full owner identity (pid, boot
+    id, start identity, pgid); an acquire that finds the lease held by a
+    provably dead instance writes one
+    `chatgpt_ui_lease_stale_owner_recovered` release event and acquires
+    in the same transaction. Legacy pid-only leases recover when the pid
+    is gone and wait when the pid is alive but unprovable.
+  - Handoff queue: a head claimed by a provably dead instance is expired
+    (`chatgpt_handoff_claim_owner_dead`) by the next claimer; a crashed
+    run's own dead claim self-heals at re-enqueue; a pending head whose
+    run is hard-terminal is expired (`chatgpt_handoff_run_terminal`).
+    Terminal runs are refused at enqueue and claim (`RUN_TERMINAL`), and
+    supervision stops before claiming.
+- Extraction is ledger-only and never enters the lane.
+
+Evidence: `tests/test_chatgpt_handoff_queue.py` (FIFO, tail rejoin,
+starvation, claim races, dead-owner and terminal-run recovery),
+`tests/test_chatgpt_ui_lease.py` (dead-pid / boot-change / pid-reuse
+recovery, live-owner and unknown-owner denial, recovery race, no
+time-based expiry), `tests/test_chatgpt_desktop_mutex.py` (liveness
+verdict, identifier round-trip, cross-process exclusion),
+`tests/test_supervision_services.py` (yield paths, one-lease transaction,
+uncertain-submit block, terminal-run guard). One-run controller/server
+contracts unchanged.
+
+---
+
+## Stage 4 — Real concurrent session workers — DONE
+
+Independent loop workers genuinely run at the same time. Codex overlaps;
+ChatGPT serializes through the Stage 3 lane. First stage where A/B/C/D
+coexist — in tests, with fakes, no Desktop.
+
+Delivered **[C]**:
+
+- `max_active_sessions` is honored everywhere and clamped to a product
+  hard cap of four (`MAX_ACTIVE_SESSIONS_HARD_CAP = 4`); default stays 1.
+  Configuring 1–4 is respected; configuring above 4 clamps to 4. A start
+  beyond the effective cap returns `active_run_exists`. No HTTP exposure
+  yet (Stage 5).
+- Concurrency audit found exactly one remaining singleton collision:
+  `start_run` unconditionally dropped the focused session after the
+  capacity check, which with capacity above one would have evicted a
+  **live** focused session A when starting B. Fixed: only a replaceable
+  (terminal) focused session is dropped; a live focused session survives
+  a sibling start, and focus simply moves to the new run.
+- Everything else in the traced paths (worker creation/cleanup,
+  `_automatic_progress_loop`, approval, tick, retry, cancel, failure
+  pause, ChatGPT wait/backoff, terminal cleanup) was already keyed by
+  explicit `run_id` from Stage 2 and is now proven under real concurrent
+  workers. Legitimately global: `LocalController._lock` (registry
+  mutations only), the machine-global desktop mutex, the controller
+  instance id used in claim-owner identity, and process-shutdown Codex
+  termination. Focused-run mirror fields remain compatibility-only; no
+  worker path reads them when a runtime exists.
+- Stage 1 Codex process registry keying by `run_id` audited as
+  sufficient: one worker per run means at most one live invocation per
+  run; `terminate_codex_run(run_id)` remains correctly scoped. Not
+  changed.
+- Isolation proofs (`tests/test_multi_session_concurrency.py`, fakes,
+  controllers built with max 2–4): two and four live runtimes coexist;
+  fifth start rejected; same project + different chats allowed; same
+  repo allowed; same live chat rejected; fake Codex A and B overlap in
+  time; A waiting on ChatGPT (and even captive inside its backoff sleep)
+  does not stop B; A waiting on approval does not stop B/C; A's
+  retryable failure and `waiting_for_retry` do not pause B; a worker
+  exception in A mutates only A; cancel A terminates only A's Codex,
+  clears only A's approval, and leaves B/C/D workers, cancel flags, and
+  states untouched in every tested phase (running Codex, waiting for
+  ChatGPT, waiting for approval, waiting for retry); terminal A is
+  absorbing (tick and approval refused, worker ceased) while siblings
+  continue; focused/current APIs follow the newest start while the
+  unfocused background session keeps progressing to completion.
+- Stage 3 lane under real session workers (real ledger queue in a
+  temporary database): three concurrent controller workers serialize
+  through the FIFO handoff queue with at most one claim active at any
+  moment and strict enqueue-order slices; cancelling a queued session
+  removes only its work (its terminal pending entry is expired by the
+  next claimer, never claimed) and a terminal run is refused at both
+  enqueue and claim (`RUN_TERMINAL`).
+- SQLite under concurrent writers: four threads writing events and
+  status updates for different run_ids, and four threads running
+  enqueue/claim/complete queue cycles, all succeed within the existing
+  10-second busy timeout. No `SQLITE_BUSY` observed; **no WAL needed**,
+  ledger settings unchanged.
+
+Evidence: `tests/test_multi_session_concurrency.py` (25 tests) passes;
+one-run ratchet (`tests/test_local_controller.py`,
+`tests/test_supervision_services.py`, `tests/test_local_server.py`,
+`tests/test_run_services.py`) passes; Stage 1
+(`tests/test_codex_invocation.py`, `tests/test_codex_services.py`) and
+Stage 3 (`tests/test_chatgpt_handoff_queue.py`,
+`tests/test_chatgpt_ui_lease.py`, `tests/test_chatgpt_desktop_mutex.py`)
+suites remain green.
+
+Known gap carried forward (unchanged, Stage 6): restore still bails
+early when the focused run is terminal, which would drop live siblings.
+Stage 4 persistence itself is correct — the snapshot `sessions` map
+records every live runtime, verified under a two-live-session start.
+
+---
+
+## Stage 5 — Multi-session start and identity rules
 
 ### Goal
 
-Name the contracts we must keep, and the contracts we will deliberately change
-in C.
+Explicit second/third/fourth session creation, enforced server-side.
 
-### Work
+### Work **[T]**
 
-Extend or add focused tests for **[C]**:
-
-- `start_run` → `active_run_exists` when a non-terminal run is current.
-- Terminal current run can be replaced; racing starts produce one winner.
-- `action_already_running` blocks overlapping approve / tick / retry.
-- UI lease: concurrent acquire has one winner; no time-based expiry.
-- Destination bind is per-run, not unique across runs.
-- Send path holds one lease through capture and extract.
-- Extract **service** does not call ChatGPT; the **planner action** still
-  enters the leased handoff transaction.
-- Capture timeout argument is discarded (`None`).
-- **Lease denied is a hard fail:** acquire failure → `blocked=True` →
-  automatic progress stops and waits for manual retry.
-  (`_chatgpt_lease_denied_result` + `_automatic_progress_loop`).
-- Unused queue: `enqueue_chatgpt_handoff`, `claim_next_chatgpt_handoff`,
-  `complete_chatgpt_handoff`, `block_chatgpt_handoff`. Record: FIFO by
-  sequence; one active entry per run; claim is the oldest pending head;
-  production does not call this API.
+1. Decide the additional-start shape: dedicated route
+   (`/api/runs/start_additional`) vs a flag on the existing start body.
+   Decision criteria: today's Start button and any cached client must be
+   physically unable to start a second session by accident. Lock the
+   decision with a test that the old start body cannot create a second
+   session while one is live.
+2. Enforce at start, under `_lock`:
+   - Hard cap: at most **4** live sessions; the effective cap is
+     `max_active_sessions` (default 1 until Stage 8 proves 2, then 4).
+   - One live session per `(project_title, chat_title)`; reject with
+     `duplicate_chatgpt_conversation` (exists **[C]**; extend tests to
+     racing starts: exactly one winner).
+   - Same project allowed; same repo allowed; comma in titles rejected
+     (exists **[C]**).
+   - Ambiguous or unparseable chat identity fails closed at start.
+3. Navigation rule: when more than one session is live, every lane slice
+   behaves as `allow_destination_navigation=True` regardless of each
+   session's checkbox — two chats cannot both already be on screen.
+   Single live session keeps its opt-in behavior.
+4. Racing duplicate starts (same conversation, simultaneous): one winner,
+   loser gets the collision error, ledger holds one run.
 
 ### Acceptance
 
-- Those tests pass.
-- A one-line amendment here: queue is fit to wire in E, or queue needs change
-  X before E.
-- Zero production behavior change.
+Contract tests: old body cannot double-start; additional start works to
+cap; collision and race rules hold; cap-4 enforced even when configured
+higher by mistake.
+
+### Files
+
+`agent/local_server.py`, `agent/local_controller.py`,
+`agent/run_services.py`, `tests/test_local_server.py`,
+`tests/test_local_controller.py`.
 
 ---
 
-## Stage B — SQLite under concurrent writers
+## Stage 6 — Restart and durability recovery
 
 ### Goal
 
-Two session threads writing events should not immediately hit `SQLITE_BUSY`.
+Four mixed session states recover independently after a CRAX restart, and
+CRAX stops initiating side effects when persistence is untrustworthy.
 
-### Work
+### Work **[T]**
 
-- Set a busy timeout on `ledger._connect()`.
-- Two threads inserting events for different `run_id`s succeed.
-- Enable WAL **only** if that test still fails after the timeout.
+1. Restore audit. Known gap **[C]**: `_restore_persisted_session` returns
+   early when `active_run_id` is missing or the focused run is
+   terminal/replaceable — live sibling sessions in the snapshot would be
+   dropped. Fix: restore every non-terminal session in the snapshot
+   independently; pick a sane focused run (previous focus if live, else
+   any live session); a terminal focused run must not veto siblings.
+2. Mixed-state restore test: A was waiting on ChatGPT, B queued for the
+   lane, C running Codex, D waiting on approval; kill and restart the
+   controller (in-process re-construction against the same ledger).
+   Expect: C reconciles via invocation artifacts (finalize, fail, or
+   pause-uncertain); D's approval snapshot intact; A and B re-enter the
+   wait/queue path rather than failing; nothing double-executes.
+3. Queue and mutex hygiene on restore: dead-owner queue claims and mutex
+   from the previous process do not deadlock the lane (build on Stage 3's
+   stale-owner work).
+4. **Persistence safety rule:** when a durable ledger write fails
+   (sqlite3 error on commit) on any path that gates an external side
+   effect — starting Codex, entering the lane, submitting — the session
+   pauses (`blocked`, explicit reason code) instead of proceeding.
+   Define the exact detection points; do not sprinkle try/except
+   everywhere. A read failure or a snapshot-persist failure must not
+   silently continue into a paste.
+5. Terminal states absorbing: a restored terminal run never gets a
+   worker, never re-enters the lane, and never re-runs Codex — test it.
 
 ### Acceptance
 
-Existing ledger tests pass. Journal mode documented in conclusions if it
-changes.
+Mixed-state restart test passes; persistence-failure test proves no new
+side effect after a failed durable write; existing restore tests pass.
+
+### Files
+
+`agent/local_controller.py`, `agent/ledger.py`,
+`agent/supervision_services.py`, `tests/test_local_controller.py`.
 
 ---
 
-## Stage C — ChatGPT wait is not a failure
-
-This is the first behavior change. It is small on purpose.
+## Stage 7 — Backend API and dashboard
 
 ### Goal
 
-A session that cannot have ChatGPT **right now** keeps living. Extract does
-not occupy the desktop.
+Start, watch, approve, retry, and stop up to four sessions without
+curling JSON.
 
-### Required behavior **[T]**
+### Work **[T]**
 
-1. Planner action `extract_next_prompt` does not acquire the UI lease and does
-   not navigate or gate. Extraction stays ledger-only.
-2. `chatgpt_ui_lease_already_held` is **not** `blocked` and **not**
-   `ok=False` for the automatic progress loop. It is retryable wait: sleep /
-   backoff, then the same planner action again.
-3. `_automatic_progress_loop` must not call `_pause_for_action_failure` for
-   that wait. Overnight single-session is unchanged because nothing else holds
-   the lease. The new path is for a second session in E.
-4. **Do not** unchain send → capture in this stage. Keep today’s
-   navigate → gate → submit → unbounded capture under one lease. That is
-   still the safe single-loop capture. Changing it is Stage X, after a live
-   probe.
-
-### Tests
-
-- Extract-only step: no lease acquire.
-- Fake second holder: session’s send/capture gets `already_held`, worker
-  retries, then succeeds when the fake lease is released. Controller state
-  is not `waiting_for_retry`.
-- Existing send → capture → extract one-lease tests still pass.
-- Single fake session still completes a full loop.
+- `GET /api/runs` — live sessions: project, chat, repo, controller state,
+  Codex status, queue position, whether this run currently owns the lane,
+  pending approval, retry/wait reason.
+- `/api/runs/<run_id>/progress|events|cancel|retry|approval` — approval
+  decisions name a `run_id`.
+- Keep `/api/runs/current*` bound to the focused session for
+  compatibility; a focus-switch endpoint changes only which run those
+  legacy routes address.
+- **Changing focus must never pause, tick, or otherwise touch a
+  background session.**
+- Explicit "start additional session" control (Stage 5's shape); same
+  form fields as today.
+- Dashboard: up to four session cards (chat/project/repo/state, lane
+  ownership, Codex status, approval prompt, wait reason, per-session
+  stop/approve/retry); detail view for the focused session. Remote phone
+  uses the same APIs — no second protocol.
+- Update `tests/test_web_static.py` URL contracts and
+  `tests/test_local_server.py`.
 
 ### Acceptance
 
-Single-session overnight path unchanged except extract no longer takes the
-lease (milliseconds today; still a real contract).
+Contract tests for list, per-id routes, and focus semantics; with the
+additional-session control unused, the old form starts exactly one run
+and the old dashboard flow is unchanged. Browser pass against the
+headless/fake path only — live ChatGPT stays Stage 8.
 
-### Do not
+### Files
 
-- Do not add a second session.
-- Do not bound capture yet.
-- Do not build a session list.
+`agent/local_server.py`, `agent/web_static/app.js`,
+`agent/web_static/index.html`, tests above.
 
 ---
 
-## Stage D — Session registry, still one live session
+## Stage 8 — Torture testing and live proof
 
-### Goal
+### 8a — Torture (fakes, no Desktop)
 
-The controller can hold a map of sessions. Default policy still allows one.
-This is the refactor that E will turn on, not a user-visible feature yet.
+Deliberately ugly cases, each a repeatable test:
 
-### Work
+- A monopolizes the lane (long fake capture) while B/C/D queue; release
+  order is FIFO; nobody starves; nobody enters `waiting_for_retry`.
+- Stop A mid-lane-wait, mid-Codex, and mid-approval; B/C/D unaffected in
+  each case.
+- Codex crash (nonzero exit, killed pid, vanished pid) per session.
+- Uncertain submission on A: A pauses for reconciliation; the lane frees;
+  B proceeds.
+- CRAX SIGKILL and restart from mixed states (Stage 6's matrix, but
+  under load).
+- Duplicate start races; same-repo concurrent edits (both complete;
+  evidence attribution may interleave — assert isolation, not clean
+  attribution).
+- Ledger failure mid-flight (Stage 6's rule under concurrency).
+- Stale mutex/queue/lease from a killed sibling process.
 
-Replace the singleton fields with a map keyed by `run_id`:
+### 8b — Live proof (operator-approved, explicit)
 
-- worker thread
-- `action_running`
-- `cancel_requested`
-- pending approval
-- controller state
-- destination, repo, sandbox, navigation flag
+Preconditions: production loop in `agent-gpt-codex-loop` **stopped**;
+this worktree's dashboard and `.venv` only; distinct ChatGPT chats,
+comma-free titles; operator has approved live desktop automation.
 
-Keep `active_run_id` as the **focused** run so `/api/runs/current*` stays
-valid.
+Script:
 
-Persist the registry, not only one id. Restore-on-restart: in-flight workers
-become blocked per session as today.
+1. Session A completes one full round alone.
+2. Start B (different chat). While A is in Codex, B runs Codex. While A
+   holds the lane, B waits — never fails — then pastes.
+3. Every paste: window identity is that session's `"<chat>, <project>"`.
+   A's marker never appears in B's chat, and the reverse.
+4. Stop A; B completes a round.
+5. Repeat with both sessions on the **same** repo.
+6. **Cap gate:** only after two live sessions pass overnight do we raise
+   the live cap toward four, then repeat the script with three and four.
+7. **Probe (record, do not depend):** while ChatGPT generates in A's
+   chat, switch to B's chat. Does A's reply finish in the background?
+   Write the answer into this file's amendment log. It bounds worst-case
+   lane hold time; it does not gate the feature.
+8. **[U]** If concurrent Codex CLIs auth-lock or starve each other,
+   record it; serializing Codex would be a deliberate follow-up decision,
+   not an improvised patch.
 
-`max_active_sessions = 1`: `start_run` still returns `active_run_exists`.
-All existing one-run tests must keep passing.
-
-Internal cancel / approve / retry take `run_id`. `/current` passes the
-focused id.
-
-Collision helpers exist and are unit-tested, even if max=1 never calls them
-on a second start:
-
-- Reject a second live session with the same `(project_title, chat_title)`.
-- Allow the same project, different chat.
-- Allow the same resolved repo path, including workspace-write.
-- Reject `,` in project or chat titles at start (identity parse needs exactly
-  one comma). Chats that already cannot gate today get a clear start error.
-
-Never hold `_lock` across Codex or ChatGPT.
+Fail closed: a wrong-chat paste, a sibling in `waiting_for_retry` because
+the lane was busy, or stop-A killing B's Codex are Stage 3–6 bugs. Fix
+there; do not proceed.
 
 ### Acceptance
 
-`tests/test_local_controller.py` and `tests/test_local_server.py` one-run
-contracts still pass.
-
----
-
-## Stage E — Second session
-
-### Goal
-
-In this worktree, two sessions run. Codex overlaps. ChatGPT is one lane.
-Same repo is allowed. Same chat is not.
-
-### Work
-
-1. **Explicit additional start** (flag or dedicated route). Today’s Start
-   button without that flag still `active_run_exists`. Decide the exact
-   payload in this stage; lock it with a test that the old start body cannot
-   start a second session.
-
-2. **Live conversation uniqueness** among non-terminal sessions:
-   `(project_title, chat_title)`. Same project allowed. Same repo allowed.
-
-3. **Navigation:** if two (or more) sessions are live, every ChatGPT slice
-   behaves as `allow_destination_navigation=True`, even if session one was
-   started with the checkbox off. Two chats cannot both already be on screen.
-
-4. **Handoff queue** (if Stage A said it is fit): before a ChatGPT slice,
-   enqueue that `run_id`, claim when this run is the pending head, acquire
-   lease, do today’s send-or-capture slice, complete (or block) the queue
-   entry, release lease. If the head belongs to another run, **wait** (Stage
-   C), do not fail. If A said the queue is unfit, retry lease acquire with
-   backoff only — do not invent a second queue.
-
-5. **Fairness:** do not busy-spin. Do not complete-and-immediately-reclaim
-   in a tight loop that starves the sibling.
-
-6. **Cancel session A** terminates only A’s Codex (`terminate_codex_run(A)`).
-   B’s worker and Codex keep going.
-
-7. **Two pending approvals** are two snapshots. Approving A does not apply
-   to B.
-
-### Tests (fakes, no Desktop)
-
-- Two sessions, different chats, **same repo path**, both Codex fakes run
-  concurrently.
-- Two sessions, same project, different chats: allowed.
-- Same `(project, chat)`: rejected.
-- Old start body while A is live: `active_run_exists`.
-- Additional start while A is in Codex: B’s initial Codex starts.
-- A holds the lease (fake): B’s send waits, then proceeds; B is never
-  `waiting_for_retry`.
-- Cancel A: B’s Codex mock is not terminated.
-- Extract on A does not take the lease (from C) and does not block B.
-- Dual approval: A and B each have a pending snapshot; deciding A leaves B
-  pending.
-
-### Acceptance
-
-Headless two-session loop with fakes. No live ChatGPT.
-
----
-
-## Stage F — Dashboard and HTTP
-
-### Goal
-
-Start, watch, approve, and stop two sessions without curling JSON.
-
-### Work
-
-- `GET /api/runs` — live sessions (project, chat, repo, stage, whether this
-  run owns the ChatGPT lease).
-- Keep `/api/runs/current*` as the focused session.
-- `/api/runs/<run_id>/...` for progress, cancel, retry; approval names
-  `run_id`.
-- Explicit “start additional session” control. Same form fields as today
-  (project, chat, repo, sandbox, model). Not a second accidental submit.
-- UI: list of sessions; detail for the focused one; per-session stop;
-  per-session approval.
-- Remote phone uses these APIs. No second protocol.
-- Update `tests/test_web_static.py` URL contracts.
-
-### Acceptance
-
-- Contract tests for list / additional start / per-id cancel.
-- With the additional-session control unused, the old form still starts
-  exactly one run.
-- Browser pass of start A, start additional B, switch focus, stop A, B still
-  listed — against the fake/headless path if we can; otherwise API-level
-  plus a short local UI pass **without** ChatGPT handoff. Live ChatGPT is
-  Stage G.
-
----
-
-## Stage G — Live proof (operator-approved)
-
-### Goal
-
-Prove the feature we will actually use.
-
-### Preconditions
-
-- Production loop from `agent-gpt-codex-loop` is **stopped**.
-- This worktree dashboard only; its own `.venv`.
-- Two distinct ChatGPT conversations. Same project allowed. Same repo
-  allowed (include at least one same-repo run in the script).
-- Titles contain no commas.
-- You have approved live desktop automation.
-
-### Script
-
-1. Session A: one full round (Codex → paste into A’s chat → capture → next
-   Codex).
-2. Start additional session B on a different chat. While A is in Codex, B
-   must be able to run Codex. While A is waiting on ChatGPT (lease held), B
-   must keep Codex moving and must **wait**, not fail, if B also needs to
-   paste.
-3. Every paste: window identity is that session’s `"<chat>, <project>"`.
-4. A’s marker never appears as a submit in B’s chat, and the reverse.
-5. Stop A; B continues and completes a round.
-6. Repeat with both sessions on the **same** repo and different chats.
-7. Only then consider a longer dual loop.
-
-### Probe for Stage X (record, do not depend on it)
-
-While ChatGPT is generating in chat A, switch to chat B. Does A’s reply
-finish in the background? Write the answer into this file. If **no**, do
-not do Stage X.
-
-### Fail closed
-
-Wrong-chat paste, a sibling session in `waiting_for_retry` because the lease
-was busy, or stop A killing B’s Codex — those are C–E bugs. Do not go to H.
-
-**[U]** If two Codex CLIs auth-lock or starve, record it. Then we may
-serialize Codex too. Do not guess that in E.
-
----
-
-## Stage H — Merge decision (later)
-
-Not a coding stage. Only after Stage G:
-
-- Merge is an explicit request.
-- Keep default one session on merge so the daily driver stays one-loop until
-  we turn additional-session on in the live folder.
-- Do not switch the live checkout to this branch as the daily driver until
-  we say so.
-
----
-
-## Stage X — Optional: switch-during-think (not MVP)
-
-Only if Stage G’s probe shows generation **continues** when the chat is not
-focused.
-
-Then, and only then:
-
-- Bound capture polls; release the lease between slices.
-- Re-navigate and re-gate every capture slice.
-- Re-enqueue at the **tail** so the sibling can paste while we wait.
-- Unchain send from unbounded capture.
-
-If the probe is no, **never** do this. Serial ChatGPT (including think time)
-plus overlapping Codex is the product.
-
----
-
-## Suggested first coding slice (when we say go)
-
-Stage A only: tests, no product change. Create `.venv` in this folder first.
-
----
-
-## Test strategy
-
-| Kind | Use |
-|---|---|
-| Existing controller / server / lease / supervision tests | Compatibility ratchet every stage |
-| Fake ChatGPT + fake Codex | Two-session wait/serialize without Desktop |
-| Focused tests | Only the files that encode the slice |
-| Live Desktop | Stage G (and the Stage X probe), explicit approval |
-
----
-
-## Files we expect to touch
-
-| Stage | Likely files |
-|---|---|
-| A | `tests/test_local_controller.py`, `tests/test_supervision_services.py`, `tests/test_chatgpt_ui_lease.py`, new queue tests |
-| B | `agent/ledger.py`, ledger tests |
-| C | `agent/supervision_services.py`, `agent/local_controller.py` (progress loop wait vs fail), supervision + controller tests |
-| D | `agent/local_controller.py`, snapshot in `agent/ledger.py`, bind/start title checks in `agent/run_services.py`, controller tests |
-| E | `agent/local_controller.py`, `agent/supervision_services.py`, queue wiring, `agent/local_server.py` start payload, two-session tests |
-| F | `agent/local_server.py`, `agent/web_static/app.js`, `index.html`, `tests/test_web_static.py`, `tests/test_local_server.py` |
-
-Avoid drive-by splits of `agent/cli.py` and
-`agent/chatgpt_navigation_diagnostic.py`. CLI multi-session is out of scope;
-the dashboard is the product.
+8a suite green; 8b script passes at two sessions, then at four. Only then
+is multi-session production-ready. Merge to `main` remains a separate,
+explicit decision, with the default cap still 1 on merge.
 
 ---
 
 ## Closed decisions (do not reopen in code without asking)
 
-1. Same repo is allowed. Do not add a start-time repo lock.
-2. Same ChatGPT project is allowed.
-3. Same ChatGPT conversation (`project_title` + `chat_title`) is not.
-4. Capture slicing is Stage X, not Stage C.
-5. Additional session is explicit; default max is 1.
-6. When two sessions are live, ChatGPT handoff always navigates.
+1. Same repository allowed, including two writers. No start-time repo lock.
+2. Same ChatGPT project allowed.
+3. Same ChatGPT conversation forbidden among live sessions.
+4. Additional sessions are explicit; default `max_active_sessions = 1`.
+5. Capability target is four sessions; live proof gates 1 -> 2 -> 4.
+6. With more than one live session, every lane slice navigates.
+7. Capture slicing / switch-during-think is out of scope; only the 8b
+   probe records the underlying fact.
+8. The handoff queue is the one scheduler. No second queue.
+9. Uncertain side effects pause for reconciliation. No attempt-count
+   giveups on safely recoverable waits; no blind retries on uncertainty.
 
-## Left to decide inside the named stage
+## Open decisions (settle inside the named stage)
 
-1. Stage E: exact additional-session API field vs route.
-2. Stage C: wait backoff (seconds). Must not spin.
-3. Stage G: whether Codex must be serialized after seeing real quota
-   behavior.
+1. Stage 5: additional-start route vs flag.
+2. Stage 6: exact durable-write failure detection points.
+3. Stage 8: whether Codex needs serializing after real quota behavior.
+
+Settled in Stage 3: yield-and-requeue reuses the wait-lane backoff
+(0.5s doubling to a capped 8s); no separate constants were needed.
+
+## Amendment log
+
+- 2026-09-16: Plan v2 replaces the A–H plan. Stages 1–2 recorded done
+  (evidence: `codex_invocation` + controller-registry test suites green).
+  Old Stage A queue-fitness amendment recorded implicitly: the ledger
+  handoff queue was characterized (`tests/test_chatgpt_handoff_queue.py`)
+  and wired into the lane; it is the production scheduler.
+- 2026-09-16: Stage 3 complete. Audit correction: pre-submit lane
+  yielding was already implemented and tested before this slice; the
+  plan's "remaining work" item 1 was stale. This slice added: full owner
+  identity on UI lease acquire events; automatic dead-owner recovery for
+  the UI lease and the handoff queue (three-state liveness, unknown fails
+  closed, race-safe under `BEGIN IMMEDIATE`); terminal-run refusal and
+  expiry in the queue (`RUN_TERMINAL`); fairness/starvation/race tests.
+  SQLite unchanged (busy timeout 10s, rollback journal, no WAL needed).
+  One characterization test updated: the "no time-based expiry" lease
+  test now pins a live-but-unprovable owner, because its fabricated dead
+  pid is now correctly recoverable. `max_active_sessions` remains 1; a
+  second start is still rejected.
+- 2026-09-16: Stage 4 complete. Audit finding: the only remaining
+  concurrency collision was `start_run` unconditionally dropping the
+  focused session after the capacity check; with capacity above one this
+  would have evicted a live focused session. Fixed to drop only a
+  replaceable (terminal) focused session. Added
+  `MAX_ACTIVE_SESSIONS_HARD_CAP = 4` (configured caps clamp to it;
+  default stays 1). New `tests/test_multi_session_concurrency.py` proves
+  2–4 real concurrent controller workers with fake Codex/ChatGPT
+  services, full cancellation/approval/retry/failure isolation, Stage 3
+  lane FIFO serialization under real session workers against the real
+  ledger queue, terminal-run lane refusal, and stable concurrent SQLite
+  writers. SQLite unchanged (busy timeout 10s, rollback journal, no WAL
+  needed — concurrent-writer tests hit no `SQLITE_BUSY`). Stage 1 Codex
+  process registry keying by `run_id` audited and kept. The Stage 6
+  restore gap (terminal focused run drops live siblings on restore) is
+  unchanged and still deferred; snapshot persistence of all live
+  runtimes was verified correct.
+- (add entries here as stages complete)

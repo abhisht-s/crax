@@ -2064,5 +2064,53 @@ class NavigationBeforeGateTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
 
 
+class HandoffQueueTerminalRunGuardTests(unittest.TestCase):
+    def test_terminal_run_enqueue_refusal_stops_before_claiming(self) -> None:
+        # Cancelled or otherwise terminal queued work must never perform a
+        # ChatGPT handoff: the RUN_TERMINAL enqueue refusal is returned as-is
+        # and the claim step is never reached.
+        from types import SimpleNamespace
+
+        from agent import ledger as default_ledger
+        from agent.supervision_services import _enqueue_and_claim_chatgpt_handoff
+
+        claim_calls: list[str] = []
+
+        class _StubLedger:
+            def enqueue_chatgpt_handoff(self, run_id, *, enqueue_source):
+                del enqueue_source
+                return SimpleNamespace(
+                    status=str(
+                        default_ledger.AtomicChatGPTHandoffQueueStatus.RUN_TERMINAL
+                    ),
+                    run_id=run_id,
+                    reason_code="chatgpt_handoff_run_terminal",
+                )
+
+            def claim_chatgpt_handoff_for_run(self, run_id, *, claim_owner_identifier):
+                del claim_owner_identifier
+                claim_calls.append(run_id)
+                raise AssertionError("claim must not run for a terminal run")
+
+            def complete_chatgpt_handoff(self, *args, **kwargs):
+                raise AssertionError("complete must not run for a terminal run")
+
+            def block_chatgpt_handoff(self, *args, **kwargs):
+                raise AssertionError("block must not run for a terminal run")
+
+        result = _enqueue_and_claim_chatgpt_handoff(
+            "run-terminal",
+            action_value="ask_send_to_gpt",
+            claim_owner_identifier="owner",
+            ledger=_StubLedger(),
+        )
+
+        self.assertEqual(
+            str(result.status),
+            str(default_ledger.AtomicChatGPTHandoffQueueStatus.RUN_TERMINAL),
+        )
+        self.assertEqual(claim_calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()

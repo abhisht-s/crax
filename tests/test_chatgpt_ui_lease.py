@@ -4,6 +4,7 @@ import concurrent.futures
 import inspect
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -356,10 +357,18 @@ class ChatGPTUILeaseTests(unittest.TestCase):
             )
 
     def test_lease_does_not_auto_expire_because_time_passes(self) -> None:
+        # A lease whose owner pid is alive but whose recorded identity cannot
+        # prove liveness either way is never expired, no matter how old the
+        # acquired_at timestamp is. Elapsed time is not evidence.
         with _temporary_ledger():
             owner_run_id = ledger.create_run("owner")
             second_run_id = ledger.create_run("second")
-            _write_acquire_event(owner_run_id, token="old-token", acquired_at="2000-01-01T00:00:00+00:00")
+            _write_acquire_event(
+                owner_run_id,
+                token="old-token",
+                acquired_at="2000-01-01T00:00:00+00:00",
+                owner_pid=os.getpid(),
+            )
 
             lookup = get_chatgpt_ui_lease(ledger=ledger)
             second = acquire_chatgpt_ui_lease(second_run_id, ledger=ledger)
@@ -407,6 +416,131 @@ class ChatGPTUILeaseTests(unittest.TestCase):
             self.assertEqual(len(redaction_events), 2)
             for event in redaction_events:
                 self.assertNotIn(raw, event["metadata_json"])
+
+    def test_dead_pid_owner_lease_is_recovered_with_audit_event(self) -> None:
+        # A legacy pid-only lease whose owner pid provably no longer exists is
+        # recovered automatically: the acquire writes one stale release event
+        # and then acquires normally in the same transaction.
+        import subprocess
+
+        with _temporary_ledger():
+            owner_run_id = ledger.create_run("owner")
+            second_run_id = ledger.create_run("second")
+            proc = subprocess.Popen(["/bin/sleep", "0"])
+            proc.wait()
+            _write_acquire_event(owner_run_id, token="dead-owner", owner_pid=proc.pid)
+
+            second = acquire_chatgpt_ui_lease(second_run_id, ledger=ledger)
+
+            self.assertTrue(second.ok)
+            self.assertEqual(second.run_id, second_run_id)
+            releases = [
+                _metadata(event)
+                for event in _lease_lifecycle_events()
+                if event["event_type"] == CHATGPT_UI_LEASE_RELEASED_EVENT_TYPE
+            ]
+            self.assertEqual(len(releases), 1)
+            self.assertTrue(releases[0]["stale_owner_recovered"])
+            self.assertEqual(
+                releases[0]["reason"],
+                ledger.CHATGPT_UI_LEASE_STALE_OWNER_RECOVERED_REASON_CODE,
+            )
+
+    def test_boot_change_owner_lease_is_recovered(self) -> None:
+        with _temporary_ledger():
+            owner_run_id = ledger.create_run("owner")
+            second_run_id = ledger.create_run("second")
+            _write_acquire_event(
+                owner_run_id,
+                token="pre-reboot",
+                owner_pid=os.getpid(),
+                identity_metadata={
+                    "owner_boot_id": "kern.bootsessionuuid=previous-boot",
+                    "owner_process_start_identity": "irrelevant",
+                },
+            )
+
+            second = acquire_chatgpt_ui_lease(second_run_id, ledger=ledger)
+
+            self.assertTrue(second.ok)
+            self.assertEqual(second.run_id, second_run_id)
+
+    def test_pid_reuse_owner_lease_is_recovered(self) -> None:
+        from agent.codex_invocation import boot_identity
+
+        with _temporary_ledger():
+            owner_run_id = ledger.create_run("owner")
+            second_run_id = ledger.create_run("second")
+            _write_acquire_event(
+                owner_run_id,
+                token="pid-reused",
+                owner_pid=os.getpid(),
+                identity_metadata={
+                    "owner_boot_id": boot_identity(),
+                    "owner_process_start_identity": "Thu Jan  1 00:00:00 1970",
+                },
+            )
+
+            second = acquire_chatgpt_ui_lease(second_run_id, ledger=ledger)
+
+            self.assertTrue(second.ok)
+            self.assertEqual(second.run_id, second_run_id)
+
+    def test_provably_live_owner_lease_is_never_stolen(self) -> None:
+        from agent.codex_invocation import boot_identity, process_start_identity
+
+        with _temporary_ledger():
+            owner_run_id = ledger.create_run("owner")
+            second_run_id = ledger.create_run("second")
+            _write_acquire_event(
+                owner_run_id,
+                token="live-owner",
+                acquired_at="2000-01-01T00:00:00+00:00",
+                owner_pid=os.getpid(),
+                identity_metadata={
+                    "owner_boot_id": boot_identity(),
+                    "owner_process_start_identity": process_start_identity(os.getpid()),
+                },
+            )
+
+            second = acquire_chatgpt_ui_lease(second_run_id, ledger=ledger)
+
+            self.assertFalse(second.ok)
+            self.assertEqual(second.reason_code, "chatgpt_ui_lease_already_held")
+
+    def test_stale_owner_recovery_race_has_one_winner(self) -> None:
+        import subprocess
+
+        with _temporary_ledger():
+            owner_run_id = ledger.create_run("owner")
+            run_a = ledger.create_run("racer a")
+            run_b = ledger.create_run("racer b")
+            proc = subprocess.Popen(["/bin/sleep", "0"])
+            proc.wait()
+            _write_acquire_event(owner_run_id, token="dead-owner", owner_pid=proc.pid)
+
+            barrier = threading.Barrier(2)
+
+            def race(run_id: str):
+                barrier.wait(timeout=5)
+                return acquire_chatgpt_ui_lease(run_id, ledger=ledger)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results = [
+                    future.result(timeout=15)
+                    for future in [executor.submit(race, run) for run in (run_a, run_b)]
+                ]
+
+            winners = [result for result in results if result.ok]
+            losers = [result for result in results if not result.ok]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(len(losers), 1)
+            self.assertEqual(losers[0].reason_code, "chatgpt_ui_lease_already_held")
+            # The loser was denied by the winner's fresh live lease, not by the
+            # dead owner's stale lease.
+            self.assertEqual(
+                losers[0].active_owner.owning_run_id, winners[0].run_id
+            )
 
     def test_no_operational_timeout_or_deadline_api_is_introduced(self) -> None:
         functions = (
@@ -533,6 +667,8 @@ def _write_acquire_event(
     token: str,
     acquired_at: str = "2026-01-01T00:00:00+00:00",
     raw: bool = False,
+    owner_pid: int = 12345,
+    identity_metadata: dict | None = None,
 ) -> None:
     token_metadata = (
         {"lease_token": token}
@@ -546,9 +682,10 @@ def _write_acquire_event(
         metadata={
             "schema_version": CHATGPT_UI_LEASE_SCHEMA_VERSION,
             **token_metadata,
-            "owner_pid": 12345,
+            "owner_pid": owner_pid,
             "owning_run_id": run_id,
             "acquired_at": acquired_at,
+            **(identity_metadata or {}),
         },
     )
 

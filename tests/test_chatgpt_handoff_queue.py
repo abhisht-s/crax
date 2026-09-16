@@ -7,7 +7,20 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import os
+
 from agent import ledger
+from agent.chatgpt_desktop_mutex import handoff_claim_owner_identifier
+from agent.run_state import RunStatus
+
+
+def _dead_claim_owner(run_id: str) -> str:
+    # Boot mismatch proves the owner instance is gone; if the current boot id
+    # is unknowable the differing start identity proves pid reuse instead.
+    return (
+        "controller:crashed|boot:kern.bootsessionuuid=some-previous-boot"
+        f"|pid:{os.getpid()}|start:Thu Jan  1 00:00:00 1970|run:{run_id}"
+    )
 
 
 def _temporary_ledger():
@@ -188,6 +201,208 @@ class ChatGPTHandoffQueueTests(unittest.TestCase):
             )
             claimed = ledger.claim_next_chatgpt_handoff(claim_owner_identifier="owner")
             self.assertEqual(claimed.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
+
+    def test_simultaneous_claim_attempts_have_one_winner(self) -> None:
+        with _temporary_ledger():
+            run_id = ledger.create_run("contested")
+            ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="ready")
+            barrier = threading.Barrier(2)
+
+            def race(owner: str):
+                barrier.wait(timeout=5)
+                return ledger.claim_chatgpt_handoff_for_run(
+                    run_id, claim_owner_identifier=owner
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results = [
+                    future.result(timeout=15)
+                    for future in [
+                        executor.submit(race, "owner-one"),
+                        executor.submit(race, "owner-two"),
+                    ]
+                ]
+
+            statuses = sorted(str(result.status) for result in results)
+            self.assertEqual(
+                statuses,
+                sorted(
+                    [
+                        str(ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED),
+                        str(ledger.AtomicChatGPTHandoffQueueStatus.OWNER_MISMATCH),
+                    ]
+                ),
+            )
+
+    def test_repeated_fast_rerequest_cannot_starve_an_older_waiter(self) -> None:
+        with _temporary_ledger():
+            run_fast = ledger.create_run("fast")
+            run_slow = ledger.create_run("slow")
+            ledger.enqueue_chatgpt_handoff(run_fast, enqueue_source="ready")
+            ledger.enqueue_chatgpt_handoff(run_slow, enqueue_source="ready")
+
+            for _cycle in range(3):
+                claimed = ledger.claim_chatgpt_handoff_for_run(
+                    run_fast, claim_owner_identifier="owner-fast"
+                )
+                if claimed.status != ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED:
+                    break
+                ledger.complete_chatgpt_handoff(
+                    claimed.queue_sequence,
+                    claim_owner_identifier="owner-fast",
+                    reason_code="chatgpt_handoff_slice_completed",
+                )
+                ledger.enqueue_chatgpt_handoff(run_fast, enqueue_source="again")
+
+            slow_claim = ledger.claim_chatgpt_handoff_for_run(
+                run_slow, claim_owner_identifier="owner-slow"
+            )
+            self.assertEqual(
+                slow_claim.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED
+            )
+            fast_wait = ledger.claim_chatgpt_handoff_for_run(
+                run_fast, claim_owner_identifier="owner-fast"
+            )
+            self.assertEqual(
+                fast_wait.status, ledger.AtomicChatGPTHandoffQueueStatus.WAITING
+            )
+            self.assertEqual(fast_wait.head_run_id, run_slow)
+
+    def test_dead_claim_owner_head_is_expired_so_followers_proceed(self) -> None:
+        with _temporary_ledger():
+            run_dead = ledger.create_run("crashed")
+            run_next = ledger.create_run("next")
+            ledger.enqueue_chatgpt_handoff(run_dead, enqueue_source="send")
+            ledger.enqueue_chatgpt_handoff(run_next, enqueue_source="send")
+            claimed = ledger.claim_chatgpt_handoff_for_run(
+                run_dead, claim_owner_identifier=_dead_claim_owner(run_dead)
+            )
+            self.assertEqual(claimed.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
+
+            follower = ledger.claim_chatgpt_handoff_for_run(
+                run_next, claim_owner_identifier="owner-next"
+            )
+
+            self.assertEqual(follower.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
+            self.assertEqual(follower.run_id, run_next)
+            blocked_events = [
+                event
+                for event in ledger.list_events(run_dead)
+                if event["event_type"] == ledger.CHATGPT_HANDOFF_BLOCKED_EVENT_TYPE
+            ]
+            self.assertEqual(len(blocked_events), 1)
+            self.assertIn(
+                ledger.CHATGPT_HANDOFF_CLAIM_OWNER_DEAD_REASON_CODE,
+                blocked_events[0]["metadata_json"],
+            )
+
+    def test_live_claim_owner_head_is_never_stolen(self) -> None:
+        with _temporary_ledger():
+            run_live = ledger.create_run("live")
+            run_next = ledger.create_run("next")
+            ledger.enqueue_chatgpt_handoff(run_live, enqueue_source="send")
+            ledger.enqueue_chatgpt_handoff(run_next, enqueue_source="send")
+            live_owner = handoff_claim_owner_identifier(run_live)
+            claimed = ledger.claim_chatgpt_handoff_for_run(
+                run_live, claim_owner_identifier=live_owner
+            )
+            self.assertEqual(claimed.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
+
+            follower = ledger.claim_chatgpt_handoff_for_run(
+                run_next, claim_owner_identifier="owner-next"
+            )
+
+            self.assertEqual(follower.status, ledger.AtomicChatGPTHandoffQueueStatus.WAITING)
+            self.assertEqual(follower.head_run_id, run_live)
+
+    def test_unparseable_claim_owner_fails_closed_as_not_dead(self) -> None:
+        with _temporary_ledger():
+            run_head = ledger.create_run("head")
+            run_next = ledger.create_run("next")
+            ledger.enqueue_chatgpt_handoff(run_head, enqueue_source="send")
+            ledger.enqueue_chatgpt_handoff(run_next, enqueue_source="send")
+            ledger.claim_chatgpt_handoff_for_run(
+                run_head, claim_owner_identifier="owner-opaque"
+            )
+
+            follower = ledger.claim_chatgpt_handoff_for_run(
+                run_next, claim_owner_identifier="owner-next"
+            )
+
+            self.assertEqual(follower.status, ledger.AtomicChatGPTHandoffQueueStatus.WAITING)
+            self.assertEqual(follower.head_run_id, run_head)
+
+    def test_crashed_run_self_heals_its_dead_claim_on_reenqueue(self) -> None:
+        with _temporary_ledger():
+            run_id = ledger.create_run("restarted")
+            ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="send")
+            claimed = ledger.claim_chatgpt_handoff_for_run(
+                run_id, claim_owner_identifier=_dead_claim_owner(run_id)
+            )
+            self.assertEqual(claimed.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
+
+            reenqueued = ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="retry")
+            self.assertEqual(
+                reenqueued.status, ledger.AtomicChatGPTHandoffQueueStatus.ENQUEUED
+            )
+            reclaimed = ledger.claim_chatgpt_handoff_for_run(
+                run_id, claim_owner_identifier="owner-after-restart"
+            )
+            self.assertEqual(
+                reclaimed.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED
+            )
+            self.assertEqual(reclaimed.claim_owner_identifier, "owner-after-restart")
+
+    def test_terminal_run_pending_head_is_expired_for_followers(self) -> None:
+        with _temporary_ledger():
+            run_cancelled = ledger.create_run("cancelled")
+            run_next = ledger.create_run("next")
+            ledger.enqueue_chatgpt_handoff(run_cancelled, enqueue_source="send")
+            ledger.enqueue_chatgpt_handoff(run_next, enqueue_source="send")
+            ledger.update_run_status(run_cancelled, RunStatus.REJECTED)
+
+            follower = ledger.claim_chatgpt_handoff_for_run(
+                run_next, claim_owner_identifier="owner-next"
+            )
+
+            self.assertEqual(follower.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
+            self.assertEqual(follower.run_id, run_next)
+            blocked_events = [
+                event
+                for event in ledger.list_events(run_cancelled)
+                if event["event_type"] == ledger.CHATGPT_HANDOFF_BLOCKED_EVENT_TYPE
+            ]
+            self.assertEqual(len(blocked_events), 1)
+            self.assertIn(
+                ledger.CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE,
+                blocked_events[0]["metadata_json"],
+            )
+
+    def test_terminal_run_cannot_enqueue_or_claim_a_handoff(self) -> None:
+        with _temporary_ledger():
+            run_id = ledger.create_run("finished")
+            ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="send")
+            ledger.update_run_status(run_id, RunStatus.COMPLETED)
+
+            enqueue = ledger.enqueue_chatgpt_handoff(run_id, enqueue_source="late")
+            claim = ledger.claim_chatgpt_handoff_for_run(
+                run_id, claim_owner_identifier="owner-late"
+            )
+
+            self.assertEqual(
+                enqueue.status, ledger.AtomicChatGPTHandoffQueueStatus.RUN_TERMINAL
+            )
+            self.assertEqual(
+                claim.status, ledger.AtomicChatGPTHandoffQueueStatus.RUN_TERMINAL
+            )
+            # The refused claim also expired the leftover pending entry so it
+            # cannot block followers.
+            run_next = ledger.create_run("next")
+            ledger.enqueue_chatgpt_handoff(run_next, enqueue_source="send")
+            follower = ledger.claim_chatgpt_handoff_for_run(
+                run_next, claim_owner_identifier="owner-next"
+            )
+            self.assertEqual(follower.status, ledger.AtomicChatGPTHandoffQueueStatus.CLAIMED)
 
     def test_busy_timeout_is_configured_without_enabling_wal(self) -> None:
         self.assertEqual(ledger.SQLITE_BUSY_TIMEOUT_SECONDS, 10.0)

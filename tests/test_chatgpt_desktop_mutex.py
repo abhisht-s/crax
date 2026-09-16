@@ -7,9 +7,15 @@ import unittest
 from pathlib import Path
 
 from agent.chatgpt_desktop_mutex import (
+    PROCESS_INSTANCE_DEAD,
+    PROCESS_INSTANCE_LIVE,
+    PROCESS_INSTANCE_UNKNOWN,
     ChatGPTDesktopMutex,
-    controller_process_is_live,
     capture_mutex_identity,
+    controller_process_is_live,
+    handoff_claim_owner_identifier,
+    parse_handoff_claim_owner_identifier,
+    process_instance_liveness,
 )
 
 
@@ -67,6 +73,45 @@ class ChatGPTDesktopMutexTests(unittest.TestCase):
             controller_instance_id="controller-a",
         )
         self.assertTrue(controller_process_is_live(live))
+
+    def test_process_instance_liveness_is_three_state_and_fail_closed(self) -> None:
+        live = capture_mutex_identity(owning_run_id="run-a")
+        self.assertEqual(process_instance_liveness(live), PROCESS_INSTANCE_LIVE)
+
+        boot_changed = dict(live)
+        boot_changed["boot_id"] = "kern.bootsessionuuid=some-previous-boot"
+        self.assertEqual(process_instance_liveness(boot_changed), PROCESS_INSTANCE_DEAD)
+
+        pid_reused = dict(live)
+        pid_reused["process_start_identity"] = "Thu Jan  1 00:00:00 1970"
+        self.assertEqual(process_instance_liveness(pid_reused), PROCESS_INSTANCE_DEAD)
+
+        # Alive pid without a recorded start identity cannot be proven either
+        # way: unknown, never dead. Elapsed time is not an input at all.
+        unproven = {"pid": live["pid"], "boot_id": live["boot_id"]}
+        self.assertEqual(process_instance_liveness(unproven), PROCESS_INSTANCE_UNKNOWN)
+
+        self.assertEqual(process_instance_liveness(None), PROCESS_INSTANCE_UNKNOWN)
+        self.assertEqual(process_instance_liveness({}), PROCESS_INSTANCE_UNKNOWN)
+        self.assertEqual(
+            process_instance_liveness({"pid": "not-an-int"}),
+            PROCESS_INSTANCE_UNKNOWN,
+        )
+
+    def test_claim_owner_identifier_round_trips_process_identity(self) -> None:
+        identifier = handoff_claim_owner_identifier(
+            "run-42", controller_instance_id="controller-a"
+        )
+        identity = parse_handoff_claim_owner_identifier(identifier)
+        self.assertIsNotNone(identity)
+        self.assertEqual(process_instance_liveness(identity), PROCESS_INSTANCE_LIVE)
+        self.assertEqual(identity["owning_run_id"], "run-42")
+
+        # Opaque owners carry no identity evidence and must parse to None so
+        # recovery fails closed instead of declaring them dead.
+        self.assertIsNone(parse_handoff_claim_owner_identifier("owner-a"))
+        self.assertIsNone(parse_handoff_claim_owner_identifier(None))
+        self.assertIsNone(parse_handoff_claim_owner_identifier("no|colon|segments"))
 
     def test_cross_process_exclusion(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -13,6 +13,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from agent.chatgpt_desktop_mutex import (
+    PROCESS_INSTANCE_DEAD,
+    parse_handoff_claim_owner_identifier,
+    process_instance_liveness,
+)
+from agent.codex_invocation import boot_identity, process_group_id, process_start_identity
 from agent.run_state import RunStatus
 
 
@@ -109,6 +115,21 @@ CHATGPT_HANDOFF_QUEUE_EVENT_TYPES = (
     *CHATGPT_HANDOFF_QUEUE_STATE_EVENT_TYPES,
     *CHATGPT_HANDOFF_QUEUE_AUDIT_EVENT_TYPES,
 )
+# Stale-owner recovery: liveness evidence only, never elapsed time.
+CHATGPT_UI_LEASE_STALE_OWNER_RECOVERED_REASON_CODE = "chatgpt_ui_lease_stale_owner_recovered"
+CHATGPT_UI_LEASE_STALE_OWNER_RECOVERY_SOURCE = "stale_owner_recovery"
+CHATGPT_HANDOFF_CLAIM_OWNER_DEAD_REASON_CODE = "chatgpt_handoff_claim_owner_dead"
+CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE = "chatgpt_handoff_run_terminal"
+# Hard-terminal run states for the handoff queue: a run in one of these states
+# can never legitimately perform a ChatGPT handoff again. needs_review and
+# waiting_for_approval are excluded because a human decision can resume them.
+HANDOFF_TERMINAL_RUN_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED.value,
+        RunStatus.FAILED.value,
+        RunStatus.REJECTED.value,
+    }
+)
 
 
 class AtomicDestinationBindingStatus(StrEnum):
@@ -148,6 +169,7 @@ class AtomicChatGPTUILeaseStatus(StrEnum):
 
 class AtomicChatGPTHandoffQueueStatus(StrEnum):
     RUN_NOT_FOUND = "run_not_found"
+    RUN_TERMINAL = "run_terminal"
     MISSING = "missing"
     ENQUEUED = "enqueued"
     IDEMPOTENT = "idempotent"
@@ -257,6 +279,7 @@ class _ChatGPTUILeaseState:
     error_message: str | None = None
     event_ids: tuple[int, ...] = ()
     released_tokens: frozenset[str] = frozenset()
+    owner_identity: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1026,151 @@ def list_chatgpt_handoff_queue_events() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _run_status_for_handoff_queue(
+    connection: sqlite3.Connection,
+    run_id: str,
+) -> str | None:
+    row = connection.execute(
+        "SELECT status FROM runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    status = row["status"]
+    return status if isinstance(status, str) else None
+
+
+def _handoff_claim_owner_is_dead(claim_owner_identifier: str | None) -> bool:
+    """True only when the claim owner's process instance is provably dead.
+
+    Unparseable owner identifiers (for example synthetic test owners) yield no
+    identity evidence and therefore fail closed as not-dead.
+    """
+
+    identity = parse_handoff_claim_owner_identifier(claim_owner_identifier)
+    if identity is None:
+        return False
+    return process_instance_liveness(identity) == PROCESS_INSTANCE_DEAD
+
+
+def _insert_handoff_queue_event(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    event_type: str,
+    message: str,
+    metadata: dict[str, object],
+) -> int | None:
+    cursor = connection.execute(
+        """
+        INSERT INTO events (
+            run_id,
+            created_at,
+            event_type,
+            message,
+            metadata_json
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            _utc_now(),
+            event_type,
+            message,
+            json.dumps(metadata, sort_keys=True),
+        ),
+    )
+    event_id = cursor.lastrowid
+    return event_id if isinstance(event_id, int) else None
+
+
+def _expire_claimed_handoff_entry(
+    connection: sqlite3.Connection,
+    entry: _HandoffQueueEntry,
+    *,
+    reason_code: str,
+    recovery_metadata: dict[str, object],
+) -> None:
+    """Write the blocked terminal event for a claimed entry during recovery.
+
+    The terminal event must carry the entry's own claim owner so queue
+    reconstruction stays valid.
+    """
+
+    _insert_handoff_queue_event(
+        connection,
+        run_id=entry.run_id,
+        event_type=CHATGPT_HANDOFF_BLOCKED_EVENT_TYPE,
+        message=CHATGPT_HANDOFF_BLOCKED_MESSAGE,
+        metadata=_compact_optional_metadata(
+            {
+                "schema_version": CHATGPT_HANDOFF_QUEUE_SCHEMA_VERSION,
+                "run_id": entry.run_id,
+                "queue_sequence": entry.queue_sequence,
+                "queue_entry_id": entry.queue_entry_id,
+                "claim_owner_identifier": entry.claim_owner_identifier,
+                "terminal_outcome": "blocked",
+                "reason_code": reason_code,
+                **recovery_metadata,
+            }
+        ),
+    )
+
+
+def _expire_pending_handoff_entry(
+    connection: sqlite3.Connection,
+    entry: _HandoffQueueEntry,
+    *,
+    recovery_claim_owner_identifier: str,
+    reason_code: str,
+    recovery_metadata: dict[str, object],
+) -> None:
+    """Claim-then-block a pending entry during recovery.
+
+    Queue reconstruction only accepts terminal events on claimed entries, so a
+    pending entry is claimed by the recovering owner and immediately blocked in
+    the same transaction. The recovering owner gains no lane ownership from
+    this: the entry ends blocked.
+    """
+
+    claimed_at = _utc_now()
+    _insert_handoff_queue_event(
+        connection,
+        run_id=entry.run_id,
+        event_type=CHATGPT_HANDOFF_CLAIMED_EVENT_TYPE,
+        message=CHATGPT_HANDOFF_CLAIMED_MESSAGE,
+        metadata=_compact_optional_metadata(
+            {
+                "schema_version": CHATGPT_HANDOFF_QUEUE_SCHEMA_VERSION,
+                "run_id": entry.run_id,
+                "queue_sequence": entry.queue_sequence,
+                "queue_entry_id": entry.queue_entry_id,
+                "claim_owner_identifier": recovery_claim_owner_identifier,
+                "claimed_at": claimed_at,
+                **recovery_metadata,
+            }
+        ),
+    )
+    _insert_handoff_queue_event(
+        connection,
+        run_id=entry.run_id,
+        event_type=CHATGPT_HANDOFF_BLOCKED_EVENT_TYPE,
+        message=CHATGPT_HANDOFF_BLOCKED_MESSAGE,
+        metadata=_compact_optional_metadata(
+            {
+                "schema_version": CHATGPT_HANDOFF_QUEUE_SCHEMA_VERSION,
+                "run_id": entry.run_id,
+                "queue_sequence": entry.queue_sequence,
+                "queue_entry_id": entry.queue_entry_id,
+                "claim_owner_identifier": recovery_claim_owner_identifier,
+                "terminal_outcome": "blocked",
+                "reason_code": reason_code,
+                **recovery_metadata,
+            }
+        ),
+    )
+
+
 def enqueue_chatgpt_handoff(
     run_id: str,
     *,
@@ -1019,7 +1187,10 @@ def enqueue_chatgpt_handoff(
         connection.execute("BEGIN IMMEDIATE")
         transaction_started = True
 
-        run = connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        run = connection.execute(
+            "SELECT id, status FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
         if run is None:
             connection.rollback()
             transaction_started = False
@@ -1029,6 +1200,18 @@ def enqueue_chatgpt_handoff(
                 reason_code="run_not_found",
                 error_message=f"Run not found: {run_id}",
             )
+        run_status = run["status"] if isinstance(run["status"], str) else None
+        if run_status in HANDOFF_TERMINAL_RUN_STATUSES:
+            connection.rollback()
+            transaction_started = False
+            return AtomicChatGPTHandoffQueueResult(
+                status=AtomicChatGPTHandoffQueueStatus.RUN_TERMINAL,
+                run_id=run_id,
+                reason_code=CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE,
+                error_message=(
+                    "Run is in a terminal state and may not enqueue a ChatGPT handoff."
+                ),
+            )
 
         state = _reconstruct_handoff_queue_state(_select_handoff_queue_state_rows(connection))
         if state.status == AtomicChatGPTHandoffQueueStatus.INVALID:
@@ -1037,6 +1220,26 @@ def enqueue_chatgpt_handoff(
             return _handoff_queue_result_from_state(state, run_id=run_id)
 
         active = _active_handoff_entry_for_run(state, run_id)
+        if (
+            active is not None
+            and active.status == "claimed"
+            and _handoff_claim_owner_is_dead(active.claim_owner_identifier)
+        ):
+            # Self-heal after a crash: the run's own claimed entry belongs to a
+            # provably dead process instance. Expire it and enqueue fresh at the
+            # tail so the restarted session re-enters fairly.
+            _expire_claimed_handoff_entry(
+                connection,
+                active,
+                reason_code=CHATGPT_HANDOFF_CLAIM_OWNER_DEAD_REASON_CODE,
+                recovery_metadata={
+                    "stale_claim_recovered": True,
+                    "recovered_by_pid": os.getpid(),
+                    "recovery_trigger": "enqueue_chatgpt_handoff",
+                },
+            )
+            active = None
+
         if active is not None:
             connection.rollback()
             transaction_started = False
@@ -1276,7 +1479,10 @@ def claim_chatgpt_handoff_for_run(
         connection.execute("BEGIN IMMEDIATE")
         transaction_started = True
 
-        run = connection.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        run = connection.execute(
+            "SELECT id, status FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
         if run is None:
             connection.rollback()
             transaction_started = False
@@ -1292,6 +1498,114 @@ def claim_chatgpt_handoff_for_run(
             connection.rollback()
             transaction_started = False
             return _handoff_queue_result_from_state(state, run_id=run_id)
+
+        run_status = run["status"] if isinstance(run["status"], str) else None
+        if run_status in HANDOFF_TERMINAL_RUN_STATUSES:
+            # Terminal work must never perform a handoff. Clean up this run's own
+            # queue entry so it cannot block followers, then refuse the claim.
+            own_entry = _active_handoff_entry_for_run(state, run_id)
+            wrote_cleanup = False
+            if own_entry is not None:
+                if own_entry.status == "pending":
+                    _expire_pending_handoff_entry(
+                        connection,
+                        own_entry,
+                        recovery_claim_owner_identifier=claim_owner_identifier,
+                        reason_code=CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE,
+                        recovery_metadata={
+                            "run_terminal_status": run_status,
+                            "recovery_trigger": "claim_chatgpt_handoff_for_run",
+                        },
+                    )
+                    wrote_cleanup = True
+                elif (
+                    own_entry.claim_owner_identifier == claim_owner_identifier
+                    or _handoff_claim_owner_is_dead(own_entry.claim_owner_identifier)
+                ):
+                    _expire_claimed_handoff_entry(
+                        connection,
+                        own_entry,
+                        reason_code=CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE,
+                        recovery_metadata={
+                            "run_terminal_status": run_status,
+                            "recovery_trigger": "claim_chatgpt_handoff_for_run",
+                        },
+                    )
+                    wrote_cleanup = True
+            if wrote_cleanup:
+                connection.commit()
+            else:
+                connection.rollback()
+            transaction_started = False
+            return AtomicChatGPTHandoffQueueResult(
+                status=AtomicChatGPTHandoffQueueStatus.RUN_TERMINAL,
+                run_id=run_id,
+                reason_code=CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE,
+                error_message=(
+                    "Run is in a terminal state and may not claim a ChatGPT handoff."
+                ),
+            )
+
+        # Stale-owner recovery for blocking heads: expire a head whose claim
+        # owner process is provably dead, or a pending head whose run is
+        # terminal. A live or unproven owner is never touched; recovery frees
+        # the head and normal FIFO acquisition decides who goes next.
+        recovery_written = False
+        for _ in range(len(state.entries) + 1):
+            head = _oldest_active_handoff_entry(state)
+            if head is None or head.run_id == run_id:
+                break
+            expired = False
+            if head.status == "claimed" and _handoff_claim_owner_is_dead(
+                head.claim_owner_identifier
+            ):
+                _expire_claimed_handoff_entry(
+                    connection,
+                    head,
+                    reason_code=CHATGPT_HANDOFF_CLAIM_OWNER_DEAD_REASON_CODE,
+                    recovery_metadata={
+                        "stale_claim_recovered": True,
+                        "recovered_by": claim_owner_identifier,
+                        "recovery_trigger": "claim_chatgpt_handoff_for_run",
+                    },
+                )
+                expired = True
+            elif head.status == "pending":
+                head_run_status = _run_status_for_handoff_queue(connection, head.run_id)
+                if head_run_status in HANDOFF_TERMINAL_RUN_STATUSES:
+                    _expire_pending_handoff_entry(
+                        connection,
+                        head,
+                        recovery_claim_owner_identifier=claim_owner_identifier,
+                        reason_code=CHATGPT_HANDOFF_RUN_TERMINAL_REASON_CODE,
+                        recovery_metadata={
+                            "run_terminal_status": head_run_status,
+                            "recovery_trigger": "claim_chatgpt_handoff_for_run",
+                        },
+                    )
+                    expired = True
+            if not expired:
+                break
+            recovery_written = True
+            state = _reconstruct_handoff_queue_state(
+                _select_handoff_queue_state_rows(connection)
+            )
+            if state.status == AtomicChatGPTHandoffQueueStatus.INVALID:
+                connection.rollback()
+                transaction_started = False
+                return _handoff_queue_result_from_state(state, run_id=run_id)
+        if recovery_written:
+            # Persist recovery even if this caller ends up waiting; later
+            # rollbacks on wait paths must not discard the expiry events.
+            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            state = _reconstruct_handoff_queue_state(
+                _select_handoff_queue_state_rows(connection)
+            )
+            if state.status == AtomicChatGPTHandoffQueueStatus.INVALID:
+                connection.rollback()
+                transaction_started = False
+                return _handoff_queue_result_from_state(state, run_id=run_id)
 
         active = _active_handoff_entry_for_run(state, run_id)
         head = _oldest_active_handoff_entry(state)
@@ -1488,20 +1802,83 @@ def acquire_chatgpt_ui_lease(
 
         now = _utc_now()
         if existing.status == AtomicChatGPTUILeaseStatus.ACQUIRED:
-            metadata = _compact_optional_metadata(
+            # Stale-owner recovery: release only when the recorded owner process
+            # instance is provably dead (boot changed, pid gone, or pid reused).
+            # A live owner is never stolen; unprovable identity fails closed as a
+            # wait. Elapsed time is never used as evidence.
+            owner_identity = existing.owner_identity
+            if owner_identity is None and isinstance(existing.owner_pid, int):
+                owner_identity = {"pid": existing.owner_pid}
+            owner_liveness = process_instance_liveness(owner_identity)
+            if owner_liveness != PROCESS_INSTANCE_DEAD:
+                metadata = _compact_optional_metadata(
+                    {
+                        "schema_version": CHATGPT_UI_LEASE_SCHEMA_VERSION,
+                        "requested_owning_run_id": run_id,
+                        "request_owner_pid": os.getpid(),
+                        "denied_at": now,
+                        "active_owning_run_id": existing.owning_run_id,
+                        "active_owner_pid": existing.owner_pid,
+                        "active_acquired_at": existing.acquired_at,
+                        "active_owner_liveness": owner_liveness,
+                        "reason": reason,
+                        "source": source,
+                    }
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO events (
+                        run_id,
+                        created_at,
+                        event_type,
+                        message,
+                        metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        now,
+                        CHATGPT_UI_LEASE_ACQUIRE_DENIED_EVENT_TYPE,
+                        CHATGPT_UI_LEASE_ACQUIRE_DENIED_MESSAGE,
+                        json.dumps(metadata, sort_keys=True),
+                    ),
+                )
+                event_id = cursor.lastrowid
+                connection.commit()
+                transaction_started = False
+                return AtomicChatGPTUILeaseResult(
+                    status=AtomicChatGPTUILeaseStatus.ALREADY_HELD,
+                    run_id=run_id,
+                    owner_pid=existing.owner_pid,
+                    owning_run_id=existing.owning_run_id,
+                    acquired_at=existing.acquired_at,
+                    active_event_id=existing.active_event_id,
+                    event_id=event_id if isinstance(event_id, int) else None,
+                    event_written=True,
+                    reason_code="chatgpt_ui_lease_already_held",
+                    error_message="ChatGPT Desktop UI lease is already active.",
+                    event_ids=existing.event_ids,
+                )
+
+            stale_metadata = _compact_optional_metadata(
                 {
                     "schema_version": CHATGPT_UI_LEASE_SCHEMA_VERSION,
-                    "requested_owning_run_id": run_id,
-                    "request_owner_pid": os.getpid(),
-                    "denied_at": now,
-                    "active_owning_run_id": existing.owning_run_id,
-                    "active_owner_pid": existing.owner_pid,
-                    "active_acquired_at": existing.acquired_at,
-                    "reason": reason,
-                    "source": source,
+                    "lease_token_sha256": existing.lease_token,
+                    "owner_pid": existing.owner_pid,
+                    "owning_run_id": existing.owning_run_id,
+                    "acquired_at": existing.acquired_at,
+                    "released_at": now,
+                    "reason": CHATGPT_UI_LEASE_STALE_OWNER_RECOVERED_REASON_CODE,
+                    "source": CHATGPT_UI_LEASE_STALE_OWNER_RECOVERY_SOURCE,
+                    "stale_owner_recovered": True,
+                    "stale_owner_liveness": PROCESS_INSTANCE_DEAD,
+                    "active_acquire_event_id": existing.active_event_id,
+                    "recovered_by_pid": os.getpid(),
+                    "recovery_requested_by_run_id": run_id,
                 }
             )
-            cursor = connection.execute(
+            connection.execute(
                 """
                 INSERT INTO events (
                     run_id,
@@ -1513,38 +1890,27 @@ def acquire_chatgpt_ui_lease(
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    run_id,
+                    existing.owning_run_id,
                     now,
-                    CHATGPT_UI_LEASE_ACQUIRE_DENIED_EVENT_TYPE,
-                    CHATGPT_UI_LEASE_ACQUIRE_DENIED_MESSAGE,
-                    json.dumps(metadata, sort_keys=True),
+                    CHATGPT_UI_LEASE_RELEASED_EVENT_TYPE,
+                    CHATGPT_UI_LEASE_RELEASED_MESSAGE,
+                    json.dumps(stale_metadata, sort_keys=True),
                 ),
-            )
-            event_id = cursor.lastrowid
-            connection.commit()
-            transaction_started = False
-            return AtomicChatGPTUILeaseResult(
-                status=AtomicChatGPTUILeaseStatus.ALREADY_HELD,
-                run_id=run_id,
-                owner_pid=existing.owner_pid,
-                owning_run_id=existing.owning_run_id,
-                acquired_at=existing.acquired_at,
-                active_event_id=existing.active_event_id,
-                event_id=event_id if isinstance(event_id, int) else None,
-                event_written=True,
-                reason_code="chatgpt_ui_lease_already_held",
-                error_message="ChatGPT Desktop UI lease is already active.",
-                event_ids=existing.event_ids,
             )
 
         lease_token = secrets.token_urlsafe(32)
+        owner_pid = os.getpid()
+        owner_pgid = process_group_id(owner_pid)
         metadata = _compact_optional_metadata(
             {
                 "schema_version": CHATGPT_UI_LEASE_SCHEMA_VERSION,
                 "lease_token_sha256": chatgpt_ui_lease_token_fingerprint(lease_token),
-                "owner_pid": os.getpid(),
+                "owner_pid": owner_pid,
                 "owning_run_id": run_id,
                 "acquired_at": now,
+                "owner_boot_id": boot_identity(),
+                "owner_process_start_identity": process_start_identity(owner_pid),
+                "owner_pgid": owner_pgid if owner_pgid is not None else owner_pid,
                 "reason": reason,
                 "source": source,
             }
@@ -2908,6 +3274,7 @@ def _reconstruct_chatgpt_ui_lease_state(
             released_tokens=frozenset(released_tokens),
         )
 
+    active_owner_identity = active.get("owner_identity")
     return _ChatGPTUILeaseState(
         status=AtomicChatGPTUILeaseStatus.ACQUIRED,
         lease_token=str(active["lease_token_sha256"]),
@@ -2917,6 +3284,7 @@ def _reconstruct_chatgpt_ui_lease_state(
         active_event_id=active_event_id,
         event_ids=event_ids,
         released_tokens=frozenset(released_tokens),
+        owner_identity=active_owner_identity if isinstance(active_owner_identity, dict) else None,
     )
 
 
@@ -2977,11 +3345,22 @@ def _chatgpt_ui_lease_acquire_from_metadata_json(
         return None
     if not isinstance(acquired_at, str) or acquired_at == "":
         return None
+    owner_identity: dict[str, object] = {"pid": owner_pid}
+    owner_boot_id = metadata.get("owner_boot_id")
+    if isinstance(owner_boot_id, str) and owner_boot_id:
+        owner_identity["boot_id"] = owner_boot_id
+    owner_start = metadata.get("owner_process_start_identity")
+    if isinstance(owner_start, str) and owner_start:
+        owner_identity["process_start_identity"] = owner_start
+    owner_pgid = metadata.get("owner_pgid")
+    if isinstance(owner_pgid, int):
+        owner_identity["pgid"] = owner_pgid
     return {
         "lease_token_sha256": lease_token_sha256,
         "owner_pid": owner_pid,
         "owning_run_id": owning_run_id,
         "acquired_at": acquired_at,
+        "owner_identity": owner_identity,
     }
 
 

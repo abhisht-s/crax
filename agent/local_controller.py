@@ -77,6 +77,10 @@ LOCAL_CONTROLLER_RETRY_SCHEMA_VERSION = 1
 LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE = "local_controller_cancel_requested"
 LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE = "Operator requested cancellation."
 DEFAULT_MAX_ACTIVE_SESSIONS = 1
+# Product ceiling for concurrently live sessions. The configured
+# max_active_sessions is clamped to this value so a misconfigured cap can
+# never exceed the proven capability target of four.
+MAX_ACTIVE_SESSIONS_HARD_CAP = 4
 CHATGPT_WAIT_INITIAL_SECONDS = 0.5
 CHATGPT_WAIT_MAX_SECONDS = 8.0
 LOCAL_CONTROLLER_SNAPSHOT_SCHEMA_VERSION = 2
@@ -334,7 +338,9 @@ class LocalController:
         self.initial_run_executor = initial_run_executor or (
             lambda **kwargs: default_initial_run_executor(**kwargs, ledger=self.ledger)
         )
-        self.max_active_sessions = max(1, int(max_active_sessions))
+        self.max_active_sessions = max(
+            1, min(int(max_active_sessions), MAX_ACTIVE_SESSIONS_HARD_CAP)
+        )
         self._chatgpt_wait_sleeper = chatgpt_wait_sleeper or time.sleep
         self.desktop_mutex = desktop_mutex if desktop_mutex is not None else ChatGPTDesktopMutex()
         self._lock = threading.Lock()
@@ -521,7 +527,13 @@ class LocalController:
                     run_id=collision_run_id,
                     controller_state=self.session.controller_state,
                 )
-            if self.session.active_run_id is not None:
+            # Only a replaceable (terminal) focused session may be dropped to
+            # make room. A live focused session must survive a sibling start:
+            # with capacity above one, starting B while A is live would
+            # otherwise evict A's runtime and orphan its worker.
+            if self.session.active_run_id is not None and self._session_is_replaceable_locked(
+                self.session.active_run_id
+            ):
                 self._drop_session_locked(self.session.active_run_id)
                 self._persist_session_locked()
 

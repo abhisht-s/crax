@@ -26,6 +26,90 @@ DEFAULT_CHATGPT_DESKTOP_MUTEX_PATH = (
     Path.home() / "Library" / "Application Support" / "crax" / "chatgpt-desktop.lock"
 )
 
+PROCESS_INSTANCE_LIVE = "live"
+PROCESS_INSTANCE_DEAD = "dead"
+PROCESS_INSTANCE_UNKNOWN = "unknown"
+
+_UNKNOWN_BOOT_IDENTITY = "boot-unknown"
+_UNKNOWN_START_IDENTITY = "start-unknown"
+
+
+def process_instance_liveness(identity: dict[str, Any] | None) -> str:
+    """Three-state, fail-closed liveness verdict for a recorded process instance.
+
+    Returns ``dead`` only on provable evidence (boot changed, pid gone, or pid
+    reused by a process with a different start identity). Returns ``live`` only
+    when the exact recorded instance is provably still running. Anything that
+    cannot be proven either way is ``unknown`` and callers must not treat it as
+    permission to steal. Elapsed time is never evidence.
+    """
+
+    if not isinstance(identity, dict):
+        return PROCESS_INSTANCE_UNKNOWN
+    pid = identity.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return PROCESS_INSTANCE_UNKNOWN
+
+    expected_boot = identity.get("boot_id")
+    if isinstance(expected_boot, str) and expected_boot and expected_boot != _UNKNOWN_BOOT_IDENTITY:
+        current_boot = boot_identity()
+        if current_boot != _UNKNOWN_BOOT_IDENTITY and expected_boot != current_boot:
+            return PROCESS_INSTANCE_DEAD
+
+    if not pid_is_alive(pid):
+        return PROCESS_INSTANCE_DEAD
+
+    expected_start = identity.get("process_start_identity") or identity.get("start_identity")
+    if (
+        not isinstance(expected_start, str)
+        or not expected_start
+        or expected_start == _UNKNOWN_START_IDENTITY
+    ):
+        return PROCESS_INSTANCE_UNKNOWN
+    live_start = process_start_identity(pid)
+    if not live_start:
+        return PROCESS_INSTANCE_UNKNOWN
+    if live_start != expected_start:
+        return PROCESS_INSTANCE_DEAD
+    return PROCESS_INSTANCE_LIVE
+
+
+def parse_handoff_claim_owner_identifier(identifier: Any) -> dict[str, Any] | None:
+    """Parse the process identity embedded by ``handoff_claim_owner_identifier``.
+
+    Returns ``None`` for identifiers that do not carry the structured identity
+    segments (for example synthetic test owners), so callers fail closed and
+    treat the owner as unknown rather than dead.
+    """
+
+    if not isinstance(identifier, str) or "|" not in identifier:
+        return None
+    fields: dict[str, str] = {}
+    for segment in identifier.split("|"):
+        key, sep, value = segment.partition(":")
+        if sep != ":" or not key:
+            return None
+        fields[key] = value
+    boot = fields.get("boot")
+    pid_raw = fields.get("pid")
+    start = fields.get("start")
+    if boot is None or pid_raw is None or start is None:
+        return None
+    try:
+        pid = int(pid_raw)
+    except ValueError:
+        return None
+    identity: dict[str, Any] = {"pid": pid, "boot_id": boot}
+    if start and start != _UNKNOWN_START_IDENTITY:
+        identity["process_start_identity"] = start
+    controller = fields.get("controller")
+    if controller:
+        identity["controller_instance_id"] = controller
+    run = fields.get("run")
+    if run:
+        identity["owning_run_id"] = run
+    return identity
+
 
 def controller_process_is_live(identity: dict[str, Any] | None) -> bool:
     """Return True only when boot, pid, start identity, and pgid all match a live process."""

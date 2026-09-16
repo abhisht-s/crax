@@ -1114,6 +1114,7 @@ def _enqueue_and_claim_chatgpt_handoff(
     enqueue_status = str(getattr(enqueue_result, "status", "") or "")
     if enqueue_status in {
         str(default_ledger.AtomicChatGPTHandoffQueueStatus.RUN_NOT_FOUND),
+        str(default_ledger.AtomicChatGPTHandoffQueueStatus.RUN_TERMINAL),
         str(default_ledger.AtomicChatGPTHandoffQueueStatus.INVALID),
         str(default_ledger.AtomicChatGPTHandoffQueueStatus.OPERATIONAL_FAILURE),
     }:
