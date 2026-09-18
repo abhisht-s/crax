@@ -12,6 +12,8 @@ from unittest import mock
 
 from agent import cli
 from agent.chatgpt_services import (
+    CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS,
+    CHATGPT_SUBMISSION_VERIFY_MAX_POLLS,
     ExtractNextCodexPromptServiceResult,
     GPT_RESPONSE_CAPTURE_FAILED_EVENT_TYPE,
     GPT_RESPONSE_CAPTURE_STARTED_EVENT_TYPE,
@@ -316,6 +318,8 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         use_default_submission_verifier: bool = False,
         operations: list[str] | None = None,
         artifact_writer=None,
+        monotonic_function=None,
+        sleep_function=None,
         **kwargs,
     ):
         ledger = ledger or FakeLedger(_submission_base_events(), operations=operations)
@@ -378,7 +382,7 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
 
         clock = {"now": 0.0}
 
-        def monotonic() -> float:
+        def default_monotonic() -> float:
             value = clock["now"]
             clock["now"] += 0.1
             return value
@@ -394,8 +398,8 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
             ax_send_button_function=ax_send_function,
             enter_function=enter_function,
             artifact_writer=artifact_writer,
-            monotonic_function=monotonic,
-            sleep_function=lambda seconds: None,
+            monotonic_function=monotonic_function or default_monotonic,
+            sleep_function=sleep_function or (lambda seconds: None),
             paste_verify_timeout_seconds=None,
             submission_verify_timeout_seconds=None,
             submission_verification_function=verification_function,
@@ -670,6 +674,53 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         )
         self.assertEqual(ledger.added_events[-1]["metadata"]["fallback_attempt_count"], 1)
         self.assertEqual(verification_results, [])
+
+    def test_axpress_fallback_enter_runs_after_three_seconds_not_full_poll_budget(self) -> None:
+        clock = {"now": 0.0}
+
+        def monotonic() -> float:
+            return clock["now"]
+
+        def sleep(seconds: float) -> None:
+            clock["now"] += float(seconds)
+
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            marker = str(marker_text)
+            if inspect.calls == 0:
+                inspect.calls += 1
+                return _submission_observation(marker, composer_text="", send_button=True)
+            inspect.calls += 1
+            return _submission_observation(marker, composer_text=marker, send_button=True)
+
+        inspect.calls = 0
+
+        result, ledger, _copied, send_calls, enter_calls = self._service(
+            inspection_function=inspect,
+            use_default_submission_verifier=True,
+            ax_send_result={"pressed": True, "method": "macos_accessibility_axpress_send_button", "error": None},
+            enter_result={"submitted": False, "method": "enter", "error": "not frontmost"},
+            monotonic_function=monotonic,
+            sleep_function=sleep,
+        )
+
+        fallback_events = [
+            event
+            for event in ledger.added_events
+            if event["event_type"] == "gpt_feedback_submit_input_sent"
+            and event["metadata"].get("fallback_attempt_count") == 1
+        ]
+        self.assertEqual(len(fallback_events), 1)
+        previous = fallback_events[0]["metadata"]["previous_verification"]
+        self.assertEqual(previous["timeout_seconds"], CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS)
+        self.assertLess(previous["poll_count"], CHATGPT_SUBMISSION_VERIFY_MAX_POLLS)
+        self.assertGreaterEqual(previous["poll_count"], 1)
+        self.assertEqual(send_calls, ["FW.2"])
+        self.assertEqual(enter_calls, ["enter"])
+        self.assertFalse(result.ok)
+        # Paste settle is 0.5s, then AXPress confirmation is capped at 3s.
+        # The full 40-poll budget would be ~14s of sleeps alone.
+        self.assertGreaterEqual(clock["now"], CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS)
+        self.assertLess(clock["now"], 8.0)
 
     def test_fallback_enter_failure_does_not_verify_or_retry_again(self) -> None:
         verify_calls = []

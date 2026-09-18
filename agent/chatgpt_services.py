@@ -55,6 +55,10 @@ CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS = 0.35
 # discrete UI confirmation only; it does NOT cut off Codex execution or ChatGPT
 # response generation, which remain deadline-free.
 CHATGPT_SUBMISSION_VERIFY_MAX_POLLS = 40
+# AXPress can return success without ChatGPT actually sending. Wait this long
+# for the marker to leave the composer, then press Enter instead of burning the
+# full 40-poll confirmation budget (~25s of silent AX walks).
+CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS = 3.0
 
 
 class PromptExtractionLedger(Protocol):
@@ -730,7 +734,10 @@ def submit_feedback_to_chatgpt_service(
             inspection_function=submission_ui_inspection_function,
             monotonic_function=monotonic_function,
             sleep_function=sleep_function,
-            timeout_seconds=submission_verify_timeout_seconds,
+            timeout_seconds=_axpress_pre_fallback_verify_timeout(
+                send_result,
+                submission_verify_timeout_seconds,
+            ),
             poll_interval_seconds=submission_verify_poll_seconds,
         )
     else:
@@ -1534,6 +1541,17 @@ def _send_result_method(send_result: dict[str, Any]) -> str | None:
     if send_result.get("method"):
         return str(send_result["method"])
     return None
+
+
+def _axpress_pre_fallback_verify_timeout(
+    send_result: dict[str, Any],
+    requested_timeout_seconds: float | None,
+) -> float | None:
+    if _send_result_method(send_result) != "macos_accessibility_axpress_send_button":
+        return requested_timeout_seconds
+    if requested_timeout_seconds is None:
+        return CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS
+    return min(requested_timeout_seconds, CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS)
 
 
 def _event_metadata(event: dict) -> dict:
