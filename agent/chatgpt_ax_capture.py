@@ -10,6 +10,7 @@ import unicodedata
 from collections import Counter
 from ctypes import POINTER, byref, c_bool, c_char_p, c_int, c_long, c_ulong, c_void_p, create_string_buffer
 from dataclasses import dataclass
+from typing import Callable
 
 from agent.chatgpt_ax_destination_snapshot import resolve_classic_chatgpt_pid
 
@@ -19,6 +20,8 @@ AX_CAPTURE_FORMAT = "rendered_ax_text"
 DEFAULT_CAPTURE_TIMEOUT_SECONDS: float | None = None
 DEFAULT_STABLE_SECONDS = 2.0
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+OPERATOR_CANCELLED_REASON_CODE = "operator_cancelled"
+OPERATOR_CANCELLED_ERROR = "Capture stopped because the operator cancelled the run."
 DEFAULT_MAX_DEPTH = 18
 DEFAULT_MAX_NODES = 1200
 MATCH_THRESHOLD = 0.90
@@ -567,6 +570,43 @@ def find_response_candidate_after_marker(
     }
 
 
+def _stop_requested(should_stop: Callable[[], bool] | None) -> bool:
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception:
+        return False
+
+
+def _cancelled_capture_result(
+    *,
+    stable_seconds: float,
+    poll_interval_seconds: float,
+    successful_polls: int,
+    require_sentinel_response: bool,
+    last_stats: dict,
+    last_match: dict,
+) -> dict:
+    return {
+        "ok": False,
+        "source": AX_CAPTURE_SOURCE,
+        "capture_format": AX_CAPTURE_FORMAT,
+        "error": OPERATOR_CANCELLED_ERROR,
+        "matched_feedback": bool(last_match.get("matched_feedback", False)),
+        "candidate_count": last_stats.get("candidate_count", 0),
+        "stable": False,
+        "stable_seconds": stable_seconds,
+        "successful_polls": successful_polls,
+        "poll_interval_seconds": poll_interval_seconds,
+        "timeout_seconds": None,
+        "ax_stats": last_stats,
+        "sentinel_required": require_sentinel_response,
+        **last_match,
+        "reason_code": OPERATOR_CANCELLED_REASON_CODE,
+    }
+
+
 def capture_response_after_feedback(
     feedback_text: str,
     app_name: str = "ChatGPT",
@@ -577,6 +617,7 @@ def capture_response_after_feedback(
     max_nodes: int = DEFAULT_MAX_NODES,
     require_sentinel_response: bool = False,
     submission_marker_text: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict:
     del timeout_seconds
     reader = _AXReader(app_name=app_name, max_depth=max_depth, max_nodes=max_nodes)
@@ -589,6 +630,15 @@ def capture_response_after_feedback(
     last_match: dict = {}
 
     while True:
+        if _stop_requested(should_stop):
+            return _cancelled_capture_result(
+                stable_seconds=stable_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                successful_polls=successful_polls,
+                require_sentinel_response=require_sentinel_response,
+                last_stats=last_stats,
+                last_match=last_match,
+            )
         try:
             candidates, stats = reader.collect_text_candidates()
             last_stats = stats
@@ -726,8 +776,18 @@ def capture_response_after_feedback(
             last_error = f"Unexpected AX capture error: {exc}"
             last_match = {}
 
+        if _stop_requested(should_stop):
+            return _cancelled_capture_result(
+                stable_seconds=stable_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                successful_polls=successful_polls,
+                require_sentinel_response=require_sentinel_response,
+                last_stats=last_stats,
+                last_match=last_match,
+            )
         if poll_interval_seconds > 0:
             time.sleep(poll_interval_seconds)
+
 
 def _match_summary(match: dict) -> dict:
     summary = {

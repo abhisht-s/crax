@@ -491,6 +491,24 @@ class ChatGPTAXCaptureTests(unittest.TestCase):
         self.assertTrue(match["ok"])
         self.assertEqual(match["response_candidate"].text, "Thinking")
 
+    def test_operator_cancel_stops_unbounded_capture_loop(self) -> None:
+        reader = _FakeAXReader(
+            [[_candidate(0, MARKER + "\n" + FEEDBACK), _candidate(1, "Thinking")]]
+        )
+
+        with mock.patch.object(ax, "_AXReader", return_value=reader):
+            result = ax.capture_response_after_feedback(
+                FEEDBACK,
+                should_stop=lambda: True,
+                poll_interval_seconds=0.0,
+                require_sentinel_response=True,
+                submission_marker_text=MARKER,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason_code"], "operator_cancelled")
+        self.assertEqual(reader.calls, 0)
+
 
 class ChatGPTAXCLIWiringTests(unittest.TestCase):
     def _run_record(self) -> dict:

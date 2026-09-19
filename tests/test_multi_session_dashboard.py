@@ -88,6 +88,25 @@ class SessionOperatorViewTests(unittest.TestCase):
         self.assertEqual(view["operator_tone"], "ok")
         self.assertFalse(view["needs_user_action"])
 
+    def test_operator_cancel_beats_working_and_chatgpt_lease(self) -> None:
+        view = session_operator_view(
+            controller_state="running_routine_action",
+            runtime={
+                "action_running": True,
+                "cancel_requested": True,
+                "automatic_burst_reason": "operator_cancelled",
+            },
+            read_model=None,
+            waiting_for_chatgpt=True,
+            owns_lease=True,
+            queue_is_head=True,
+            queue_status="claimed",
+        )
+        self.assertEqual(view["operator_status"], "stopped")
+        self.assertEqual(view["operator_status_label"], "Stopped")
+        self.assertEqual(view["operator_tone"], "error")
+        self.assertFalse(view["needs_user_action"])
+
     def test_conversation_claim_conflict_is_distinct_attention(self) -> None:
         model = replace(
             _approval_model("run-x"),
@@ -244,6 +263,35 @@ class SessionListAndFocusTests(unittest.TestCase):
 
             record_a.release.set()
             record_b.release.set()
+            _join_workers(controller)
+
+    def test_stop_means_complete_death_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            world = SessionWorld()
+            world.default_model_factory = lambda run_id: _completed_model(run_id, repo)
+            executor = PerRunInitialExecutor()
+            record_a = executor.configure("run-1", blocking=True)
+            controller = _make_controller(world, executor=executor, max_sessions=4)
+            first = _start(controller, repo, chat="Chat A", additional=False)
+            self.assertTrue(record_a.entered.wait(WAIT_TIMEOUT_SECONDS))
+            self.assertTrue(controller._sessions[first.run_id].action_running)
+
+            cancelled = controller.request_cancel(first.run_id)
+            self.assertTrue(cancelled.ok)
+            runtime = controller._sessions[first.run_id]
+            self.assertTrue(runtime.cancel_requested.is_set())
+            self.assertFalse(runtime.action_running)
+            self.assertFalse(runtime.waiting_for_chatgpt)
+            self.assertEqual(runtime.controller_state, "blocked")
+            listed = controller.list_sessions()
+            session = listed.metadata["sessions"][0]
+            self.assertEqual(session["run_id"], first.run_id)
+            self.assertEqual(session["operator_status"], "stopped")
+            self.assertFalse(session["live"])
+            self.assertFalse(session["action_running"])
+            self.assertEqual(listed.metadata["live_session_count"], 0)
+
+            record_a.release.set()
             _join_workers(controller)
 
     def test_approve_and_reject_target_exact_run(self) -> None:

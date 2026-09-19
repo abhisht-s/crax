@@ -12,6 +12,7 @@ from agent import ledger as default_ledger
 from agent.chatgpt_ax_capture import (
     DEFAULT_CAPTURE_TIMEOUT_SECONDS,
     DEFAULT_STABLE_SECONDS,
+    OPERATOR_CANCELLED_REASON_CODE,
     capture_response_after_feedback,
 )
 from agent.clipboard import copy_to_clipboard
@@ -175,6 +176,15 @@ class SubmitFeedbackToChatGPTServiceResult:
     output_path: Path | None = None
 
 
+def _stop_requested(should_stop: Callable[[], bool] | None) -> bool:
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception:
+        return False
+
+
 def submit_feedback_to_chatgpt_service(
     run_id: str,
     run: dict[str, Any],
@@ -199,9 +209,20 @@ def submit_feedback_to_chatgpt_service(
     submission_verify_timeout_seconds: float | None = CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
     submission_verify_poll_seconds: float = CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
     submission_verification_function: Callable[[str, str], dict[str, Any]] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> SubmitFeedbackToChatGPTServiceResult:
     if artifact_writer is None:
         artifact_writer = _write_feedback_artifact
+
+    if _stop_requested(should_stop):
+        return _submission_result(
+            False,
+            run_id,
+            {"run_id": run_id, "message": ""},
+            None,
+            reason_code=OPERATOR_CANCELLED_REASON_CODE,
+            error_message="Run cancelled by operator.",
+        )
 
     events = ledger.list_events(run_id)
     feedback = feedback_builder(run, events)
@@ -589,10 +610,18 @@ def submit_feedback_to_chatgpt_service(
         sleep_function=sleep_function,
         timeout_seconds=paste_verify_timeout_seconds,
         poll_interval_seconds=paste_verify_poll_seconds,
+        should_stop=should_stop,
     )
     if not paste_verification["ok"]:
         submit_result = _skipped_submit_result(
             "Skipped submit because pasted marker was not visible in the composer."
+            if paste_verification.get("reason_code") != OPERATOR_CANCELLED_REASON_CODE
+            else "Skipped submit because the operator cancelled the run."
+        )
+        paste_reason = (
+            OPERATOR_CANCELLED_REASON_CODE
+            if paste_verification.get("reason_code") == OPERATOR_CANCELLED_REASON_CODE
+            else "chatgpt_paste_not_visible"
         )
         failure_metadata = {
             "run_id": feedback["run_id"],
@@ -609,13 +638,17 @@ def submit_feedback_to_chatgpt_service(
             "app_name": app_name,
             "targeted_chatgpt": True,
             "output_path": str(output_path) if output_path is not None else None,
-            "reason_code": "chatgpt_paste_not_visible",
+            "reason_code": paste_reason,
         }
         failure_event_id = _event_id(
             ledger.add_event(
                 run_id,
                 "gpt_feedback_submission_failed",
-                "ChatGPT feedback submission failed: pasted marker was not visible.",
+                (
+                    "ChatGPT feedback submission stopped because the operator cancelled the run."
+                    if paste_reason == OPERATOR_CANCELLED_REASON_CODE
+                    else "ChatGPT feedback submission failed: pasted marker was not visible."
+                ),
                 failure_metadata,
             )
         )
@@ -624,8 +657,8 @@ def submit_feedback_to_chatgpt_service(
             run_id,
             feedback,
             output_path,
-            reason_code="chatgpt_paste_not_visible",
-            error_message="chatgpt_paste_not_visible",
+            reason_code=paste_reason,
+            error_message=paste_reason,
             generated_event_id=generated_event_id,
             copied_event_id=copied_event_id,
             pasted_event_id=pasted_event_id,
@@ -739,6 +772,7 @@ def submit_feedback_to_chatgpt_service(
                 submission_verify_timeout_seconds,
             ),
             poll_interval_seconds=submission_verify_poll_seconds,
+            should_stop=should_stop,
         )
     else:
         verification = submission_verification_function(app_name, feedback["submission_marker_text"])
@@ -792,6 +826,7 @@ def submit_feedback_to_chatgpt_service(
                     sleep_function=sleep_function,
                     timeout_seconds=submission_verify_timeout_seconds,
                     poll_interval_seconds=submission_verify_poll_seconds,
+                    should_stop=should_stop,
                 )
             else:
                 verification = submission_verification_function(app_name, feedback["submission_marker_text"])
@@ -914,6 +949,7 @@ def capture_chatgpt_response_service(
     activation_function: Callable[[str], dict[str, Any]] = activate_chatgpt,
     capture_function: Callable[..., dict[str, Any]] = capture_response_after_feedback,
     hash_function: Callable[[str], str] = sha256_text,
+    should_stop: Callable[[], bool] | None = None,
 ) -> CaptureChatGPTResponseServiceResult:
     del timeout_seconds
     events = ledger.list_events(run_id)
@@ -946,6 +982,16 @@ def capture_chatgpt_response_service(
             run_id=run_id,
             reason_code="submission_marker_sha_mismatch",
             error_message="verified submission marker hash did not match marker text",
+            submission_event_id=submission_event_id,
+            matched_submission_marker_details=marker_details,
+        )
+
+    if _stop_requested(should_stop):
+        return CaptureChatGPTResponseServiceResult(
+            ok=False,
+            run_id=run_id,
+            reason_code=OPERATOR_CANCELLED_REASON_CODE,
+            error_message="Run cancelled by operator.",
             submission_event_id=submission_event_id,
             matched_submission_marker_details=marker_details,
         )
@@ -1002,6 +1048,7 @@ def capture_chatgpt_response_service(
         stable_seconds=stable_seconds,
         require_sentinel_response=require_sentinel_response,
         submission_marker_text=submission_marker_text,
+        should_stop=should_stop,
     )
     if not capture_result["ok"]:
         metadata = _capture_failed_metadata(
@@ -1370,11 +1417,21 @@ def _wait_for_pasted_marker(
     sleep_function: Callable[[float], None] = time.sleep,
     timeout_seconds: float | None = CHATGPT_PASTE_VERIFY_TIMEOUT_SECONDS,
     poll_interval_seconds: float = CHATGPT_PASTE_VERIFY_POLL_SECONDS,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     del timeout_seconds
     polls = 0
     last_observation: dict[str, Any] = {}
     while True:
+        if _stop_requested(should_stop):
+            return {
+                "ok": False,
+                "reason_code": OPERATOR_CANCELLED_REASON_CODE,
+                "poll_count": polls,
+                "timeout_seconds": None,
+                "poll_interval_seconds": poll_interval_seconds,
+                "observation": _submission_ui_observation_summary(last_observation, marker_text),
+            }
         polls += 1
         observation = inspection_function(app_name, marker_text=marker_text)
         last_observation = observation
@@ -1387,6 +1444,15 @@ def _wait_for_pasted_marker(
                 "timeout_seconds": None,
                 "poll_interval_seconds": poll_interval_seconds,
                 "observation": _submission_ui_observation_summary(observation, marker_text),
+            }
+        if _stop_requested(should_stop):
+            return {
+                "ok": False,
+                "reason_code": OPERATOR_CANCELLED_REASON_CODE,
+                "poll_count": polls,
+                "timeout_seconds": None,
+                "poll_interval_seconds": poll_interval_seconds,
+                "observation": _submission_ui_observation_summary(last_observation, marker_text),
             }
         if poll_interval_seconds > 0:
             sleep_function(poll_interval_seconds)
@@ -1442,12 +1508,23 @@ def _verify_submission_marker(
     timeout_seconds: float | None = CHATGPT_SUBMISSION_VERIFY_TIMEOUT_SECONDS,
     poll_interval_seconds: float = CHATGPT_SUBMISSION_VERIFY_POLL_SECONDS,
     max_polls: int = CHATGPT_SUBMISSION_VERIFY_MAX_POLLS,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     start = monotonic_function()
     polls = 0
     last_observation: dict[str, Any] = {}
     last_status: dict[str, Any] = {}
     while True:
+        if _stop_requested(should_stop):
+            return {
+                "ok": False,
+                "reason_code": OPERATOR_CANCELLED_REASON_CODE,
+                "poll_count": polls,
+                "timeout_seconds": timeout_seconds,
+                "poll_interval_seconds": poll_interval_seconds,
+                "status": last_status,
+                "observation": _submission_ui_observation_summary(last_observation, marker_text),
+            }
         polls += 1
         observation = inspection_function(app_name, marker_text=marker_text)
         last_observation = observation
@@ -1472,6 +1549,16 @@ def _verify_submission_marker(
             return {
                 "ok": False,
                 "reason_code": "chatgpt_submission_not_verified",
+                "poll_count": polls,
+                "timeout_seconds": timeout_seconds,
+                "poll_interval_seconds": poll_interval_seconds,
+                "status": last_status,
+                "observation": _submission_ui_observation_summary(last_observation, marker_text),
+            }
+        if _stop_requested(should_stop):
+            return {
+                "ok": False,
+                "reason_code": OPERATOR_CANCELLED_REASON_CODE,
                 "poll_count": polls,
                 "timeout_seconds": timeout_seconds,
                 "poll_interval_seconds": poll_interval_seconds,

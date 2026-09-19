@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable
+import inspect
 
 from agent import ledger as default_ledger
 from agent.chatgpt_ax_destination_snapshot import ChatGPTAXDestinationSnapshotAdapter
@@ -12,7 +13,7 @@ from agent.chatgpt_destination_gate import (
     DestinationLeaseContext,
     destination_gate_failure,
 )
-from agent.chatgpt_ax_capture import DEFAULT_STABLE_SECONDS
+from agent.chatgpt_ax_capture import DEFAULT_STABLE_SECONDS, OPERATOR_CANCELLED_REASON_CODE
 from agent.chatgpt_desktop_mutex import (
     ChatGPTDesktopMutex,
     ChatGPTDesktopMutexHold,
@@ -262,6 +263,7 @@ def _default_submit_service(
     *,
     approval_mode: str,
     ledger: Any,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Any:
     return submit_feedback_to_chatgpt_service(
         run_id,
@@ -269,6 +271,7 @@ def _default_submit_service(
         app_name=app_name,
         approval_mode=approval_mode,
         ledger=ledger,
+        should_stop=should_stop,
     )
 
 
@@ -281,6 +284,7 @@ def _default_capture_service(
     *,
     require_sentinel_response: bool,
     ledger: Any,
+    should_stop: Callable[[], bool] | None = None,
 ) -> Any:
     del run, timeout_seconds
     return capture_chatgpt_response_service(
@@ -290,6 +294,7 @@ def _default_capture_service(
         stable_seconds=stable_seconds,
         require_sentinel_response=require_sentinel_response,
         ledger=ledger,
+        should_stop=should_stop,
     )
 
 
@@ -715,6 +720,8 @@ def _exception_service_result(
 def _chatgpt_submit_failure_retryable(result: Any) -> bool:
     # Payload construction failures are deterministic; cursor/focus retries can
     # only help once there is a valid message ready to transfer.
+    if _result_reason_code(result, "") == OPERATOR_CANCELLED_REASON_CODE:
+        return False
     return getattr(result, "event_type", None) != "gpt_feedback_generation_failed"
 
 
@@ -1053,6 +1060,67 @@ def _chatgpt_lease_denied_result(
     )
 
 
+def _stop_requested(should_stop: Callable[[], bool] | None) -> bool:
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception:
+        return False
+
+
+def _accepted_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str, Any]:
+    if not kwargs:
+        return {}
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}
+    parameters = signature.parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return dict(kwargs)
+    accepted: dict[str, Any] = {}
+    for name, value in kwargs.items():
+        parameter = parameters.get(name)
+        if parameter is None:
+            continue
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            accepted[name] = value
+    return accepted
+
+
+def _operator_cancelled_handoff_result(
+    *,
+    run_id: str,
+    plan: SupervisePlan,
+    action_value: str,
+    plan_metadata: dict[str, Any],
+    status: str | None,
+    metadata: dict[str, Any],
+    events_written: list[dict[str, Any]] | None = None,
+) -> SupervisionStepResult:
+    return SupervisionStepResult(
+        ok=False,
+        run_id=run_id,
+        planner_action=action_value,
+        planner_reason_code=plan.reason,
+        planner_metadata=plan_metadata,
+        action_executed=False,
+        next_state_hint="blocked",
+        blocked=True,
+        terminal=True,
+        waiting_for_chatgpt=False,
+        reason_code=OPERATOR_CANCELLED_REASON_CODE,
+        error_message="Run cancelled by operator.",
+        events_written=list(events_written or []),
+        run_status=status,
+        metadata=metadata,
+    )
+
+
 def _chatgpt_wait_result(
     *,
     run_id: str,
@@ -1260,6 +1328,7 @@ def _run_chatgpt_handoff_transaction(
     events: list[dict],
     desktop_mutex: Any,
     controller_instance_id: str | None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> SupervisionStepResult:
     claim_owner_identifier = handoff_claim_owner_identifier(
         run_id,
@@ -1268,6 +1337,16 @@ def _run_chatgpt_handoff_transaction(
     queue_sequence: int | None = None
     queue_terminal: tuple[str, str] | None = None
     mutex_hold: ChatGPTDesktopMutexHold | None = None
+
+    if _stop_requested(should_stop):
+        return _operator_cancelled_handoff_result(
+            run_id=run_id,
+            plan=plan,
+            action_value=action_value,
+            plan_metadata=plan_metadata,
+            status=status,
+            metadata=metadata,
+        )
 
     if _handoff_queue_available(ledger):
         queue_result = _enqueue_and_claim_chatgpt_handoff(
@@ -1419,6 +1498,21 @@ def _run_chatgpt_handoff_transaction(
         previous_gate_failure_fingerprint: tuple[str, str] | None = None
 
         for attempt_number in range(1, max_attempts + 1):
+            if _stop_requested(should_stop):
+                queue_terminal = (
+                    "blocked",
+                    OPERATOR_CANCELLED_REASON_CODE,
+                )
+                final_result = _operator_cancelled_handoff_result(
+                    run_id=run_id,
+                    plan=plan,
+                    action_value=action_value,
+                    plan_metadata=plan_metadata,
+                    status=status,
+                    metadata=metadata,
+                    events_written=events_written,
+                )
+                break
             current_stage = str(plan.action)
             attempt_can_retry = (
                 plan.action == SuperviseAction.ASK_SEND_TO_GPT
@@ -1606,6 +1700,21 @@ def _run_chatgpt_handoff_transaction(
                 break
 
             phase = HANDOFF_PHASE_SUBMISSION_STARTED
+            if _stop_requested(should_stop):
+                queue_terminal = (
+                    "blocked",
+                    OPERATOR_CANCELLED_REASON_CODE,
+                )
+                final_result = _operator_cancelled_handoff_result(
+                    run_id=run_id,
+                    plan=plan,
+                    action_value=action_value,
+                    plan_metadata=plan_metadata,
+                    status=status,
+                    metadata=metadata,
+                    events_written=events_written,
+                )
+                break
             try:
                 current_result = submit_service(
                     run_id,
@@ -1613,6 +1722,7 @@ def _run_chatgpt_handoff_transaction(
                     app_name,
                     approval_mode=mode,
                     ledger=ledger,
+                    **_accepted_kwargs(submit_service, {"should_stop": should_stop}),
                 )
             except Exception as submit_exc:
                 current_result = _exception_service_result(
@@ -1709,55 +1819,71 @@ def _run_chatgpt_handoff_transaction(
             break
 
         if final_result is None and current_stage == str(SuperviseAction.CAPTURE_GPT_RESPONSE):
-            phase = HANDOFF_PHASE_CAPTURE_STARTED
-            current_result = capture_service(
-                run_id,
-                run,
-                app_name,
-                capture_timeout_seconds,
-                capture_stable_seconds,
-                require_sentinel_response=True,
-                ledger=ledger,
-            )
-            event = _event_from_service_result(current_result)
-            if event is not None:
-                events_written.append(event)
-            if not _result_ok(current_result):
+            if _stop_requested(should_stop):
                 queue_terminal = (
                     "blocked",
-                    _result_reason_code(current_result, "capture_gpt_response_failed"),
+                    OPERATOR_CANCELLED_REASON_CODE,
                 )
-                final_result = _chatgpt_step_result(
-                    ok=False,
+                final_result = _operator_cancelled_handoff_result(
                     run_id=run_id,
                     plan=plan,
                     action_value=action_value,
                     plan_metadata=plan_metadata,
                     status=status,
                     metadata=metadata,
-                    result=current_result,
-                    next_state_hint="extract_next_prompt",
-                    default_reason_code="capture_gpt_response_failed",
                     events_written=events_written,
                 )
             else:
-                queue_terminal = (
-                    "completed",
-                    CHATGPT_HANDOFF_SLICE_COMPLETED_REASON_CODE,
+                phase = HANDOFF_PHASE_CAPTURE_STARTED
+                current_result = capture_service(
+                    run_id,
+                    run,
+                    app_name,
+                    capture_timeout_seconds,
+                    capture_stable_seconds,
+                    require_sentinel_response=True,
+                    ledger=ledger,
+                    **_accepted_kwargs(capture_service, {"should_stop": should_stop}),
                 )
-                final_result = _chatgpt_step_result(
-                    ok=True,
-                    run_id=run_id,
-                    plan=plan,
-                    action_value=action_value,
-                    plan_metadata=plan_metadata,
-                    status=status,
-                    metadata=metadata,
-                    result=current_result,
-                    next_state_hint="extract_next_prompt",
-                    default_reason_code="capture_gpt_response_failed",
-                    events_written=events_written,
-                )
+                event = _event_from_service_result(current_result)
+                if event is not None:
+                    events_written.append(event)
+                if not _result_ok(current_result):
+                    queue_terminal = (
+                        "blocked",
+                        _result_reason_code(current_result, "capture_gpt_response_failed"),
+                    )
+                    final_result = _chatgpt_step_result(
+                        ok=False,
+                        run_id=run_id,
+                        plan=plan,
+                        action_value=action_value,
+                        plan_metadata=plan_metadata,
+                        status=status,
+                        metadata=metadata,
+                        result=current_result,
+                        next_state_hint="extract_next_prompt",
+                        default_reason_code="capture_gpt_response_failed",
+                        events_written=events_written,
+                    )
+                else:
+                    queue_terminal = (
+                        "completed",
+                        CHATGPT_HANDOFF_SLICE_COMPLETED_REASON_CODE,
+                    )
+                    final_result = _chatgpt_step_result(
+                        ok=True,
+                        run_id=run_id,
+                        plan=plan,
+                        action_value=action_value,
+                        plan_metadata=plan_metadata,
+                        status=status,
+                        metadata=metadata,
+                        result=current_result,
+                        next_state_hint="extract_next_prompt",
+                        default_reason_code="capture_gpt_response_failed",
+                        events_written=events_written,
+                    )
 
         if final_result is None:
             queue_terminal = (
@@ -1967,6 +2093,7 @@ def run_supervision_step(
     before_action_callback: Callable[[SupervisePlan, dict | None, list[dict]], None] | None = None,
     desktop_mutex: Any | None = None,
     controller_instance_id: str | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> SupervisionStepResult:
     normalized_decision = _validate_approval_decision(approval_decision)
     if normalized_decision == "":
@@ -2110,6 +2237,7 @@ def run_supervision_step(
             events=events,
             desktop_mutex=desktop_mutex if desktop_mutex is not None else ChatGPTDesktopMutex(),
             controller_instance_id=controller_instance_id,
+            should_stop=should_stop,
         )
 
     if action == SuperviseAction.CAPTURE_GPT_RESPONSE:
@@ -2136,6 +2264,7 @@ def run_supervision_step(
             events=events,
             desktop_mutex=desktop_mutex if desktop_mutex is not None else ChatGPTDesktopMutex(),
             controller_instance_id=controller_instance_id,
+            should_stop=should_stop,
         )
 
     if action == SuperviseAction.EXTRACT_NEXT_PROMPT:

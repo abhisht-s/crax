@@ -657,10 +657,31 @@ class SupervisionStepServiceTests(unittest.TestCase):
         self.assertEqual(len(capture.calls), 0)
         self.assertEqual(len(extract.calls), 0)
         self.assertEqual(len(run_prompt.calls), 0)
-        self.assertEqual([event["event_type"] for event in ledger.added_events], ["supervise_auto_stopped"])
+        self.assertEqual(
+            [event["event_type"] for event in ledger.added_events],
+            ["supervise_auto_stopped"],
+        )
         self.assertEqual(
             ledger.added_events[0]["metadata"]["automatic_stop_reason"],
             "codex_result_changed_files",
+        )
+
+    def test_operator_cancel_aborts_handoff_before_submit(self) -> None:
+        result, _planner, ledger, submit, capture, extract, run_prompt = self._run_step(
+            _send_plan(),
+            should_stop=lambda: True,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.reason_code, "operator_cancelled")
+        self.assertEqual(len(submit.calls), 0)
+        self.assertEqual(len(capture.calls), 0)
+        self.assertEqual(len(extract.calls), 0)
+        self.assertEqual(len(run_prompt.calls), 0)
+        self.assertEqual(
+            [op for op in ledger.operations if op in {"acquire_lease", "release_lease"}],
+            [],
         )
 
     def test_interactive_send_requires_approval_then_approved_or_rejected(self) -> None:

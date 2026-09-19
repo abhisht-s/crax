@@ -682,6 +682,8 @@ class LocalController:
 
     def _session_is_replaceable_locked(self, run_id: str) -> bool:
         runtime = self._sessions.get(run_id)
+        if runtime is not None and runtime.cancel_requested.is_set():
+            return True
         if runtime is not None and runtime.action_running:
             return False
         if (
@@ -853,7 +855,7 @@ class LocalController:
                     "durability": self.durability.status(),
                 }
                 self._touch_runtime_locked(runtime)
-            self._chatgpt_wait_sleeper(self._chatgpt_wait_delay_seconds(wait_count))
+            self._interruptible_sleep(run_id, self._chatgpt_wait_delay_seconds(wait_count))
         return True
 
     def _drop_session_locked(self, run_id: str) -> None:
@@ -1245,6 +1247,10 @@ class LocalController:
             runtime.pending_approval = None
             runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
             runtime.automatic_burst_reason = "operator_cancelled"
+            runtime.action_running = False
+            runtime.current_action_kind = None
+            runtime.current_action_started_at = None
+            runtime.waiting_for_chatgpt = False
             self._touch_runtime_locked(runtime)
             self._persist_session_locked()
 
@@ -2134,7 +2140,7 @@ class LocalController:
                     run_id, read_model.allow_destination_navigation
                 ),
                 ledger=self.ledger,
-                **self._supervision_handoff_kwargs(),
+                **self._supervision_handoff_kwargs(run_id),
             )
             if self._cancel_requested_for(run_id):
                 return
@@ -2320,7 +2326,7 @@ class LocalController:
                     snapshot.run_id, read_model.allow_destination_navigation
                 ),
                 ledger=self.ledger,
-                **self._supervision_handoff_kwargs(),
+                **self._supervision_handoff_kwargs(snapshot.run_id),
             )
             if self._cancel_requested_for(snapshot.run_id):
                 return
@@ -2407,6 +2413,17 @@ class LocalController:
                     return
 
             with self._lock:
+                if self._cancel_requested_for(run_id):
+                    runtime = self._sessions.get(run_id)
+                    if runtime is not None:
+                        runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                        runtime.action_running = False
+                        runtime.current_action_kind = None
+                        runtime.current_action_started_at = None
+                        runtime.waiting_for_chatgpt = False
+                        runtime.automatic_burst_reason = "operator_cancelled"
+                        self._touch_runtime_locked(runtime)
+                    return
                 runtime = self._get_or_create_session(run_id)
                 runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
                 runtime.current_action_kind = read_model.planner_action or "routine_progress"
@@ -2421,7 +2438,7 @@ class LocalController:
                     run_id, read_model.allow_destination_navigation
                 ),
                 ledger=self.ledger,
-                **self._supervision_handoff_kwargs(),
+                **self._supervision_handoff_kwargs(run_id),
             )
             if self._cancel_requested_for(run_id):
                 return
@@ -2458,10 +2475,11 @@ class LocalController:
                 )
                 return
 
-    def _supervision_handoff_kwargs(self) -> dict[str, Any]:
+    def _supervision_handoff_kwargs(self, run_id: str) -> dict[str, Any]:
         return {
             "desktop_mutex": self.desktop_mutex,
             "controller_instance_id": self.session.session_id,
+            "should_stop": lambda: self._cancel_requested_for(run_id),
         }
 
     def _navigation_for_handoff(self, run_id: str, configured: bool) -> bool:
@@ -2493,6 +2511,21 @@ class LocalController:
             CHATGPT_WAIT_MAX_SECONDS,
         )
 
+    def _interruptible_sleep(self, run_id: str, delay: float) -> None:
+        if delay <= 0:
+            return
+        runtime = self._sessions.get(run_id)
+        cancel_event = (
+            runtime.cancel_requested if runtime is not None else self.cancel_requested
+        )
+        sleeper = self._chatgpt_wait_sleeper
+        if sleeper is time.sleep:
+            cancel_event.wait(timeout=delay)
+            return
+        if cancel_event.is_set():
+            return
+        sleeper(delay)
+
     def _wait_for_chatgpt_lane(self, run_id: str, result: Any) -> None:
         with self._lock:
             if self._cancel_requested_for(run_id):
@@ -2510,8 +2543,7 @@ class LocalController:
                 "wait_count": wait_count,
             }
             self._touch_runtime_locked(runtime)
-        delay = self._chatgpt_wait_delay_seconds(wait_count)
-        self._chatgpt_wait_sleeper(delay)
+        self._interruptible_sleep(run_id, self._chatgpt_wait_delay_seconds(wait_count))
 
     def _wait_for_safe_retry_backoff(self, run_id: str) -> None:
         """Restart a capped exponential backoff after process restart.
@@ -2534,7 +2566,7 @@ class LocalController:
                 "wait_count": wait_count,
             }
             self._touch_runtime_locked(runtime)
-        self._chatgpt_wait_sleeper(self._chatgpt_wait_delay_seconds(wait_count))
+        self._interruptible_sleep(run_id, self._chatgpt_wait_delay_seconds(wait_count))
 
     def _commit_state_from_read_model(
         self,
@@ -2547,6 +2579,14 @@ class LocalController:
             return
         with self._lock:
             runtime = self._get_or_create_session(read_model.run_id)
+            if runtime.cancel_requested.is_set():
+                runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                runtime.action_running = False
+                runtime.waiting_for_chatgpt = False
+                runtime.automatic_burst_reason = "operator_cancelled"
+                self._touch_runtime_locked(runtime)
+                self._persist_session_locked()
+                return
             if read_model.completed:
                 runtime.controller_state = LOCAL_CONTROLLER_STATE_COMPLETED
             elif read_model.blocked or read_model.terminal:
@@ -2628,6 +2668,10 @@ class LocalController:
                 runtime.action_running = False
                 runtime.current_action_kind = None
                 runtime.current_action_started_at = None
+                if runtime.cancel_requested.is_set():
+                    runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                    runtime.waiting_for_chatgpt = False
+                    runtime.automatic_burst_reason = "operator_cancelled"
                 self._touch_runtime_locked(runtime)
             elif target_run_id == self.session.active_run_id:
                 self.action_running = False
@@ -3400,6 +3444,10 @@ class LocalController:
                     if target_run_id == self.session.active_run_id
                     else None
                 ),
+                "cancel_requested": bool(
+                    target_run_id == self.session.active_run_id
+                    and self.cancel_requested.is_set()
+                ),
                 "ledger_durability": self.durability.status(),
             }
         pending = runtime.pending_approval
@@ -3418,6 +3466,7 @@ class LocalController:
             "automatic_burst_reason": runtime.automatic_burst_reason,
             "waiting_for_chatgpt": runtime.waiting_for_chatgpt,
             "chatgpt_wait_count": runtime.chatgpt_wait_count,
+            "cancel_requested": runtime.cancel_requested.is_set(),
             "ledger_durability": self.durability.status(),
         }
 
@@ -4218,11 +4267,15 @@ def session_operator_view(
         or (read_model is not None and read_model.requires_human_approval)
     )
     action_running = bool(runtime.get("action_running"))
+    cancel_requested = bool(runtime.get("cancel_requested"))
     status = "idle"
     tone = "ok"
     needs_user_action = False
 
-    if reason_code == CONVERSATION_CLAIM_CONFLICT_REASON_CODE:
+    if cancel_requested or runtime.get("automatic_burst_reason") == "operator_cancelled":
+        status = "stopped"
+        tone = "error"
+    elif reason_code == CONVERSATION_CLAIM_CONFLICT_REASON_CODE:
         status = "conversation_claim_conflict"
         tone = "attention"
         needs_user_action = True
