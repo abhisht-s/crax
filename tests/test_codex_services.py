@@ -585,6 +585,7 @@ class CodexDirectExecutionServiceTests(unittest.TestCase):
         )
         self.assertEqual(ledger.events[0]["metadata"], {
             "prompt": prompt,
+            "coding_agent": "codex",
             "repo_path": repo_path,
             "timeout": None,
             "sandbox": "read-only",

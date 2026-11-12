@@ -325,9 +325,11 @@ def build_intent_payload(
     paths: InvocationArtifactPaths,
     extraction_event_id: int | None = None,
     extraction_prompt_sha256: str | None = None,
+    coding_agent: str = "codex",
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "codex_invocation_id": invocation_id,
+        "coding_agent": coding_agent,
         "run_id": run_id,
         "prompt": prompt,
         "prompt_sha256": _sha256_text(prompt),
@@ -778,6 +780,25 @@ def signal_process_group(pgid: int, sig: int) -> None:
     os.killpg(pgid, sig)
 
 
+def process_group_is_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_process_group_exit(pgid: int, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while process_group_is_alive(pgid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def terminate_verified_identity(
     identity: dict[str, Any],
     *,
@@ -795,11 +816,11 @@ def terminate_verified_identity(
     if not isinstance(pgid, int):
         pgid = process_group_id(pid) or pid
     if cancel_paths is not None:
-        write_cancel_marker(
-            cancel_paths,
-            invocation_id=str(identity.get("codex_invocation_id") or ""),
-            source=source,
-        )
+        # Failure to write diagnostic evidence must not disable emergency stop.
+        try:
+            write_cancel_marker(cancel_paths, invocation_id=str(identity.get("codex_invocation_id") or ""), source=source)
+        except OSError:
+            pass
     try:
         signal_process_group(pgid, signal.SIGTERM)
     except OSError as exc:
@@ -810,25 +831,25 @@ def terminate_verified_identity(
         }
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if not identity_matches_live_process(identity) and not pid_is_alive(pid):
+        if not identity_matches_live_process(identity) and not process_group_is_alive(pgid):
             return {
                 "terminated": True,
                 "reason_code": "codex_process_terminated",
                 "signal": "SIGTERM",
             }
         time.sleep(0.05)
-    if identity_matches_live_process(identity) or pid_is_alive(pid):
+    if process_group_is_alive(pgid):
         try:
-            if identity_matches_live_process(identity):
-                signal_process_group(pgid, signal.SIGKILL)
+            signal_process_group(pgid, signal.SIGKILL)
         except OSError as exc:
             return {
                 "terminated": False,
                 "reason_code": "codex_process_termination_failed",
                 "error_message": str(exc),
             }
+    stopped = wait_for_process_group_exit(pgid, timeout_seconds)
     return {
-        "terminated": True,
-        "reason_code": "codex_process_terminated",
+        "terminated": stopped,
+        "reason_code": "codex_process_terminated" if stopped else "codex_process_termination_failed",
         "signal": "SIGKILL",
     }

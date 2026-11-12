@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agent import ledger as default_ledger
-from agent.codex_services import (
-    CodexDirectExecutionResult,
-    execute_codex_direct_service,
+from agent.coding_agent_services import (
+    CodingAgentExecutionResult as CodexDirectExecutionResult,
+    execute_coding_agent_service as execute_codex_direct_service,
 )
 from agent.git_snapshot import (
     capture_git_snapshot,
@@ -196,6 +196,16 @@ def execute_initial_direct_codex_run_service(
         preflight_validation_error=validation_error,
         ledger=ledger,
     )
+    if raw_execution.raw_process_result is None:
+        return InitialDirectCodexRunResult(
+            ok=False, run_id=run_id, reason_code=raw_execution.reason_code,
+            error_message=raw_execution.error_message, prompt=prompt, repo_path=repo_path,
+            sandbox=sandbox, prompt_contract=prompt_contract, git_before=git_before,
+            invocation_state_before=invocation_state_before, raw_execution_result=raw_execution,
+            governance_result=None, run_status=None, supervision_decision=None,
+            validation_error=raw_execution.error_message, events_written=events_written,
+            persisted=False,
+        )
     raw_result = raw_execution.raw_process_result or {}
     governance_result = governance_service(
         run_id,

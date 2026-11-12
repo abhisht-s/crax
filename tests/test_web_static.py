@@ -205,7 +205,7 @@ class StaticSourceContractTests(unittest.TestCase):
             "quotaResumeIsLive(runtime)",
             'id="quota-force-continue-button"',
             "Force continue",
-            'requestJson("POST", "/api/runs/current/quota-resume"',
+            'requestJson("POST", "/api/runs/current/continue"',
             "currentCodexSessionId || quotaWaitThreadId",
             "injects a continue prompt into the same Codex session",
             "Codex limits ran out. Reset in ${hh}:${mm} hours",

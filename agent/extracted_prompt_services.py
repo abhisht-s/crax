@@ -6,7 +6,8 @@ from typing import Any, Callable
 
 from agent import ledger as default_ledger
 from agent.codex_invocation import STATUS_COMPLETE, STATUS_LIVE, event_metadata, latest_open_invocation
-from agent.codex_services import execute_codex_direct_service
+from agent.coding_agent_services import execute_coding_agent_service as execute_codex_direct_service
+from agent.coding_agents import provider_for_events, ProviderResolutionError
 from agent.codex_terminal import ALLOWED_CODEX_SANDBOXES
 from agent.continuation_policy import can_continue_run
 from agent.prompt_contract import parse_prompt_contract
@@ -60,6 +61,8 @@ def _default_codex_flow_coordinator(
     sandbox: str,
     timeout: float | None,
     confirm_full_access: bool,
+    *,
+    ledger: Any,
 ) -> dict[str, Any]:
     from agent.cli import _run_codex_exec_flow
 
@@ -71,6 +74,7 @@ def _default_codex_flow_coordinator(
         sandbox,
         timeout,
         confirm_full_access=confirm_full_access,
+        event_ledger=ledger,
     )
 
 
@@ -407,6 +411,12 @@ def execute_extracted_codex_prompt_service(
         )
 
     events = ledger.list_events(run_id)
+    try:
+        provider_for_events(run_id, events)
+    except ProviderResolutionError as exc:
+        return _failure(run_id, sandbox, exc.reason_code, str(exc), 1,
+                        continuation_result=continuation,
+                        workspace_write_pre_run_result=workspace_write_pre_run_policy)
     unpaired_started = _unpaired_extracted_run_started(events)
     if unpaired_started is not None:
         started_id = _event_id_or_negative(unpaired_started)
@@ -636,7 +646,8 @@ def execute_extracted_codex_prompt_service(
         },
     )
 
-    coordinator = codex_flow_coordinator or _default_codex_flow_coordinator
+    from functools import partial
+    coordinator = codex_flow_coordinator or partial(_default_codex_flow_coordinator, ledger=ledger)
     flow = coordinator(
         run_id,
         run,

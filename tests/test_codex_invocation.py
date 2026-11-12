@@ -64,6 +64,9 @@ final_text = os.environ.get(
 )
 started_path = os.environ.get("FAKE_CODEX_STARTED_PATH")
 lines = os.environ.get("FAKE_CODEX_LINES")
+if os.environ.get("FAKE_CODEX_IGNORE_TERM") == "1":
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 sys.stderr.write(stderr_text)
 sys.stderr.flush()
@@ -179,6 +182,7 @@ class DurableCodexInvocationTests(unittest.TestCase):
             "FAKE_CODEX_HOLD_PATH",
             "FAKE_CODEX_STARTED_PATH",
             "FAKE_CODEX_LINES",
+            "FAKE_CODEX_IGNORE_TERM",
         ):
             os.environ.pop(key, None)
         os.environ["FAKE_CODEX_EXIT"] = "0"
@@ -302,6 +306,30 @@ class DurableCodexInvocationTests(unittest.TestCase):
         result = result_holder["result"]
         self.assertEqual(result["termination_reason"], "operator_cancelled")
         self.assertTrue(result["cancel_requested"])
+
+    def test_emergency_stop_escalates_and_leaves_reconcilable_exit(self) -> None:
+        os.environ["FAKE_CODEX_IGNORE_TERM"] = "1"
+        os.environ["FAKE_CODEX_SLEEP"] = "30"
+        started = self.root / "child-started.txt"
+        os.environ["FAKE_CODEX_STARTED_PATH"] = str(started)
+        result_holder = {}
+        thread = threading.Thread(target=lambda: result_holder.update(result=self._run_stream()))
+        thread.start()
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and not started.exists():
+                time.sleep(0.05)
+            self.assertTrue(started.exists())
+            termination = terminate_codex_run("run-durable", timeout_seconds=0.3)
+            self.assertTrue(termination["terminated"])
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(self._paths().cancel_path.is_file())
+            self.assertEqual(classify_invocation("run-durable", "inv-1").status, STATUS_COMPLETE)
+            self.assertEqual(result_holder["result"]["termination_reason"], "operator_cancelled")
+        finally:
+            terminate_codex_run("run-durable", timeout_seconds=0.3)
+            thread.join(timeout=5)
 
     def test_exact_live_recovery_does_not_duplicate_wrapper(self) -> None:
         os.environ["FAKE_CODEX_SLEEP"] = "8"

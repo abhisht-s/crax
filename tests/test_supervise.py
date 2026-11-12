@@ -9,7 +9,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from agent import cli, ledger as default_ledger
+from agent import cli
+from agent import governance_services, ledger as default_ledger
 from agent import supervision_services as supervision_services_module
 from agent.chatgpt_destination_gate import (
     ChatGPTDestinationSnapshot,
@@ -149,7 +150,7 @@ class GovernancePolicyTests(unittest.TestCase):
                 }
             ],
         }
-        observation = cli._build_governance_observation(
+        observation = governance_services._build_governance_observation(
             contract,
             delta,
             classify_changed_files(["README.md"]),
@@ -157,7 +158,7 @@ class GovernancePolicyTests(unittest.TestCase):
             {"status_short": ""},
         )
         self.assertIn("read_only_sandbox_attributable_write", observation["objective_failures"])
-        transition = cli._governance_transition_if_blocking(
+        transition = governance_services._governance_transition_if_blocking(
             observation,
             {
                 "next_status": "completed",
@@ -187,7 +188,7 @@ class GovernancePolicyTests(unittest.TestCase):
                 }
             ],
         }
-        observation = cli._build_governance_observation(
+        observation = governance_services._build_governance_observation(
             contract,
             delta,
             classify_changed_files(["README.md"]),

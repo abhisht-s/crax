@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent import ledger as default_ledger
+from agent.chatgpt_ax_capture import COMPLETED_WITHOUT_PROMPT_REASON_CODE
 from agent.chatgpt_desktop_mutex import ChatGPTDesktopMutex
 from agent.codex_invocation import (
     STATUS_COMPLETE,
@@ -21,8 +22,12 @@ from agent.codex_invocation import (
     STATUS_UNCERTAIN,
     latest_open_invocation,
 )
-from agent.codex_services import reconcile_codex_invocation
-from agent.codex_terminal import terminate_codex_run
+from agent.coding_agent_services import reconcile_coding_agent_invocation as reconcile_codex_invocation
+from agent.codex_terminal import codex_cancellation_scope
+from agent.coding_agents import (
+    cancel_coding_agent_run as terminate_codex_run, provider_for_events, ProviderResolutionError,
+)
+from agent.codex_resume_services import codex_session_details, execute_coding_agent_resume_service as execute_codex_resume_service
 from agent.initial_codex_run_services import execute_initial_direct_codex_run_service
 from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
@@ -99,8 +104,9 @@ REPLACEABLE_RUN_STATUSES = frozenset(
         RunStatus.REJECTED.value,
     }
 )
-# Stage 6: restore-time absorbing run statuses. failed/rejected runs can never
-# advance again, so restore never registers a runtime for them. completed is
+# Stage 6: restore-time absorbing run statuses. failed/rejected runs never
+# advance automatically, so restore never registers a runtime for them. An
+# explicit Force continue request can recover their runtime. completed is
 # deliberately NOT here: it is the normal mid-loop status between planner
 # steps; restore distinguishes a finished loop from a mid-loop session through
 # the planner (read model `completed`), not the run status alone.
@@ -133,6 +139,7 @@ SESSION_OPERATOR_STATUS_LABELS = {
 CODEX_RUNNING_ACTION_KINDS = frozenset(
     {
         "initial_codex",
+        "codex_continue",
         "approval_run_prompt",
         LOCAL_CONTROLLER_RESTORE_RESUME_ACTION_KIND,
     }
@@ -441,6 +448,7 @@ class ControllerSessionRuntime:
     navigation_forced_multi_live: bool = False
     waiting_for_chatgpt: bool = False
     chatgpt_wait_count: int = 0
+    cancel_termination: dict[str, Any] | None = None
 
 
 def conversation_identity(project_title: str, chat_title: str) -> tuple[str, str]:
@@ -521,6 +529,7 @@ class LocalControllerReadModel:
     controller_runtime: dict[str, Any]
     configuration_complete: bool
     latest_failure: dict[str, Any] | None = None
+    codex_session: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -600,6 +609,7 @@ class LocalController:
         max_active_sessions: int = DEFAULT_MAX_ACTIVE_SESSIONS,
         chatgpt_wait_sleeper: Callable[[float], None] | None = None,
         desktop_mutex: Any | None = None,
+        codex_resume_executor: Callable[..., Any] = execute_codex_resume_service,
     ) -> None:
         restore_persisted_session = session is None
         self.session = session or LocalControllerSession()
@@ -611,6 +621,7 @@ class LocalController:
             self.ledger = DurabilityGuardedLedger(ledger, self.durability)
         self.read_model_builder = read_model_builder or build_local_controller_read_model
         self.run_supervision_step = supervision_step
+        self.codex_resume_executor = codex_resume_executor
         self.initial_run_executor = initial_run_executor or (
             lambda **kwargs: default_initial_run_executor(**kwargs, ledger=self.ledger)
         )
@@ -1252,20 +1263,23 @@ class LocalController:
             runtime.current_action_started_at = None
             runtime.waiting_for_chatgpt = False
             self._touch_runtime_locked(runtime)
-            self._persist_session_locked()
 
-        termination = terminate_codex_run(target_run_id)
-        self.ledger.add_event(
-            target_run_id,
-            LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE,
-            LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE,
-            {
-                "source": LOCAL_CONTROLLER_SOURCE,
-                "controller_mode": LOCAL_CONTROLLER_MODE,
-                "process_termination": termination,
-            },
-        )
+        # Emergency termination must not depend on SQLite being writable.
+        termination = terminate_codex_run(target_run_id, ledger=self.ledger)
+        with self._lock:
+            runtime.cancel_termination = termination
+        persistence_error = None
         try:
+            self.ledger.add_event(
+                target_run_id,
+                LOCAL_CONTROLLER_CANCEL_REQUESTED_EVENT_TYPE,
+                LOCAL_CONTROLLER_CANCEL_REQUESTED_MESSAGE,
+                {
+                    "source": LOCAL_CONTROLLER_SOURCE,
+                    "controller_mode": LOCAL_CONTROLLER_MODE,
+                    "process_termination": termination,
+                },
+            )
             self.ledger.update_run_status(
                 target_run_id,
                 RunStatus.FAILED,
@@ -1273,15 +1287,91 @@ class LocalController:
             )
         except (AttributeError, TypeError):
             pass
-        self._release_conversation_claim_if_hard_terminal(target_run_id)
+        except sqlite3.Error as exc:
+            persistence_error = str(exc)
+        try:
+            with self._lock:
+                self._persist_session_locked()
+            self._release_conversation_claim_if_hard_terminal(target_run_id)
+        except sqlite3.Error as exc:
+            persistence_error = str(exc)
+        stopped = bool(termination.get("terminated")) or termination.get("reason_code") == "codex_process_not_running"
         return LocalControllerOperationResult(
-            ok=True,
-            reason_code="cancel_requested",
+            ok=stopped,
+            reason_code="cancel_requested" if stopped else "codex_process_termination_failed",
+            error_message=None if stopped else str(termination.get("error_message") or "Controller stopped, but Codex termination could not be confirmed. Try Emergency stop again."),
             run_id=target_run_id,
             controller_state=LOCAL_CONTROLLER_STATE_BLOCKED,
-            read_model=self.get_current_state(target_run_id).read_model,
-            metadata={"process_termination": termination},
+            metadata={"process_termination": termination, "persistence_error": persistence_error},
         )
+
+    def request_force_continue(self, run_id: str | None = None) -> LocalControllerOperationResult:
+        with self._lock:
+            target = run_id or self.session.active_run_id
+            runtime = self._sessions.get(target) if target else None
+            def denied(reason: str, message: str):
+                return LocalControllerOperationResult(ok=False, run_id=target, reason_code=reason, error_message=message)
+            if target is None:
+                return denied("no_active_run", "No known run is available to continue.")
+            if runtime is not None and (runtime.action_running or (runtime.current_worker is not None and runtime.current_worker.is_alive())):
+                return denied("action_already_running", "The current worker must stop before this session can continue.")
+            if self.durability.status().get("blocked"):
+                return denied("ledger_durability_blocked", "Ledger persistence must recover before continuation.")
+            run = self.ledger.get_run(target)
+            if not isinstance(run, dict):
+                return denied("run_not_found" if runtime is not None else "no_active_run", "Run not found.")
+            events = self.ledger.list_events(target)
+            try:
+                provider_for_events(target, events)
+            except ProviderResolutionError as exc:
+                return denied(exc.reason_code, str(exc))
+            session = codex_session_details(target, events)
+            if not session.get("session_id"):
+                return denied("codex_session_unavailable", "This run has no recoverable Codex session ID.")
+            existing = latest_open_invocation(target, events=events)
+            if existing is not None and existing.status == STATUS_LIVE:
+                return denied("action_already_running", "Codex is still running. Stop it before continuing.")
+            if existing is not None and existing.status == STATUS_UNCERTAIN:
+                return denied("codex_invocation_uncertain", "Existing Codex completion is unproven; reconcile it before continuing.")
+            read_model = self._build_read_model(target)
+            if not read_model.configuration_complete or not read_model.repository_path or not read_model.sandbox:
+                return denied("run_configuration_missing", "The persisted run configuration is unavailable.")
+            if len([other for other in self._live_session_ids_locked() if other != target]) >= self.max_active_sessions:
+                return denied("session_capacity_reached", "Stop another session before continuing this one; all active slots are occupied.")
+            claim = self._verify_conversation_claim_for_advancement(target)
+            if not claim.ok:
+                return denied(claim.reason_code or CONVERSATION_CLAIM_CONFLICT_REASON_CODE, claim.error_message or "Another session owns this conversation.")
+            # This explicit operator action authorizes continuation even after
+            # local rejection/approval stops. Preserve Codex's own safeguards,
+            # the original execution profile, and the exact session identity.
+            self.ledger.add_event(target, "local_controller_continue_requested", "Operator requested continuation in the same Codex session.", {
+                **session,
+                "previous_run_status": run.get("status"),
+                "local_approval_overridden": bool(
+                    (runtime is not None and runtime.pending_approval is not None)
+                    or run.get("status") in {"waiting_for_approval", "rejected"}
+                ),
+            })
+            if runtime is None:
+                # Restore intentionally omits finished/failed runtimes. Manual
+                # continuation recovers one only after the durable gates pass.
+                runtime = self._get_or_create_session(target)
+                runtime.repository_path = read_model.repository_path
+                runtime.sandbox = read_model.sandbox
+                runtime.allow_destination_navigation = read_model.allow_destination_navigation
+                binding = read_model.destination_binding or {}
+                runtime.project_title = _string_or_none(binding.get("project_title"))
+                runtime.chat_title = _string_or_none(binding.get("chat_title"))
+            runtime.cancel_requested.clear()
+            runtime.cancel_termination = None
+            runtime.pending_approval = None
+            runtime.controller_state = LOCAL_CONTROLLER_STATE_RUNNING_ROUTINE_ACTION
+            self._mark_action_running_locked(target, "codex_continue")
+            worker = self._new_worker(self._continue_worker, target, session["session_id"], read_model.repository_path, read_model.sandbox)
+            runtime.current_worker = worker
+            self._persist_session_locked()
+            worker.start()
+        return LocalControllerOperationResult(ok=True, run_id=target, reason_code="continue_worker_started", metadata=session)
 
     def retry_failed_action(
         self,
@@ -1620,7 +1710,11 @@ class LocalController:
                 **runtime,
                 "notice": "approval_snapshot_unavailable_after_controller_restart",
             }
-        read_model = replace(read_model, controller_runtime=runtime)
+        read_model = replace(
+            read_model, controller_runtime=runtime,
+            terminal=read_model.terminal and not runtime["action_running"],
+            blocked=read_model.blocked and not runtime["action_running"],
+        )
         return LocalControllerOperationResult(
             ok=True,
             reason_code="state_loaded",
@@ -1634,6 +1728,7 @@ class LocalController:
         *,
         after_sequence: int = 0,
         limit: int = default_ledger.CODEX_PROGRESS_DEFAULT_LIMIT,
+        snapshot: bool = False,
     ) -> LocalControllerOperationResult:
         with self._lock:
             run_id = self.session.active_run_id
@@ -1647,7 +1742,7 @@ class LocalController:
                     "progress": _codex_progress_payload(
                         None,
                         [],
-                        after_sequence=after_sequence,
+                        after_sequence=0 if snapshot else after_sequence,
                     )
                 },
             )
@@ -1655,6 +1750,7 @@ class LocalController:
             run_id,
             after_sequence=after_sequence,
             limit=limit,
+            snapshot=snapshot,
         )
 
     def get_run_progress(
@@ -1663,6 +1759,7 @@ class LocalController:
         *,
         after_sequence: int = 0,
         limit: int = default_ledger.CODEX_PROGRESS_DEFAULT_LIMIT,
+        snapshot: bool = False,
     ) -> LocalControllerOperationResult:
         target = str(run_id or "").strip()
         if not target:
@@ -1689,11 +1786,14 @@ class LocalController:
                 controller_state=self.session.controller_state,
             )
         try:
-            events = self.ledger.list_codex_progress_events(
-                target,
-                after_sequence=after_sequence,
-                limit=limit,
-            )
+            if snapshot:
+                events = self.ledger.get_codex_progress_snapshot(target, limit=limit)
+            else:
+                events = self.ledger.list_codex_progress_events(
+                    target,
+                    after_sequence=after_sequence,
+                    limit=limit,
+                )
         except AttributeError:
             events = []
         return LocalControllerOperationResult(
@@ -1705,7 +1805,7 @@ class LocalController:
                 "progress": _codex_progress_payload(
                     target,
                     events,
-                    after_sequence=after_sequence,
+                    after_sequence=0 if snapshot else after_sequence,
                 )
             },
         )
@@ -1960,6 +2060,7 @@ class LocalController:
         terminal = bool(getattr(read_model, "terminal", False)) if read_model is not None else (
             controller_state in LOCAL_CONTROLLER_TERMINAL_STATES
         )
+        terminal = terminal and not runtime.get("action_running")
         return {
             "run_id": run_id,
             "focused": run_id == focused_run_id,
@@ -2077,6 +2178,29 @@ class LocalController:
                 run_id=run_id,
                 action_key=self._action_kind_for(run_id) or "routine_progress",
             )
+        finally:
+            self._clear_action_running(run_id)
+
+    def _continue_worker(self, run_id: str, session_id: str, repository_path: str, sandbox: str) -> None:
+        try:
+            if self._cancel_requested_for(run_id) or not self._wait_for_durability(run_id):
+                return
+            result = self.codex_resume_executor(
+                run_id=run_id, run=self.ledger.get_run(run_id),
+                repository_path=repository_path, sandbox=sandbox,
+                session_id=session_id, ledger=self.ledger,
+            )
+            if self._cancel_requested_for(run_id):
+                return
+            if not _result_ok(result):
+                self._pause_for_action_failure(run_id, action_key="codex_continue", result=result, run_status_before_action=None, source="manual_continue")
+                return
+            failure = _latest_unresolved_action_failure(self.ledger.list_events(run_id))
+            if failure is not None:
+                self._record_failure_resolved(run_id, failure["event_id"], failure.get("action_key") or "codex_continue", result)
+            self._automatic_progress_loop(run_id, starting_burst_count=0)
+        except Exception as exc:
+            self._record_worker_exception(exc, run_id=run_id, action_key="codex_continue")
         finally:
             self._clear_action_running(run_id)
 
@@ -2634,8 +2758,14 @@ class LocalController:
         return self.read_model_builder(run_id, ledger=self.ledger, session=self.session)
 
     def _new_worker(self, target: Callable[..., None], *args: Any) -> threading.Thread:
-        # Daemon workers avoid hanging local process shutdown; Slice 10 does not implement termination.
-        return threading.Thread(target=target, args=args, daemon=True)
+        first = args[0] if args else None
+        run_id = first if isinstance(first, str) else getattr(first, "run_id", None)
+        runtime = self._sessions.get(run_id)
+        cancellation = runtime.cancel_requested if runtime else None
+        def run_worker():
+            with codex_cancellation_scope(cancellation):
+                target(*args)
+        return threading.Thread(target=run_worker, daemon=True)
 
     def _action_kind_for(self, run_id: str) -> str | None:
         runtime = self._sessions.get(run_id)
@@ -2672,6 +2802,9 @@ class LocalController:
                     runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
                     runtime.waiting_for_chatgpt = False
                     runtime.automatic_burst_reason = "operator_cancelled"
+                    # Governance may have finished while stop was terminating
+                    # its process. Cancellation remains the final run status.
+                    self.ledger.update_run_status(target_run_id, RunStatus.FAILED, error="Run cancelled by operator.")
                 self._touch_runtime_locked(runtime)
             elif target_run_id == self.session.active_run_id:
                 self.action_running = False
@@ -2935,7 +3068,14 @@ class LocalController:
         if open_item is not None and open_item.status == STATUS_COMPLETE:
             # Finalize idempotently from durable artifacts, then re-derive.
             try:
-                reconcile_codex_invocation(run_id, ledger=self.ledger)
+                reconciled = reconcile_codex_invocation(run_id, ledger=self.ledger)
+                if reconciled is not None and not reconciled.persisted:
+                    runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
+                    runtime.pending_approval = None
+                    runtime.last_action_result_summary = {
+                        "kind": "restore", "ok": False, "reason_code": reconciled.reason_code,
+                    }
+                    return runtime, False
             except Exception:
                 runtime.controller_state = LOCAL_CONTROLLER_STATE_BLOCKED
                 runtime.pending_approval = None
@@ -3414,6 +3554,7 @@ class LocalController:
                 "pending_approval_kind": pending.approval_kind if pending is not None else None,
                 "session_age_seconds": _session_age_seconds(self.session.created_at),
                 "action_running": self.action_running if target_run_id == self.session.active_run_id else False,
+                "worker_running": bool(target_run_id == self.session.active_run_id and self.current_worker and self.current_worker.is_alive()),
                 "current_action_kind": (
                     self.current_action_kind
                     if target_run_id == self.session.active_run_id
@@ -3458,6 +3599,7 @@ class LocalController:
             "pending_approval_kind": pending.approval_kind if pending is not None else None,
             "session_age_seconds": _session_age_seconds(self.session.created_at),
             "action_running": runtime.action_running,
+            "worker_running": bool(runtime.current_worker and runtime.current_worker.is_alive()),
             "current_action_kind": runtime.current_action_kind,
             "current_action_started_at": runtime.current_action_started_at,
             "last_action_result_summary": runtime.last_action_result_summary,
@@ -3467,6 +3609,7 @@ class LocalController:
             "waiting_for_chatgpt": runtime.waiting_for_chatgpt,
             "chatgpt_wait_count": runtime.chatgpt_wait_count,
             "cancel_requested": runtime.cancel_requested.is_set(),
+            "cancel_termination": runtime.cancel_termination,
             "ledger_durability": self.durability.status(),
         }
 
@@ -3968,6 +4111,7 @@ def build_local_controller_read_model(
         controller_runtime=_controller_runtime(session),
         configuration_complete=configuration_complete,
         latest_failure=latest_failure,
+        codex_session=codex_session_details(run_id, events),
     )
 
 
@@ -4994,6 +5138,7 @@ def _failure_retry_classification(
         "codex_invocation_uncertain",
     }
     deterministic_reasons = {
+        COMPLETED_WITHOUT_PROMPT_REASON_CODE,
         "gpt_feedback_not_submittable",
         "gpt_feedback_generation_failed",
         "captured_response_integrity_failed",

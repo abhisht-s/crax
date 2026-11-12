@@ -30,6 +30,24 @@ RUN_DESTINATION_BOUND_SCHEMA_VERSION = 1
 RUN_EXECUTION_PROFILE_SELECTED_EVENT_TYPE = "run_execution_profile_selected"
 RUN_EXECUTION_PROFILE_SELECTED_MESSAGE = "Run execution profile selected."
 RUN_EXECUTION_PROFILE_SCHEMA_VERSION = 1
+RUN_EXECUTION_PROFILE_SCHEMA_VERSION_V2 = 2
+DEFAULT_CODING_AGENT = "codex"
+ALLOWED_CODING_AGENTS = (
+    DEFAULT_CODING_AGENT,
+    "claude_code",
+    "cursor",
+)
+_EXECUTION_PROFILE_V1_KEYS = frozenset(
+    {
+        "schema_version",
+        "sandbox",
+        "model",
+        "reasoning_effort",
+        "approval_policy",
+        "profile_source",
+    }
+)
+_EXECUTION_PROFILE_V2_KEYS = _EXECUTION_PROFILE_V1_KEYS | {"coding_agent"}
 CODEX_DEFAULT_SELECTION = "codex_default"
 ALLOWED_EXECUTION_PROFILE_SANDBOXES = (
     "read-only",
@@ -264,6 +282,7 @@ class AtomicExecutionProfileResult:
     reason_code: str | None = None
     error_message: str | None = None
     event_ids: tuple[int, ...] = ()
+    coding_agent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -673,6 +692,45 @@ def list_codex_progress_events(
             (run_id, CODEX_PROGRESS_EVENT_TYPE, safe_after, safe_limit),
         ).fetchall()
 
+    return [_codex_progress_event_from_row(row) for row in rows]
+
+
+def get_codex_progress_snapshot(
+    run_id: str,
+    *,
+    limit: int = CODEX_PROGRESS_DEFAULT_LIMIT,
+) -> list[dict[str, Any]]:
+    """Recent events plus the working notes/session/plan needed to open a view.
+
+    One statement gives the snapshot a consistent cursor while Codex writes.
+    Context can precede the recent window; return everything in sequence order
+    so process_started still clears a previous invocation's session and plan.
+    The forward-only list_codex_progress_events contract stays unchanged.
+    """
+    init_db()
+    safe_limit = max(1, min(int(limit), CODEX_PROGRESS_MAX_LIMIT))
+    select = """
+        SELECT id, run_id, created_at, event_type, message, metadata_json
+        FROM events WHERE run_id = ? AND event_type = ?
+    """
+    valid_metadata = "CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END"
+    windows = [
+        ("", safe_limit),
+        (f"AND json_extract({valid_metadata}, '$.kind') = 'assistant_commentary'", 8),
+        (f"AND json_extract({valid_metadata}, '$.kind') = 'process_started'", 1),
+        (f"AND json_extract({valid_metadata}, '$.metadata.event_type') = 'thread.started'", 1),
+        (f"AND json_extract({valid_metadata}, '$.metadata.value_summary.item_type') = 'todo_list'", 1),
+    ]
+    queries = []
+    parameters: list[Any] = []
+    for predicate, count in windows:
+        queries.append(f"SELECT * FROM ({select} {predicate} ORDER BY id DESC LIMIT ?)")
+        parameters.extend((run_id, CODEX_PROGRESS_EVENT_TYPE, count))
+    with closing(_connect()) as connection:
+        rows = connection.execute(
+            " UNION ".join(queries) + " ORDER BY id ASC",
+            parameters,
+        ).fetchall()
     return [_codex_progress_event_from_row(row) for row in rows]
 
 
@@ -3021,9 +3079,22 @@ def bind_run_execution_profile(
     reasoning_effort: str,
     approval_policy: str,
     profile_source: str,
+    *,
+    coding_agent: str = DEFAULT_CODING_AGENT,
 ) -> AtomicExecutionProfileResult:
     """Atomically select one immutable execution profile for an existing run."""
 
+    candidate = {
+        "schema_version": RUN_EXECUTION_PROFILE_SCHEMA_VERSION_V2,
+        "sandbox": sandbox, "model": model, "reasoning_effort": reasoning_effort,
+        "approval_policy": approval_policy, "profile_source": profile_source,
+        "coding_agent": coding_agent,
+    }
+    if _parse_execution_profile_metadata(candidate) is None:
+        return AtomicExecutionProfileResult(
+            status=AtomicExecutionProfileStatus.INVALID, run_id=run_id,
+            reason_code="invalid_execution_profile", error_message="Invalid execution profile configuration.",
+        )
     connection: sqlite3.Connection | None = None
     transaction_started = False
     try:
@@ -3090,17 +3161,20 @@ def bind_run_execution_profile(
                     "has started."
                 ),
                 event_ids=existing.event_ids,
+                coding_agent=existing.coding_agent,
             )
 
         if existing.status == AtomicExecutionProfileStatus.IDEMPOTENT:
             connection.rollback()
             transaction_started = False
+            existing_coding_agent = existing.coding_agent or DEFAULT_CODING_AGENT
             if (
                 existing.sandbox == sandbox
                 and existing.model == model
                 and existing.reasoning_effort == reasoning_effort
                 and existing.approval_policy == approval_policy
                 and existing.profile_source == profile_source
+                and existing_coding_agent == coding_agent
             ):
                 return AtomicExecutionProfileResult(
                     status=AtomicExecutionProfileStatus.IDEMPOTENT,
@@ -3111,6 +3185,7 @@ def bind_run_execution_profile(
                     approval_policy=existing.approval_policy,
                     profile_source=existing.profile_source,
                     event_ids=existing.event_ids,
+                    coding_agent=existing_coding_agent,
                 )
 
             return AtomicExecutionProfileResult(
@@ -3124,6 +3199,7 @@ def bind_run_execution_profile(
                 reason_code="execution_profile_already_selected_different_profile",
                 error_message="Run already has a different execution profile.",
                 event_ids=existing.event_ids,
+                coding_agent=existing_coding_agent,
             )
 
         metadata = {
@@ -3134,6 +3210,9 @@ def bind_run_execution_profile(
             "approval_policy": approval_policy,
             "profile_source": profile_source,
         }
+        if coding_agent != DEFAULT_CODING_AGENT:
+            metadata["schema_version"] = RUN_EXECUTION_PROFILE_SCHEMA_VERSION_V2
+            metadata["coding_agent"] = coding_agent
         cursor = connection.execute(
             """
             INSERT INTO events (
@@ -3166,6 +3245,7 @@ def bind_run_execution_profile(
             profile_source=profile_source,
             event_id=event_id if isinstance(event_id, int) else None,
             event_written=True,
+            coding_agent=coding_agent,
         )
     except sqlite3.Error as exc:
         if connection is not None and transaction_started:
@@ -3245,7 +3325,7 @@ def _reconstruct_execution_profile(
             run_id=run_id,
         )
 
-    profiles: list[tuple[str, str, str, str, str]] = []
+    profiles: list[tuple[str, str, str, str, str, str]] = []
     for row in rows:
         profile = _execution_profile_from_metadata_json(row["metadata_json"])
         if profile is None:
@@ -3268,7 +3348,9 @@ def _reconstruct_execution_profile(
             event_ids=event_ids,
         )
 
-    sandbox, model, reasoning_effort, approval_policy, profile_source = profiles[0]
+    sandbox, model, reasoning_effort, approval_policy, profile_source, coding_agent = (
+        profiles[0]
+    )
     return AtomicExecutionProfileResult(
         status=AtomicExecutionProfileStatus.IDEMPOTENT,
         run_id=run_id,
@@ -3278,6 +3360,7 @@ def _reconstruct_execution_profile(
         approval_policy=approval_policy,
         profile_source=profile_source,
         event_ids=event_ids,
+        coding_agent=coding_agent,
     )
 
 
@@ -4266,7 +4349,7 @@ def _destination_binding_from_metadata_json(
 
 def _execution_profile_from_metadata_json(
     metadata_json: object,
-) -> tuple[str, str, str, str, str] | None:
+) -> tuple[str, str, str, str, str, str] | None:
     if not isinstance(metadata_json, str):
         return None
     try:
@@ -4275,18 +4358,26 @@ def _execution_profile_from_metadata_json(
         return None
     if not isinstance(metadata, dict):
         return None
+    return _parse_execution_profile_metadata(metadata)
 
-    expected_keys = {
-        "schema_version",
-        "sandbox",
-        "model",
-        "reasoning_effort",
-        "approval_policy",
-        "profile_source",
-    }
-    if set(metadata) != expected_keys:
+
+def _parse_execution_profile_metadata(
+    metadata: dict[str, Any] | None,
+) -> tuple[str, str, str, str, str, str] | None:
+    if not isinstance(metadata, dict):
         return None
-    if metadata.get("schema_version") != RUN_EXECUTION_PROFILE_SCHEMA_VERSION:
+
+    schema_version = metadata.get("schema_version")
+    keys = set(metadata)
+    if schema_version == RUN_EXECUTION_PROFILE_SCHEMA_VERSION:
+        if keys != _EXECUTION_PROFILE_V1_KEYS:
+            return None
+        coding_agent: object = DEFAULT_CODING_AGENT
+    elif schema_version == RUN_EXECUTION_PROFILE_SCHEMA_VERSION_V2:
+        if keys != _EXECUTION_PROFILE_V2_KEYS:
+            return None
+        coding_agent = metadata.get("coding_agent")
+    else:
         return None
 
     sandbox = metadata.get("sandbox")
@@ -4302,6 +4393,7 @@ def _execution_profile_from_metadata_json(
             reasoning_effort,
             approval_policy,
             profile_source,
+            coding_agent,
         )
     ):
         return None
@@ -4316,5 +4408,7 @@ def _execution_profile_from_metadata_json(
         return None
     if profile_source not in ALLOWED_EXECUTION_PROFILE_SOURCES:
         return None
+    if coding_agent not in ALLOWED_CODING_AGENTS:
+        return None
 
-    return sandbox, model, reasoning_effort, approval_policy, profile_source
+    return sandbox, model, reasoning_effort, approval_policy, profile_source, coding_agent

@@ -1741,6 +1741,7 @@ class RunExtractedCodexPromptCharacterizationTests(unittest.TestCase):
                 "read-only",
                 None,
                 False,
+                ledger=cli.ledger,
             )
 
         self.assertIs(result, flow)
@@ -1752,6 +1753,7 @@ class RunExtractedCodexPromptCharacterizationTests(unittest.TestCase):
             "read-only",
             None,
             confirm_full_access=False,
+            event_ledger=cli.ledger,
         )
 
     def test_run_extracted_cli_requires_confirm_run_before_ledger_or_codex_flow(self) -> None:

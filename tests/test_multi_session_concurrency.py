@@ -1006,7 +1006,7 @@ class MultiSessionCancellationTests(unittest.TestCase):
             terminated: list[str] = []
             with mock.patch(
                 "agent.local_controller.terminate_codex_run",
-                side_effect=lambda run_id: terminated.append(run_id) or {"terminated": True},
+                side_effect=lambda run_id, **kwargs: terminated.append(run_id) or {"terminated": True},
             ):
                 cancelled = controller.request_cancel(first.run_id)
 

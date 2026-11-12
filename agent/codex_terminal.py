@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,6 +25,7 @@ from agent.codex_invocation import (
     classify_invocation,
     disk_invocation_ids,
     identity_matches_live_process,
+    process_group_is_alive,
     read_json_file,
     result_from_artifacts,
     spawn_invocation_wrapper,
@@ -30,6 +33,8 @@ from agent.codex_invocation import (
     terminate_verified_identity,
     write_cancel_marker,
     write_intent,
+    write_json_atomic,
+    wait_for_process_group_exit,
 )
 from agent.ledger import ALLOWED_CODEX_MODEL_SELECTIONS, CODEX_DEFAULT_SELECTION
 
@@ -50,6 +55,17 @@ _ACTIVE_CODEX_PROCESSES: dict[str, ActiveCodexInvocation] = {}
 _ACTIVE_CODEX_PROCESSES_LOCK = threading.Lock()
 _SHUTDOWN_LOCK = threading.Lock()
 _SHUTDOWN_HANDLERS_INSTALLED = False
+_CANCELLATION_EVENT: ContextVar[threading.Event | None] = ContextVar("codex_cancellation", default=None)
+
+
+@contextmanager
+def codex_cancellation_scope(event: threading.Event | None):
+    """Carry the controller's stop signal through existing execution services."""
+    token = _CANCELLATION_EVENT.set(event)
+    try:
+        yield
+    finally:
+        _CANCELLATION_EVENT.reset(token)
 
 
 def _utc_now() -> str:
@@ -168,6 +184,10 @@ def _json_value_summary(event: dict[str, Any]) -> dict[str, object]:
     summary: dict[str, object] = {}
     event_type = _json_event_type(event)
     summary["event_type"] = event_type
+    if event_type == "thread.started":
+        session_id = event.get("thread_id")
+        if isinstance(session_id, str):
+            summary["codex_session_id"] = _safe_identifier(session_id)
     for key in ("id", "status", "exit_code", "duration_ms", "duration_seconds"):
         value = _nested_dict_value(event, key)
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -188,6 +208,8 @@ def _json_value_summary(event: dict[str, Any]) -> dict[str, object]:
     if files:
         summary["file_changes"] = files
     error = _nested_dict_value(event, "error") or _nested_dict_value(event, "error_message")
+    if error is None and any(marker in event_type.lower() for marker in ("error", "failed", "failure")):
+        error = event.get("message")
     if error is not None:
         summary["error"] = _bounded_text(error, CODEX_PROGRESS_METADATA_TEXT_LIMIT)
     return summary
@@ -313,7 +335,7 @@ def normalize_codex_jsonl_event(line: str) -> dict[str, object]:
             kind="error",
             status="failed",
             title="Codex error",
-            summary=f"Codex emitted {event_type}.",
+            summary=str(metadata["value_summary"].get("error") or f"Codex emitted {event_type}."),
             metadata=metadata,
         )
     if command is not None or "command" in lowered or "exec" in lowered:
@@ -529,9 +551,14 @@ def _terminate_popen_group(
         except OSError:
             process.kill()
         process.wait(timeout=timeout_seconds)
+    # The wrapper may exit while a child ignores SIGTERM. Stop the entire
+    # dedicated group, and confirm it disappeared before reporting success.
+    if process_group_is_alive(pgid):
+        os.killpg(pgid, signal.SIGKILL)
+    stopped = wait_for_process_group_exit(pgid, timeout_seconds)
     return {
-        "terminated": True,
-        "reason_code": "codex_process_terminated",
+        "terminated": stopped,
+        "reason_code": "codex_process_terminated" if stopped else "codex_process_termination_failed",
         "exit_code": process.returncode,
     }
 
@@ -583,6 +610,7 @@ def run_json_streaming_command(
     *,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     process_metadata: dict[str, object] | None = None,
+    progress_normalizer: Callable[[str], dict[str, object]] | None = None,
 ) -> dict:
     started_at = _utc_now()
     metadata = dict(process_metadata or {})
@@ -607,6 +635,7 @@ def run_json_streaming_command(
         command=command,
         json_mode=True,
         paths=paths,
+        coding_agent=str(metadata.get("coding_agent", "codex")),
         extraction_event_id=(
             int(metadata["extraction_event_id"])
             if isinstance(metadata.get("extraction_event_id"), int)
@@ -619,6 +648,19 @@ def run_json_streaming_command(
         ),
     )
     write_intent(paths, intent)
+    cancellation = _CANCELLATION_EVENT.get()
+    if cancellation is not None and cancellation.is_set():
+        write_cancel_marker(paths, invocation_id=invocation_id, source="operator_cancel")
+        write_json_atomic(paths.exit_path, {
+            "codex_invocation_id": invocation_id, "exit_code": -signal.SIGTERM,
+            "finished_at": _utc_now(), "cancel_requested": True,
+        })
+        return {
+            "command": command, "cwd": cwd, "exit_code": -signal.SIGTERM,
+            "stdout": "", "stderr": "Run cancelled before Codex started.",
+            "timed_out": False, "started_at": started_at, "finished_at": _utc_now(),
+            "cancel_requested": True,
+        }
     active: ActiveCodexInvocation | None = None
     _install_main_thread_shutdown_handlers()
     try:
@@ -630,6 +672,10 @@ def run_json_streaming_command(
             paths=paths,
         )
         _register_active_invocation(active)
+        # Stop can arrive between the pre-spawn check and registration. The
+        # worker owns this gap, so it must terminate the newly registered group.
+        if cancellation is not None and cancellation.is_set():
+            terminate_codex_run(run_id)
         _emit_progress(
             progress_callback,
             _progress_event(
@@ -648,7 +694,7 @@ def run_json_streaming_command(
         )
 
         def on_line(line: str) -> None:
-            _emit_progress(progress_callback, normalize_codex_jsonl_event(line))
+            _emit_progress(progress_callback, (progress_normalizer or normalize_codex_jsonl_event)(line))
 
         observation = tail_stdout_and_wait(
             paths=paths,
@@ -702,6 +748,18 @@ def run_json_streaming_command(
         _forget_active_invocation(active)
 
 
+def _record_terminated_exit(paths: InvocationArtifactPaths, invocation_id: str, termination: dict[str, object]) -> None:
+    if termination.get("terminated") and not paths.exit_path.exists():
+        exit_code = termination.get("exit_code")
+        if not isinstance(exit_code, int):
+            exit_code = -signal.SIGKILL if termination.get("signal") == "SIGKILL" else -signal.SIGTERM
+        write_json_atomic(paths.exit_path, {
+            "codex_invocation_id": invocation_id, "exit_code": exit_code,
+            "finished_at": _utc_now(), "cancel_requested": True,
+            "source": "verified_process_termination",
+        })
+
+
 def terminate_codex_run(
     run_id: str,
     *,
@@ -711,13 +769,22 @@ def terminate_codex_run(
     with _ACTIVE_CODEX_PROCESSES_LOCK:
         active = _ACTIVE_CODEX_PROCESSES.get(run_id)
     if active is not None and active.process.poll() is None:
-        write_cancel_marker(
-            active.paths,
-            invocation_id=active.invocation_id,
-            source=source,
-        )
+        marker_error = None
         try:
-            return _terminate_popen_group(active.process, timeout_seconds=timeout_seconds)
+            write_cancel_marker(active.paths, invocation_id=active.invocation_id, source=source)
+        except OSError as exc:
+            marker_error = str(exc)
+        try:
+            termination = _terminate_popen_group(active.process, timeout_seconds=timeout_seconds)
+            try:
+                _record_terminated_exit(active.paths, active.invocation_id, termination)
+            except OSError as exc:
+                marker_error = str(exc)
+            return {
+                **termination,
+                "codex_invocation_id": active.invocation_id,
+                "persistence_error": marker_error,
+            }
         except (OSError, subprocess.SubprocessError) as exc:
             return {
                 "terminated": False,
@@ -731,19 +798,37 @@ def terminate_codex_run(
             "terminated": False,
             "reason_code": "codex_process_not_running",
         }
-    classified = classify_invocation(run_id, invocation_ids[-1])
-    identity = classified.identity
-    if identity is None or not identity_matches_live_process(identity):
-        return {
-            "terminated": False,
-            "reason_code": "codex_process_not_running",
-        }
-    return terminate_verified_identity(
-        identity,
-        timeout_seconds=timeout_seconds,
-        cancel_paths=classified.paths,
-        source=source,
-    )
+    outcomes = []
+    # Invocation names contain random UUIDs; alphabetical order says nothing
+    # about which process is live. Check every invocation of this run only.
+    for invocation_id in invocation_ids:
+        classified = classify_invocation(run_id, invocation_id)
+        identity = classified.identity
+        if identity is not None and identity_matches_live_process(identity):
+            termination = terminate_verified_identity(identity, timeout_seconds=timeout_seconds, cancel_paths=classified.paths, source=source)
+            try:
+                _record_terminated_exit(classified.paths, invocation_id, termination)
+            except OSError as exc:
+                termination["persistence_error"] = str(exc)
+            outcomes.append({
+                **termination,
+                "codex_invocation_id": invocation_id,
+            })
+    if not outcomes:
+        return {"terminated": False, "reason_code": "codex_process_not_running"}
+    if len(outcomes) == 1:
+        return outcomes[0]
+    stopped = all(outcome.get("terminated") for outcome in outcomes)
+    return {"terminated": stopped, "reason_code": "codex_process_terminated" if stopped else "codex_process_termination_failed", "invocations": outcomes}
+
+
+def terminate_coding_agent_processes(run_id: str, **kwargs: Any) -> dict[str, object]:
+    """CRAX-owned verified process-group stop, independent of native sessions.
+
+    The historical implementation name and artifact layout remain compatible.
+    This operation never launches a CLI or interprets a provider session ID.
+    """
+    return terminate_codex_run(run_id, **kwargs)
 
 
 def terminate_all_active_codex_invocations(
@@ -783,6 +868,8 @@ def run_codex_exec(
     artifact_dir: str | Path | None = None,
     extraction_event_id: int | None = None,
     extraction_prompt_sha256: str | None = None,
+    resume_session_id: str | None = None,
+    progress_normalizer: Callable[[str], dict[str, object]] | None = None,
 ) -> dict:
     del timeout_seconds
     codex_path = shutil.which("codex")
@@ -824,9 +911,11 @@ def run_codex_exec(
         [
             "--output-last-message",
             str(resolved_final_message_path),
-            prompt,
         ]
     )
+    if resume_session_id is not None:
+        command.extend(["resume", resume_session_id])
+    command.append(prompt)
 
     validation_error = None
     if sandbox not in ALLOWED_CODEX_SANDBOXES:
@@ -834,6 +923,13 @@ def run_codex_exec(
             "Invalid Codex sandbox. Allowed values: "
             f"{', '.join(ALLOWED_CODEX_SANDBOXES)}."
         )
+    elif resume_session_id is not None and (
+        not isinstance(resume_session_id, str)
+        or not resume_session_id
+        or _safe_identifier(resume_session_id) != resume_session_id
+        or resume_session_id.startswith("-")
+    ):
+        validation_error = "Invalid Codex session ID."
     elif model_text not in ALLOWED_CODEX_MODEL_SELECTIONS:
         validation_error = (
             "Invalid Codex model. Allowed values: "
@@ -967,6 +1063,7 @@ def run_codex_exec(
         }
 
     process_metadata = {
+        "coding_agent": "codex",
         "run_id": run_id,
         "repo_path": resolved_repo_path_text,
         "sandbox": sandbox,
@@ -981,11 +1078,13 @@ def run_codex_exec(
     if extraction_prompt_sha256 is not None:
         process_metadata["extraction_prompt_sha256"] = extraction_prompt_sha256
     if json_stream:
+        normalizer_kwargs = {} if progress_normalizer is None else {"progress_normalizer": progress_normalizer}
         result = run_json_streaming_command(
             command,
             cwd=resolved_repo_path_text,
             progress_callback=progress_callback,
             process_metadata=process_metadata,
+            **normalizer_kwargs,
         )
     else:
         result = run_command(command, cwd=resolved_repo_path_text, timeout_seconds=None)
@@ -1047,6 +1146,7 @@ def observe_existing_codex_invocation(
     *,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     wrapper: subprocess.Popen | None = None,
+    progress_normalizer: Callable[[str], dict[str, object]] | None = None,
 ) -> dict:
     intent = classification.intent or {}
     command = intent.get("command") if isinstance(intent.get("command"), list) else []
@@ -1073,7 +1173,7 @@ def observe_existing_codex_invocation(
         _register_active_invocation(active)
     try:
         def on_line(line: str) -> None:
-            _emit_progress(progress_callback, normalize_codex_jsonl_event(line))
+            _emit_progress(progress_callback, (progress_normalizer or normalize_codex_jsonl_event)(line))
 
         observation = tail_stdout_and_wait(
             paths=classification.paths,

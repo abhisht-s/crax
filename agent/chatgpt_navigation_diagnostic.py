@@ -130,6 +130,7 @@ FRAME_CLICK_STATUSES = {
 }
 AUTONOMOUS_OPEN_STABILITY_SAMPLE_COUNT = 3
 AUTONOMOUS_OPEN_STABILITY_POLL_SECONDS = 0.12
+AUTONOMOUS_OPEN_STABILITY_RETRY_SECONDS = 5.0
 AUTONOMOUS_OPEN_SETTLE_SECONDS = 0.35
 AUTONOMOUS_OPEN_POST_ACTION_SETTLE_SECONDS = 0.5
 AUTONOMOUS_OPEN_OUTCOMES = {
@@ -3646,6 +3647,15 @@ def _resolve_open_project_identity(
             "chats_tab_confirmed": False,
             "sources_tab_visible": False,
         }
+    # Classic can repeat one project's title in the window and toolbar. Titles
+    # anchored to the same Chats/Sources controls describe the same project.
+    candidates_by_tabs = {}
+    for candidate in candidates:
+        tabs = candidate["tab_context"]
+        key = (tabs["chats_tab_path"], tabs["sources_tab_path"])
+        if key not in candidates_by_tabs or candidate["snapshot"].role == "AXWindow":
+            candidates_by_tabs[key] = candidate
+    candidates = list(candidates_by_tabs.values())
     if len(candidates) > 1:
         return {
             "status": "project_identity_ambiguous",
@@ -4600,9 +4610,19 @@ def open_chatgpt_sidebar_destination(
         sleep_function=sleeper,
     )
     result["activation_stability"] = _autonomous_stability_summary(stable)
-    if stable["status"] != "stable":
-        result.update({"outcome": "unstable_chatgpt_ui", "error": stable.get("error") or "ChatGPT AX/window geometry did not stabilize."})
-        return result
+    axpress_geometry_fallback = stable["status"] != "stable"
+    result["axpress_geometry_fallback"] = axpress_geometry_fallback
+    if axpress_geometry_fallback:
+        # Geometry is required for mouse clicks, not an advertised AXPress.
+        # Keep the warning, but read fresh controls instead of stopping here.
+        stable = _stable_chatgpt_geometry_sample(
+            reader, process.pid, windowserver_probe_factory or _WindowServerBoundsProbe,
+            sample_count=AUTONOMOUS_OPEN_STABILITY_SAMPLE_COUNT,
+            sleep_function=sleeper, require_window_geometry=False,
+        )
+        if stable["status"] != "stable":
+            result.update({"outcome": "post_action_inspection_unavailable", "error": stable.get("error") or "ChatGPT Accessibility controls were unavailable."})
+            return result
 
     plan = _autonomous_destination_plan(
         stable["snapshots"],
@@ -4612,6 +4632,7 @@ def open_chatgpt_sidebar_destination(
         requested_title,
         stable["windowserver_bounds"],
         display_probe_factory or _CoreGraphicsDisplayProbe,
+        axpress_only=axpress_geometry_fallback,
     )
     result.update(_autonomous_plan_result(plan))
     if plan["status"] != "ready":
@@ -4641,6 +4662,7 @@ def open_chatgpt_sidebar_destination(
                 plan.get("pre_action_state") or {},
                 windowserver_probe_factory=windowserver_probe_factory or _WindowServerBoundsProbe,
                 sleep_function=sleeper,
+                require_window_geometry=not axpress_geometry_fallback,
             )
             result["post_action_evidence"] = post
             if post.get("inspection_available") and post.get("confirmed"):
@@ -4654,6 +4676,15 @@ def open_chatgpt_sidebar_destination(
                 result.update(_autonomous_project_chat_result_fields(post))
                 result.update({"outcome": post.get("open_outcome"), "error": post.get("reason") or "Project opened, but the Chats list could not be confirmed."})
                 return result
+
+    if axpress_geometry_fallback:
+        # Never turn a geometry warning into an unchecked mouse click, even
+        # when AXPress failed or its destination could not be confirmed.
+        result.update({
+            "outcome": "action_posted_but_destination_not_confirmed" if result["actions_performed"] else "unstable_chatgpt_ui",
+            "error": (result.get("axpress_attempt") or {}).get("error") or "Destination was not confirmed after Accessibility press; coordinate click requires stable geometry.",
+        })
+        return result
 
     click_result = _autonomous_validated_click(
         reader,
@@ -5014,6 +5045,8 @@ def _project_chat_open_project_summary(project_result: dict) -> dict:
         "chosen_method": project_result.get("chosen_method") or "",
         "target_match_count": max(0, int(project_result.get("target_match_count") or 0)),
         "activation_stability_status": str((project_result.get("activation_stability") or {}).get("status") or ""),
+        "activation_stability_error": str((project_result.get("activation_stability") or {}).get("error") or "")[:800],
+        "axpress_geometry_fallback": bool(project_result.get("axpress_geometry_fallback")),
         "traversal": {
             "truncated_by_node_limit": bool(traversal.get("truncated_by_node_limit")),
             "truncated_by_depth_limit": bool(traversal.get("truncated_by_depth_limit")),
@@ -5394,6 +5427,7 @@ def _open_ready_project_chat_plan(
                 fresh_plan,
                 windowserver_probe_factory=windowserver_probe_factory,
                 sleep_function=sleep_function,
+                require_window_geometry=not fresh_plan.get("axpress_geometry_fallback", False),
             )
             result["post_action_evidence"] = post
             _apply_project_chat_post_action_diagnostics(result, post)
@@ -5408,6 +5442,13 @@ def _open_ready_project_chat_plan(
             # one existing hit-test-validated geometry click below; no blind
             # coordinate action is introduced here.
             result["axpress_post_action_evidence"] = post
+
+    if fresh_plan.get("axpress_geometry_fallback"):
+        result.update({
+            "outcome": "action_posted_but_chat_not_confirmed" if result.get("chat_open_action_posted") else "chat_row_not_interactable",
+            "error": (result.get("axpress_attempt") or {}).get("error") or "Chat was not confirmed after Accessibility press; coordinate click requires stable geometry.",
+        })
+        return result
 
     stable_plan = _fresh_project_chat_open_plan(
         reader,
@@ -6983,13 +7024,16 @@ def _fresh_project_chat_targeting_plan(
     try:
         snapshots, stats, window_metadata = reader.collect(pid)
         ax_window_frame = _window_frame_from_metadata(window_metadata, snapshots)
+    except Exception as exc:
+        return {"status": "post_action_inspection_unavailable", "error": str(exc)}
+    if not snapshots or not _frame_is_valid(ax_window_frame):
+        return {"status": "post_action_inspection_unavailable", "error": "Fresh ChatGPT AX tree or window bounds were unavailable."}
+    try:
         windows = windowserver_probe_factory().visible_windows_for_pid(pid)
         windowserver_window = _choose_windowserver_window_for_ax_frame(windows, ax_window_frame)
         windowserver_bounds = _frame_tuple((windowserver_window or {}).get("bounds"))
-    except Exception as exc:
-        return {"status": "post_action_inspection_unavailable", "error": str(exc)}
-    if not snapshots or not _frame_is_valid(ax_window_frame) or not _frame_is_valid(windowserver_bounds):
-        return {"status": "post_action_inspection_unavailable", "error": "Fresh ChatGPT AX tree or window bounds were unavailable."}
+    except Exception:
+        windowserver_bounds = None
     return _project_chat_open_plan_from_snapshots(
         snapshots,
         stats,
@@ -6999,6 +7043,7 @@ def _fresh_project_chat_targeting_plan(
         project_title,
         chat_title,
         display_probe_factory,
+        axpress_only=not _frame_is_valid(windowserver_bounds),
     )
 
 
@@ -7041,6 +7086,8 @@ def _project_chat_open_plan_from_snapshots(
     project_title: str,
     chat_title: str,
     display_probe_factory: object,
+    *,
+    axpress_only: bool = False,
 ) -> dict:
     resolution = resolve_open_project_content_and_visible_chats(
         project_title,
@@ -7059,8 +7106,9 @@ def _project_chat_open_plan_from_snapshots(
         "resolver_snapshot_id": _project_chat_resolver_snapshot_id(snapshots),
         "ax_window_frame": ax_window_frame,
         "windowserver_bounds": windowserver_bounds,
-        "display_bounds": _collect_display_bounds_without_cursor(display_probe_factory),
+        "display_bounds": [] if axpress_only else _collect_display_bounds_without_cursor(display_probe_factory),
         "target_candidate_count": 0,
+        "axpress_geometry_fallback": axpress_only,
     }
     if resolution.get("status") != "visible_chats_found":
         if resolution.get("status") == "project_chat_list_identity_not_confirmed":
@@ -7118,7 +7166,10 @@ def _project_chat_open_plan_from_snapshots(
         "scope": {"title_path": title_snapshot.path, "row_path": row_snapshot.path},
         "axpress_target": _project_chat_axpress_target(title_snapshot, row_snapshot),
     }
-    interactable = _project_chat_row_interactable(row, viewport_frame, ax_window_frame, windowserver_bounds, base["display_bounds"])
+    interactable = _project_chat_row_interactable(
+        row, viewport_frame, ax_window_frame, windowserver_bounds, base["display_bounds"],
+        axpress_only=axpress_only and bool(matched_fields["axpress_target"].get("path")),
+    )
     if not interactable.get("ok"):
         return {
             **base,
@@ -7138,6 +7189,8 @@ def _project_chat_row_interactable(
     ax_window_frame: tuple[float, float, float, float] | None,
     windowserver_bounds: tuple[float, float, float, float] | None,
     display_bounds: list[tuple[float, float, float, float]],
+    *,
+    axpress_only: bool = False,
 ) -> dict:
     title_frame = _frame_tuple(row.get("title_frame"))
     row_frame = _frame_tuple(row.get("row_frame"))
@@ -7152,9 +7205,11 @@ def _project_chat_row_interactable(
         return {"ok": False, "error": "The derived point is outside the selected chat row/title frame."}
     if not _point_inside_frame(point_tuple, viewport_frame):
         return {"ok": False, "error": "The derived point is outside the visible project chat-list viewport."}
-    if not _point_inside_frame(point_tuple, ax_window_frame) or not _point_inside_frame(point_tuple, windowserver_bounds):
+    if not _point_inside_frame(point_tuple, ax_window_frame) or (
+        not axpress_only and not _point_inside_frame(point_tuple, windowserver_bounds)
+    ):
         return {"ok": False, "error": "The derived point is outside the current ChatGPT window bounds."}
-    if not any(_point_inside_frame(point_tuple, display) for display in display_bounds):
+    if not axpress_only and not any(_point_inside_frame(point_tuple, display) for display in display_bounds):
         return {"ok": False, "error": "The derived point is outside all available displays."}
     return {"ok": True, "point": point}
 
@@ -7425,6 +7480,7 @@ def _project_chat_post_action_inspection(
     *,
     windowserver_probe_factory: object,
     sleep_function: object,
+    require_window_geometry: bool = True,
 ) -> dict:
     sleep_function(min(AUTONOMOUS_OPEN_POST_ACTION_SETTLE_SECONDS, 1.0))
     try:
@@ -7434,6 +7490,7 @@ def _project_chat_post_action_inspection(
             windowserver_probe_factory,
             sample_count=2,
             sleep_function=sleep_function,
+            require_window_geometry=require_window_geometry,
         )
     except Exception as exc:
         return {"inspection_available": False, "confirmed": False, "error": str(exc), "signals": []}
@@ -7463,6 +7520,20 @@ def _project_chat_post_action_inspection(
         pre_plan,
         ax_window_frame=ax_window_frame,
     )
+    # Use the same Classic toolbar identity parser as the destination gate;
+    # its label is "<chat>, <project>", rather than the bare chat title.
+    from agent.chatgpt_ax_destination_snapshot import AXDestinationNode, _active_conversation_identity
+
+    title_nodes = tuple(
+        AXDestinationNode(
+            path=node.path, depth=node.depth, role=node.role, title=node.title,
+            description=node.description, value=node.value, actions=node.actions,
+            frame=node.frame,
+        )
+        for node in snapshots
+    )
+    if _active_conversation_identity(title_nodes) == (chat_title, project_title):
+        signals.append({"type": "active_conversation_identity_outside_chat_list"})
     signal_types = {signal.get("type") for signal in signals}
     verification_state = "project_list_active" if resolution.get("status") == "visible_chats_found" else "conversation_or_non_list_view_active"
     confirmed = (
@@ -7636,22 +7707,42 @@ def _stable_chatgpt_geometry_sample(
     *,
     sample_count: int,
     sleep_function: object,
+    require_window_geometry: bool = True,
 ) -> dict:
+    """Sample geometry, or fresh AX controls when only AXPress is allowed."""
     samples = []
     last_error = ""
-    for index in range(max(2, sample_count)):
+    required_samples = max(2, sample_count)
+    # Allow at least five seconds of polling for missing or moving windows,
+    # plus enough observations to confirm the window once it becomes ready.
+    poll_seconds = min(AUTONOMOUS_OPEN_STABILITY_POLL_SECONDS, 0.5)
+    max_attempts = required_samples + math.ceil(AUTONOMOUS_OPEN_STABILITY_RETRY_SECONDS / poll_seconds)
+    for index in range(max_attempts):
         try:
             snapshots, stats, window_metadata = reader.collect(pid)
             ax_window_frame = _window_frame_from_metadata(window_metadata, snapshots)
-            windows = windowserver_probe_factory().visible_windows_for_pid(pid)
+            windows = windowserver_probe_factory().visible_windows_for_pid(pid) if require_window_geometry else []
             windowserver_window = _choose_windowserver_window_for_ax_frame(windows, ax_window_frame)
             windowserver_bounds = _frame_tuple((windowserver_window or {}).get("bounds"))
         except Exception as exc:
             last_error = str(exc)
-            break
-        if not snapshots or not _frame_is_valid(ax_window_frame) or not _frame_is_valid(windowserver_bounds):
-            last_error = "ChatGPT AX window frame or WindowServer bounds were unavailable."
-            break
+            samples.clear()
+            sleep_function(poll_seconds)
+            continue
+        if not snapshots or (
+            require_window_geometry
+            and (not _frame_is_valid(ax_window_frame) or not _frame_is_valid(windowserver_bounds))
+        ):
+            last_error = "ChatGPT AX window frame or WindowServer bounds were unavailable." if require_window_geometry else "ChatGPT Accessibility controls were unavailable."
+            samples.clear()
+            sleep_function(poll_seconds)
+            continue
+        if samples and require_window_geometry and (
+            _frames_materially_changed(samples[0]["ax_window_frame"], ax_window_frame)
+            or _frames_materially_changed(samples[0]["windowserver_bounds"], windowserver_bounds)
+        ):
+            last_error = "AX window frame or WindowServer bounds changed during stabilization."
+            samples.clear()
         samples.append(
             {
                 "snapshots": snapshots,
@@ -7662,17 +7753,11 @@ def _stable_chatgpt_geometry_sample(
                 "windowserver_bounds": windowserver_bounds,
             }
         )
-        if index < sample_count - 1:
-            sleep_function(min(AUTONOMOUS_OPEN_STABILITY_POLL_SECONDS, 0.5))
-    if len(samples) < max(2, sample_count):
+        if len(samples) == required_samples:
+            break
+        sleep_function(poll_seconds)
+    if len(samples) < required_samples:
         return {"status": "unstable", "error": last_error or "Insufficient bounded geometry samples."}
-    first = samples[0]
-    for sample in samples[1:]:
-        if _frames_materially_changed(first["ax_window_frame"], sample["ax_window_frame"]) or _frames_materially_changed(
-            first["windowserver_bounds"],
-            sample["windowserver_bounds"],
-        ):
-            return {"status": "unstable", "error": "AX window frame or WindowServer bounds changed during stabilization.", "samples": len(samples)}
     latest = samples[-1]
     return {"status": "stable", "samples": len(samples), "all_samples": samples, **latest}
 
@@ -7717,6 +7802,8 @@ def _autonomous_destination_plan(
     requested_title: str,
     windowserver_bounds: tuple[float, float, float, float] | None,
     display_probe_factory: object,
+    *,
+    axpress_only: bool = False,
 ) -> dict:
     classified = classify_navigation_snapshots(snapshots, stats, window_metadata, include_visible_navigation_titles=True)
     matches = _matching_visible_destination_candidates(classified, kind, requested_title)
@@ -7732,6 +7819,8 @@ def _autonomous_destination_plan(
         return {**base, "status": "target_absent", "error": "No exactly matching visible sidebar destination was found."}
     if len(matches) > 1:
         return {**base, "status": "target_ambiguous", "error": "More than one matching visible sidebar destination was found."}
+    if axpress_only and (stats.get("truncated_by_node_limit") or stats.get("truncated_by_depth_limit")):
+        return {**base, "status": "post_action_inspection_unavailable", "error": "Accessibility traversal was truncated; exact press target could not be verified."}
 
     snapshots_by_path = {snapshot.path: snapshot for snapshot in snapshots}
     candidate = matches[0]
@@ -7741,22 +7830,24 @@ def _autonomous_destination_plan(
     title_frame = _frame_tuple(title_snapshot.frame if title_snapshot else None)
     row_frame = _frame_tuple(row_snapshot.frame if row_snapshot else None)
     ax_window_frame = _window_frame_from_metadata(window_metadata, snapshots)
-    display_bounds = _collect_display_bounds_without_cursor(display_probe_factory)
-    visibility = _autonomous_target_visibility(
-        title_frame,
-        row_frame,
-        ax_window_frame,
-        windowserver_bounds,
-        display_bounds,
-    )
-    if visibility["status"] != "ready":
-        return {**base, "status": visibility["status"], "error": visibility["error"], "candidate": candidate, "scope": scope}
+    display_bounds = [] if axpress_only else _collect_display_bounds_without_cursor(display_probe_factory)
+    if not axpress_only:
+        visibility = _autonomous_target_visibility(
+            title_frame, row_frame, ax_window_frame, windowserver_bounds, display_bounds,
+        )
+        if visibility["status"] != "ready":
+            return {**base, "status": visibility["status"], "error": visibility["error"], "candidate": candidate, "scope": scope}
 
     elements = [
         _deep_inspection_element(snapshot, scope, requested_title, snapshots_by_path)
         for snapshot in scope["ordered_snapshots"]
     ]
     primary = _assess_primary_selection_path(elements, candidate)
+    axpress_target = _autonomous_axpress_target(primary)
+    if axpress_only:
+        target = snapshots_by_path.get(axpress_target.get("path"))
+        if target is None or target.enabled is False:
+            return {**base, "status": "unstable_chatgpt_ui", "error": "Geometry was unstable and no unique enabled AXPress control was available.", "candidate": candidate, "scope": scope}
     return {
         **base,
         "candidate": candidate,
@@ -7768,7 +7859,7 @@ def _autonomous_destination_plan(
         "ax_window_frame": ax_window_frame,
         "windowserver_bounds": windowserver_bounds,
         "display_bounds": display_bounds,
-        "axpress_target": _autonomous_axpress_target(primary),
+        "axpress_target": axpress_target,
         "pre_action_state": _autonomous_destination_state(snapshots, classified, kind, requested_title, scope),
     }
 
@@ -8095,6 +8186,7 @@ def _autonomous_post_action_inspection(
     *,
     windowserver_probe_factory: object,
     sleep_function: object,
+    require_window_geometry: bool = True,
 ) -> dict:
     sleep_function(min(AUTONOMOUS_OPEN_POST_ACTION_SETTLE_SECONDS, 1.0))
     try:
@@ -8104,6 +8196,7 @@ def _autonomous_post_action_inspection(
             windowserver_probe_factory,
             sample_count=2,
             sleep_function=sleep_function,
+            require_window_geometry=require_window_geometry,
         )
     except Exception as exc:
         return {"inspection_available": False, "confirmed": False, "error": str(exc), "signals": []}

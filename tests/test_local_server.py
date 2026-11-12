@@ -40,6 +40,7 @@ class FakeController:
         self.retry_run_ids: list[str | None] = []
         self.cancel_calls = 0
         self.cancel_run_ids: list[str | None] = []
+        self.continue_run_ids: list[str | None] = []
         self.focus_calls: list[str] = []
         self.list_calls = 0
         self.progress_run_ids: list[str | None] = []
@@ -184,6 +185,10 @@ class FakeController:
         self.cancel_calls += 1
         self.cancel_run_ids.append(run_id)
         return self.cancel_result
+
+    def request_force_continue(self, run_id: str | None = None):
+        self.continue_run_ids.append(run_id)
+        return self._result(ok=True, reason="continue_worker_started", run_id=run_id or "run-1")
 
     def get_current_progress(self, *, after_sequence: int = 0, limit: int = 100):
         self.progress_calls.append({"after_sequence": after_sequence, "limit": limit})
@@ -1220,6 +1225,22 @@ class MaxActiveSessionsConfigTests(unittest.TestCase):
 
 
 class MultiSessionHttpContractTests(LocalServerHTTPTestCase):
+    def test_continuation_routes_require_authentication_and_target_named_run(self):
+        for action in ["continue", "quota-resume"]:
+            path = f"/api/runs/run-1/{action}"
+            self.assertEqual(self.request("POST", path, body={})[0], 401)
+            self.assertEqual(self.controller.continue_run_ids, [])
+            status, _, payload = self.request("POST", path, body={}, token=self.token)
+            self.assertEqual(status, 202)
+            self.assertEqual(payload["reason_code"], "continue_worker_started")
+            self.assertEqual(self.controller.continue_run_ids.pop(), "run-1")
+            status, _, _ = self.request("POST", f"/api/runs/current/{action}", body={}, token=self.token)
+            self.assertEqual(status, 202)
+            self.assertIsNone(self.controller.continue_run_ids.pop())
+        self.assertEqual(self.request("POST", "/api/runs/missing/continue", body={}, token=self.token)[0], 404)
+        self.assertEqual(self.request("POST", "/api/runs/run-1/continue", body={"session_id": "other-session"}, token=self.token)[0], 400)
+        self.assertEqual(self.controller.continue_run_ids, [])
+
     def test_get_runs_returns_session_list_payload(self) -> None:
         self.controller.session.active_run_id = "run-1"
         self.controller.list_result = self.controller._result(

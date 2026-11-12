@@ -298,12 +298,14 @@ def _make_handler(server_runtime: LocalControllerServer):
                 return
             if path == "/api/runs/current/progress":
                 after_sequence, limit = _progress_query(query)
+                snapshot = _progress_snapshot_query(query)
                 self._write_json(
                     200,
                     _progress_payload(
                         server_runtime,
                         after_sequence=after_sequence,
                         limit=limit,
+                        snapshot=snapshot,
                     ),
                 )
                 return
@@ -336,6 +338,7 @@ def _make_handler(server_runtime: LocalControllerServer):
                     return
                 if action == "progress":
                     after_sequence, limit = _progress_query(query)
+                    snapshot = _progress_snapshot_query(query)
                     _require_known_run(server_runtime.controller, run_id)
                     self._write_json(
                         200,
@@ -344,6 +347,7 @@ def _make_handler(server_runtime: LocalControllerServer):
                             after_sequence=after_sequence,
                             limit=limit,
                             run_id=run_id,
+                            snapshot=snapshot,
                         ),
                     )
                     return
@@ -446,6 +450,14 @@ def _make_handler(server_runtime: LocalControllerServer):
                 self._audit_remote_result(result)
                 self._write_operation_result(result, success_status=202)
                 return
+            if path in {"/api/runs/current/continue", "/api/runs/current/quota-resume"}:
+                payload = self._read_json_body(LOCAL_SERVER_GENERIC_BODY_LIMIT, require_object=True, allow_empty=True)
+                if payload:
+                    raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                result = server_runtime.controller.request_force_continue()
+                self._audit_remote_result(result)
+                self._write_operation_result(result, success_status=202, default_failure_status=409)
+                return
             run_resource = _match_run_resource(path)
             if run_resource is not None:
                 run_id, action = run_resource
@@ -477,6 +489,14 @@ def _make_handler(server_runtime: LocalControllerServer):
                     result = server_runtime.controller.request_cancel(run_id)
                     self._audit_remote_result(result)
                     self._write_operation_result(result, success_status=202)
+                    return
+                if action in {"continue", "quota-resume"}:
+                    payload = self._read_json_body(LOCAL_SERVER_GENERIC_BODY_LIMIT, require_object=True, allow_empty=True)
+                    if payload:
+                        raise LocalServerError(400, "unexpected_request_fields", "Unexpected request fields.")
+                    result = server_runtime.controller.request_force_continue(run_id)
+                    self._audit_remote_result(result)
+                    self._write_operation_result(result, success_status=202, default_failure_status=409)
                     return
                 if action == "retry":
                     payload = self._read_json_body(
@@ -716,6 +736,9 @@ def _make_handler(server_runtime: LocalControllerServer):
                     return
                 if not self._write_sse_comment("heartbeat"):
                     return
+                if len(events) >= limit:
+                    # Drain available updates before waiting for new ones.
+                    continue
                 time.sleep(LOCAL_SERVER_SSE_HEARTBEAT_SECONDS)
 
         def _write_sse_event(self, event_name: str, payload: dict[str, Any]) -> bool:
@@ -905,12 +928,14 @@ def _required_scope(method: str, path: str) -> str:
         "/api/tick",
         "/api/runs/current/retry",
         "/api/runs/current/cancel",
+        "/api/runs/current/continue",
+        "/api/runs/current/quota-resume",
     }:
         return "control"
     run_resource = _match_run_resource(path)
     if run_resource is not None:
         _run_id, action = run_resource
-        if action in {"cancel", "retry", "approval", "tick", "focus"}:
+        if action in {"cancel", "retry", "approval", "tick", "focus", "continue", "quota-resume"}:
             return "control"
     return "admin"
 
@@ -925,6 +950,8 @@ _RUN_RESOURCE_ACTIONS = {
     "approval",
     "tick",
     "focus",
+    "continue",
+    "quota-resume",
 }
 
 
@@ -1192,6 +1219,15 @@ def _progress_query(query: str) -> tuple[int, int]:
     return after_sequence, limit
 
 
+def _progress_snapshot_query(query: str) -> bool:
+    values = parse_qs(query, keep_blank_values=True).get("snapshot")
+    if values is None:
+        return False
+    if len(values) != 1 or values[0] not in {"0", "1"}:
+        raise LocalServerError(400, "invalid_progress_snapshot", "snapshot must be 0 or 1.")
+    return values[0] == "1"
+
+
 def _single_nonnegative_int_query_value(
     params: dict[str, list[str]],
     name: str,
@@ -1219,17 +1255,19 @@ def _progress_payload(
     after_sequence: int,
     limit: int,
     run_id: str | None = None,
+    snapshot: bool = False,
 ) -> dict[str, Any]:
+    options = {"snapshot": True} if snapshot else {}
     if run_id:
         progress_reader = getattr(server_runtime.controller, "get_run_progress", None)
         if callable(progress_reader):
             return _operation_payload(
-                progress_reader(run_id, after_sequence=after_sequence, limit=limit)
+                progress_reader(run_id, after_sequence=after_sequence, limit=limit, **options)
             )
     progress_reader = getattr(server_runtime.controller, "get_current_progress", None)
     if callable(progress_reader):
         return _operation_payload(
-            progress_reader(after_sequence=after_sequence, limit=limit)
+            progress_reader(after_sequence=after_sequence, limit=limit, **options)
         )
 
     active_run_id = server_runtime.session.active_run_id

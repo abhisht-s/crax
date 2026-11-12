@@ -398,6 +398,7 @@ def _navigation_attempt_from_open_result(result: dict) -> NavigationAttemptResul
         ok=False,
         outcome=outcome,
         reason_code="destination_navigation_action_not_performed",
+        error_message=str(result.get("error") or "")[:800] or None,
         action_posted=False,
         navigator_confirmed=False,
         navigation_action_diagnostics=diagnostics,
@@ -423,6 +424,8 @@ _NAVIGATION_ACTION_DIAGNOSTIC_DEFAULTS = {
     "project_open_truncated_by_node_limit": False,
     "project_open_truncated_by_depth_limit": False,
     "project_open_stability_status": "",
+    "project_open_stability_error": "",
+    "project_open_axpress_geometry_fallback": False,
 }
 
 
@@ -479,6 +482,12 @@ def _navigation_action_diagnostics_from_open_result(result: dict) -> dict[str, A
         or result.get("project_open_stability_status")
         or ""
     )[:40]
+    diagnostics["project_open_stability_error"] = str(
+        project_result.get("activation_stability_error") or result.get("project_open_stability_error") or ""
+    )[:800]
+    diagnostics["project_open_axpress_geometry_fallback"] = bool(
+        project_result.get("axpress_geometry_fallback") or result.get("project_open_axpress_geometry_fallback")
+    )
     return diagnostics
 
 

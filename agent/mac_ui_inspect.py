@@ -358,12 +358,17 @@ class _AXSubmissionReader:
 
     def collect(self) -> tuple[list[_AXElementSnapshot], dict]:
         focused_window = self._focused_window()
+        if getattr(self, "_content_scope_path", None):
+            self._content_link_budget = min(32, self.max_nodes)
+            self._content_text_budget = self.max_nodes
         snapshots: list[_AXElementSnapshot] = []
         visited_count = 0
+        truncated = False
 
         def walk(element: int, path: str, depth: int) -> None:
-            nonlocal visited_count
+            nonlocal visited_count, truncated
             if visited_count >= self.max_nodes:
+                truncated = True
                 return
             visited_count += 1
             role = self._cf_string(self._copy_attribute(element, "AXRole"))
@@ -384,9 +389,16 @@ class _AXSubmissionReader:
             )
             snapshots.append(snapshot)
             if depth >= self.max_depth:
+                if getattr(self, "_content_scope_path", None) and self._children(element):
+                    truncated = True
                 return
-            for index, child in enumerate(self._children(element), start=1):
+            children = self._children(element)
+            scope = getattr(self, "_content_scope_path", None)
+            if scope and (path == scope or path.startswith(scope + ".")):
+                children = _content_sibling_children(self, element, children)
+            for index, child in enumerate(children, start=1):
                 if visited_count >= self.max_nodes:
+                    truncated = True
                     break
                 walk(child, f"{path}.{index}", depth + 1)
 
@@ -395,6 +407,8 @@ class _AXSubmissionReader:
             "visited_nodes": visited_count,
             "max_depth": self.max_depth,
             "max_nodes": self.max_nodes,
+            **({"content_sibling_recovery_complete": not truncated}
+               if getattr(self, "_content_scope_path", None) else {}),
         }
 
     def _copy_actions(self, element: int) -> int | None:
@@ -438,6 +452,69 @@ class _AXSubmissionReader:
 
 def _applescript_string_inner(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _content_sibling_children(reader, element: int, children: list[int]) -> list[int]:
+    """Recover virtualized message rows, scoped to their existing section list.
+
+    Used only by a missing-marker read fallback. These references must never
+    change the ordinary child paths used to resolve an action target.
+    """
+    if reader._cf_string(reader._copy_attribute(element, "AXSubrole")) != "AXSectionList":
+        return children
+    equal = reader._cf.CFEqual
+    equal.argtypes, equal.restype = [c_void_p, c_void_p], c_bool
+
+    def seen(value, references):
+        return any(equal(c_void_p(value), c_void_p(other)) for other in references)
+
+    # Probe recent gaps first. An old visible prefix must not consume the link
+    # budget before we reach the newest submitted message.
+    ordered: list[int] = []
+    for child in children:
+        if not seen(child, ordered):
+            ordered.append(child)
+    remaining = reader._content_link_budget
+    for child in reversed(ordered.copy()):
+        pending: list[int] = []
+        current = child
+        while remaining > 0:
+            remaining -= 1
+            previous = reader._copy_attribute(current, "AXPreviousContentSibling")
+            if not previous or seen(previous, ordered + pending):
+                break
+            parent = reader._copy_attribute(previous, "AXParent")
+            if not parent or not equal(c_void_p(parent), c_void_p(element)):
+                break
+            pending.append(previous)
+            current = previous
+        position = next(index for index, item in enumerate(ordered)
+                        if equal(c_void_p(item), c_void_p(child)))
+        ordered[position:position] = reversed(pending)
+    reader._content_link_budget = remaining
+
+    marker = getattr(reader, "_submission_marker_text", None)
+    if not marker:
+        return children
+    # Find marker rows newest-first before the main walk. Prune unrelated old
+    # history so its subtrees cannot consume max_nodes ahead of the anchor.
+    text_budget = reader._content_text_budget
+    scan_incomplete = False
+
+    def contains_marker(node, depth=0):
+        nonlocal text_budget, scan_incomplete
+        if text_budget <= 0 or depth > reader.max_depth:
+            scan_incomplete = True
+            return False
+        text_budget -= 1
+        if any(marker in reader._cf_string(reader._copy_attribute(node, name))
+               for name in TEXT_ATTRIBUTES):
+            return True
+        return any(contains_marker(child, depth + 1) for child in reader._children(node))
+
+    matches = [index for index in reversed(range(len(ordered))) if contains_marker(ordered[index])]
+    reader._content_text_budget = text_budget
+    return ordered[min(matches):] if matches and not scan_incomplete else children
 
 
 def _element_text(snapshot: _AXElementSnapshot) -> str:
@@ -507,6 +584,7 @@ def inspect_chatgpt_submission_ui(
     marker_text: str | None = None,
     max_depth: int = DEFAULT_MAX_DEPTH,
     max_nodes: int = DEFAULT_MAX_NODES,
+    recover_missing_marker: bool = False,
 ) -> dict:
     result = {
         "ok": False,
@@ -524,7 +602,8 @@ def inspect_chatgpt_submission_ui(
         "error": None,
     }
     try:
-        snapshots, stats = _AXSubmissionReader(app_name, max_depth, max_nodes).collect()
+        reader = _AXSubmissionReader(app_name, max_depth, max_nodes)
+        snapshots, stats = reader.collect()
     except (AXInspectError, OSError) as exc:
         result["error"] = str(exc)
         return result
@@ -535,6 +614,36 @@ def inspect_chatgpt_submission_ui(
     buttons = [_snapshot_dict(item, include_text=False) for item in snapshots if item.role in BUTTON_ROLES]
     send_button = next((item for item in snapshots if _looks_like_send_button(item)), None)
     messages = _message_candidates(snapshots)
+
+    if recover_missing_marker and marker_text and not any(marker_text in item["text"] for item in messages):
+        # Recover text only. Buttons, focus, and action paths retain the normal
+        # snapshot, and a marker still in a draft never invokes this fallback.
+        areas = [item for item in snapshots if item.role == "AXTextArea"]
+        if len(areas) == 1:
+            hosts = [item.path for item in snapshots if item.role == "AXGroup"
+                     and item.subrole == "AXHostingView" and areas[0].path.startswith(item.path + ".")]
+            if hosts:
+                reader._content_scope_path = max(hosts, key=len)
+                reader._submission_marker_text = marker_text
+                try:
+                    recovered, recovery_stats = reader.collect()
+                    draft_present = any(item.role in TEXT_INPUT_ROLES and marker_text in _element_text(item)
+                                        for item in recovered)
+                    # Distinct rows containing identical marker text are still
+                    # ambiguous; do not collapse them by adjacent text value.
+                    matches = [candidate for item in recovered if not draft_present
+                               and recovery_stats["content_sibling_recovery_complete"]
+                               and item.role not in TEXT_INPUT_ROLES
+                               for candidate in _message_candidates([item])
+                               if marker_text in candidate["text"]]
+                    for item in matches:
+                        messages.append({**item, "index": len(messages)})
+                    stats = {**stats, "content_sibling_recovery": recovery_stats,
+                             "recovered_marker_candidates": len(matches)}
+                except (AXInspectError, OSError):
+                    pass
+                finally:
+                    reader._content_scope_path = None
 
     if marker_text:
         marker_candidate_count = sum(
@@ -562,6 +671,13 @@ def inspect_chatgpt_submission_ui(
         }
     )
     return result
+
+
+def _inspect_submission_for_verification(app_name: str, marker_text: str, inspection_function) -> dict:
+    # Keep preparation reads and injected inspector call contracts unchanged.
+    if inspection_function is inspect_chatgpt_submission_ui:
+        return inspection_function(app_name, marker_text=marker_text, recover_missing_marker=True)
+    return inspection_function(app_name, marker_text=marker_text)
 
 
 def press_chatgpt_send_button(app_name: str, button_path: str) -> dict:

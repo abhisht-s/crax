@@ -86,6 +86,7 @@ from agent.mac_paste import (
     press_enter_in_frontmost_app,
 )
 from agent.mac_ui_inspect import (
+    _inspect_submission_for_verification,
     inspect_chatgpt_submission_ui,
     inspect_chatgpt_ui,
     press_chatgpt_send_button,
@@ -374,7 +375,7 @@ def _verify_submission_marker(app_name: str, marker_text: str) -> dict:
     last_status: dict = {}
     while True:
         polls += 1
-        observation = inspect_chatgpt_submission_ui(app_name, marker_text=marker_text)
+        observation = _inspect_submission_for_verification(app_name, marker_text, inspect_chatgpt_submission_ui)
         last_observation = observation
         status = _submission_verification_status(observation, marker_text)
         last_status = status
@@ -2026,7 +2027,10 @@ def _run_codex_exec_flow(
     sandbox: str,
     timeout: float | None,
     confirm_full_access: bool,
+    *,
+    event_ledger: Any | None = None,
 ) -> dict:
+    ledger = event_ledger if event_ledger is not None else globals()["ledger"]
     prompt_contract = parse_prompt_contract(prompt, sandbox).to_dict()
     git_snapshot = capture_git_snapshot(repo_path_text)
     invocation_state_before = capture_invocation_git_state(repo_path_text)
@@ -2069,7 +2073,18 @@ def _run_codex_exec_flow(
         preflight_validation_error=validation_error,
         ledger=ledger,
     )
-    result = codex_execution.raw_process_result or {}
+    if codex_execution.raw_process_result is None:
+        # A rejected/unavailable execution is not an executed process result.
+        print(f"error: {codex_execution.error_message}", file=sys.stderr)
+        return {
+            "result": {"validation_error": codex_execution.error_message,
+                       "found": False, "exit_code": None, "timed_out": False,
+                       "repo_path": repo_path_text, "sandbox": sandbox,
+                       "reason_code": codex_execution.reason_code},
+            "supervision_decision": None, "transition": {},
+            "execution_result": codex_execution,
+        }
+    result = codex_execution.raw_process_result
     if result["validation_error"]:
         print(f"error: {result['validation_error']}", file=sys.stderr)
     _print_codex_exec_result(result)

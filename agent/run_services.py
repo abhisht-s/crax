@@ -80,6 +80,8 @@ class ExecutionProfileLedger(Protocol):
         reasoning_effort: str,
         approval_policy: str,
         profile_source: str,
+        *,
+        coding_agent: str = "codex",
     ) -> Any: ...
 
 
@@ -163,7 +165,12 @@ RUN_EXECUTION_PROFILE_SELECTED_MESSAGE = (
     default_ledger.RUN_EXECUTION_PROFILE_SELECTED_MESSAGE
 )
 RUN_EXECUTION_PROFILE_SCHEMA_VERSION = default_ledger.RUN_EXECUTION_PROFILE_SCHEMA_VERSION
+RUN_EXECUTION_PROFILE_SCHEMA_VERSION_V2 = (
+    default_ledger.RUN_EXECUTION_PROFILE_SCHEMA_VERSION_V2
+)
 CODEX_DEFAULT_SELECTION = default_ledger.CODEX_DEFAULT_SELECTION
+DEFAULT_CODING_AGENT = default_ledger.DEFAULT_CODING_AGENT
+ALLOWED_CODING_AGENTS = default_ledger.ALLOWED_CODING_AGENTS
 ALLOWED_EXECUTION_PROFILE_SANDBOXES = (
     default_ledger.ALLOWED_EXECUTION_PROFILE_SANDBOXES
 )
@@ -298,6 +305,7 @@ class RunExecutionProfile:
     reasoning_effort: str = CODEX_DEFAULT_SELECTION
     approval_policy: str = CODEX_DEFAULT_SELECTION
     profile_source: str = "system_default"
+    coding_agent: str = DEFAULT_CODING_AGENT
 
     def __post_init__(self) -> None:
         _require_allowed_value(
@@ -320,6 +328,11 @@ class RunExecutionProfile:
             "profile_source",
             self.profile_source,
             ALLOWED_EXECUTION_PROFILE_SOURCES,
+        )
+        _require_allowed_value(
+            "coding_agent",
+            self.coding_agent,
+            ALLOWED_CODING_AGENTS,
         )
 
 
@@ -797,6 +810,8 @@ def select_run_execution_profile(
             error_message="profile must be a RunExecutionProfile",
         )
 
+    provider_kwargs = {} if profile.coding_agent == DEFAULT_CODING_AGENT else {"coding_agent": profile.coding_agent}
+
     ledger_result = ledger.bind_run_execution_profile(
         run_id,
         profile.sandbox,
@@ -804,6 +819,7 @@ def select_run_execution_profile(
         profile.reasoning_effort,
         profile.approval_policy,
         profile.profile_source,
+        **provider_kwargs,
     )
     status = str(ledger_result.status)
 
@@ -1376,7 +1392,7 @@ def _destination_binding_metadata(binding: RunDestinationBinding) -> dict[str, A
 
 
 def _execution_profile_metadata(profile: RunExecutionProfile) -> dict[str, Any]:
-    return {
+    metadata = {
         "schema_version": RUN_EXECUTION_PROFILE_SCHEMA_VERSION,
         "sandbox": profile.sandbox,
         "model": profile.model,
@@ -1384,6 +1400,11 @@ def _execution_profile_metadata(profile: RunExecutionProfile) -> dict[str, Any]:
         "approval_policy": profile.approval_policy,
         "profile_source": profile.profile_source,
     }
+
+    if profile.coding_agent != DEFAULT_CODING_AGENT:
+        metadata["schema_version"] = default_ledger.RUN_EXECUTION_PROFILE_SCHEMA_VERSION_V2
+        metadata["coding_agent"] = profile.coding_agent
+    return metadata
 
 
 def _chatgpt_ui_lease_acquired_metadata(
@@ -1449,12 +1470,16 @@ def _execution_profile_from_ledger_result(
 ) -> RunExecutionProfile | None:
     if ledger_result.sandbox is None:
         return None
+    coding_agent = ledger_result.coding_agent
+    if not isinstance(coding_agent, str) or coding_agent == "":
+        coding_agent = DEFAULT_CODING_AGENT
     return RunExecutionProfile(
         ledger_result.sandbox,
         ledger_result.model,
         ledger_result.reasoning_effort,
         ledger_result.approval_policy,
         ledger_result.profile_source,
+        coding_agent=coding_agent,
     )
 
 
@@ -1703,27 +1728,20 @@ def _destination_binding_from_metadata(
 def _execution_profile_from_metadata(
     metadata: dict[str, Any] | None,
 ) -> RunExecutionProfile | None:
-    if metadata is None:
+    parsed = default_ledger._parse_execution_profile_metadata(metadata)
+    if parsed is None:
         return None
-    expected_keys = {
-        "schema_version",
-        "sandbox",
-        "model",
-        "reasoning_effort",
-        "approval_policy",
-        "profile_source",
-    }
-    if set(metadata) != expected_keys:
-        return None
-    if metadata.get("schema_version") != RUN_EXECUTION_PROFILE_SCHEMA_VERSION:
-        return None
+    sandbox, model, reasoning_effort, approval_policy, profile_source, coding_agent = (
+        parsed
+    )
     try:
         return RunExecutionProfile(
-            metadata["sandbox"],
-            metadata["model"],
-            metadata["reasoning_effort"],
-            metadata["approval_policy"],
-            metadata["profile_source"],
+            sandbox,
+            model,
+            reasoning_effort,
+            approval_policy,
+            profile_source,
+            coding_agent=coding_agent,
         )
     except (KeyError, TypeError, ValueError):
         return None

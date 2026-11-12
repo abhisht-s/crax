@@ -25,6 +25,7 @@ from agent.mac_paste import (
     press_enter_in_frontmost_app,
 )
 from agent.mac_ui_inspect import (
+    _inspect_submission_for_verification,
     inspect_chatgpt_submission_ui,
     press_chatgpt_send_button,
 )
@@ -59,7 +60,7 @@ CHATGPT_SUBMISSION_VERIFY_MAX_POLLS = 40
 # AXPress can return success without ChatGPT actually sending. Wait this long
 # for the marker to leave the composer, then press Enter instead of burning the
 # full 40-poll confirmation budget (~25s of silent AX walks).
-CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS = 3.0
+CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS = 10.0
 
 
 class PromptExtractionLedger(Protocol):
@@ -1526,7 +1527,7 @@ def _verify_submission_marker(
                 "observation": _submission_ui_observation_summary(last_observation, marker_text),
             }
         polls += 1
-        observation = inspection_function(app_name, marker_text=marker_text)
+        observation = _inspect_submission_for_verification(app_name, marker_text, inspection_function)
         last_observation = observation
         status = _submission_verification_status(observation, marker_text)
         last_status = status
@@ -1543,6 +1544,9 @@ def _verify_submission_marker(
         timed_out = (
             timeout_seconds is not None
             and (monotonic_function() - start) >= timeout_seconds
+            # A failed AX read cannot prove whether sending is still needed.
+            # Wait for readable evidence; max_polls still bounds read failures.
+            and observation.get("ok") is True
         )
         exhausted = max_polls is not None and polls >= max_polls
         if timed_out or exhausted:
@@ -1751,6 +1755,8 @@ def _capture_failed_metadata(
             "timeout_seconds": capture_result.get("timeout_seconds"),
         },
         "ax_stats": capture_result.get("ax_stats", {}),
+        **({"completion_evidence": capture_result["completion_evidence"]}
+           if "completion_evidence" in capture_result else {}),
     }
 
 

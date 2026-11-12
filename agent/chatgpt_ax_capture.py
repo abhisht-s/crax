@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from agent.chatgpt_ax_destination_snapshot import resolve_classic_chatgpt_pid
+from agent.mac_ui_inspect import _content_sibling_children
 
 
 AX_CAPTURE_SOURCE = "chatgpt_desktop_ax"
@@ -22,6 +23,7 @@ DEFAULT_STABLE_SECONDS = 2.0
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 OPERATOR_CANCELLED_REASON_CODE = "operator_cancelled"
 OPERATOR_CANCELLED_ERROR = "Capture stopped because the operator cancelled the run."
+COMPLETED_WITHOUT_PROMPT_REASON_CODE = "chatgpt_completed_without_valid_prompt"
 DEFAULT_MAX_DEPTH = 18
 DEFAULT_MAX_NODES = 1200
 MATCH_THRESHOLD = 0.90
@@ -94,6 +96,9 @@ class _AXReader:
         self._cf.CFGetTypeID.restype = c_ulong
         self._cf.CFStringGetTypeID.restype = c_ulong
         self._cf.CFArrayGetTypeID.restype = c_ulong
+        self._cf.CFBooleanGetTypeID.restype = c_ulong
+        self._cf.CFBooleanGetValue.argtypes = [c_void_p]
+        self._cf.CFBooleanGetValue.restype = c_bool
         self._cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_ulong]
         self._cf.CFStringCreateWithCString.restype = c_void_p
         self._cf.CFStringGetLength.argtypes = [c_void_p]
@@ -112,6 +117,7 @@ class _AXReader:
 
         self._string_type = self._cf.CFStringGetTypeID()
         self._array_type = self._cf.CFArrayGetTypeID()
+        self._boolean_type = self._cf.CFBooleanGetTypeID()
 
     def _attribute_ref(self, name: str) -> int:
         if name not in self._attr_cache:
@@ -130,8 +136,17 @@ class _AXReader:
             byref(output),
         )
         if error != 0 or not output.value:
+            # Unsupported/empty optional attributes are normal. Other read
+            # failures make absence of a generation control inconclusive.
+            if error not in (0, -25205, -25212):
+                self._observation_incomplete = True
             return None
         return output.value
+
+    def _cf_bool(self, value: int | None) -> bool | None:
+        if not value or self._cf.CFGetTypeID(c_void_p(value)) != self._boolean_type:
+            return None
+        return bool(self._cf.CFBooleanGetValue(c_void_p(value)))
 
     def _cf_string(self, value: int | None) -> str:
         if not value:
@@ -146,6 +161,7 @@ class _AXReader:
                 return ""
             return buffer.value.decode("utf-8", "replace")
         except Exception:
+            self._observation_incomplete = True
             return ""
 
     def _children(self, element: int) -> list[int]:
@@ -155,6 +171,7 @@ class _AXReader:
                 continue
             try:
                 if self._cf.CFGetTypeID(c_void_p(value)) != self._array_type:
+                    self._observation_incomplete = True
                     continue
                 count = self._cf.CFArrayGetCount(c_void_p(value))
                 if count > 0:
@@ -163,6 +180,7 @@ class _AXReader:
                         for index in range(count)
                     ]
             except Exception:
+                self._observation_incomplete = True
                 continue
         return []
 
@@ -197,6 +215,10 @@ class _AXReader:
             raise AXCaptureError(f"Could not parse process id for app {self.app_name!r}.") from exc
 
     def collect_text_candidates(self) -> tuple[list[TextCandidate], dict]:
+        self._observation_incomplete = False
+        if getattr(self, "_content_scope_path", None):
+            self._content_link_budget = min(32, self.max_nodes)
+            self._content_text_budget = self.max_nodes
         pid = self._get_pid()
         app_element = self._ax.AXUIElementCreateApplication(pid)
         if not app_element:
@@ -207,19 +229,39 @@ class _AXReader:
             raise AXCaptureError("Could not read AXFocusedWindow from ChatGPT.")
 
         nodes: list[AXNode] = []
+        response_controls: list[dict] = []
+        composer_scopes: list[str] = []
         visited_count = 0
+        truncated = False
 
         def walk(element: int, path: str, depth: int, containers: tuple[str, ...]) -> None:
-            nonlocal visited_count
+            nonlocal visited_count, truncated
             if visited_count >= self.max_nodes:
+                truncated = True
+                self._observation_incomplete = True
                 return
             visited_count += 1
 
             role = self._cf_string(self._copy_attribute(element, "AXRole"))
+            if not role:
+                self._observation_incomplete = True
             subrole = self._cf_string(self._copy_attribute(element, "AXSubrole"))
+            if role == "AXButton":
+                labels = [
+                    self._cf_string(self._copy_attribute(element, name)).strip()
+                    for name in ("AXTitle", "AXDescription", "AXIdentifier")
+                ]
+                if _response_control_kind(labels) is not None:
+                    response_controls.append({
+                        "path": path,
+                        "labels": labels,
+                        "enabled": self._cf_bool(self._copy_attribute(element, "AXEnabled")),
+                    })
             next_containers = containers
             if role == CONTAINER_ROLE and subrole == CONTAINER_SUBROLE:
                 next_containers = (*containers, path)
+            if role == "AXTextArea" and next_containers:
+                composer_scopes.append(next_containers[-1])
 
             text_parts: list[str] = []
             if role in TEXT_ROLES:
@@ -240,11 +282,20 @@ class _AXReader:
                     )
                 )
 
+            children = self._children(element)
+            scope = getattr(self, "_content_scope_path", None)
+            if scope and (path == scope or path.startswith(scope + ".")):
+                children = _content_sibling_children(self, element, children)
             if depth >= self.max_depth:
+                if children:
+                    truncated = True
+                    self._observation_incomplete = True
                 return
 
-            for index, child in enumerate(self._children(element), start=1):
+            for index, child in enumerate(children, start=1):
                 if visited_count >= self.max_nodes:
+                    truncated = True
+                    self._observation_incomplete = True
                     break
                 walk(child, f"{path}.{index}", depth + 1, next_containers)
 
@@ -258,7 +309,27 @@ class _AXReader:
             "candidate_count": len(candidates),
             "max_depth": self.max_depth,
             "max_nodes": self.max_nodes,
+            "response_controls": response_controls,
+            "response_controls_complete": not self._observation_incomplete,
+            **({"content_sibling_recovery_complete": not truncated}
+               if getattr(self, "_content_scope_path", None) else {}),
         }
+        marker = getattr(self, "_submission_marker_text", None)
+        if (marker and not getattr(self, "_content_scope_path", None)
+                and not any(marker in item.text for item in candidates)
+                and len(composer_scopes) == 1):
+            self._content_scope_path = composer_scopes[0]
+            try:
+                recovered, recovery_stats = self.collect_text_candidates()
+                if (recovery_stats["content_sibling_recovery_complete"]
+                        and any(marker in item.text for item in recovered)):
+                    # Expanded text does not establish complete coverage of
+                    # generation controls for the finished-without-prompt check.
+                    recovery_stats["response_controls_complete"] = False
+                    recovery_stats["content_sibling_recovery"] = True
+                    return recovered, recovery_stats
+            finally:
+                self._content_scope_path = None
         return candidates, stats
 
 
@@ -607,6 +678,79 @@ def _cancelled_capture_result(
     }
 
 
+def _response_control_kind(labels: list[str]) -> str | None:
+    # Exact control labels only: prose and code-block Copy buttons cannot by
+    # themselves establish completion. Unknown/localized UI keeps waiting.
+    names = {label.casefold() for label in labels}
+    if names & {"stop", "stop generating", "stop response", "stop responding", "stop streaming", "stop-button"}:
+        return "stop"
+    if names & {"good response", "thumbs up"}:
+        return "good"
+    if names & {"bad response", "thumbs down"}:
+        return "bad"
+    if names & {"copy", "copy response", "read aloud"}:
+        return "response_action"
+    return None
+
+
+def _path_parts(path: str) -> tuple[int, ...]:
+    if not path.startswith("FW."):
+        return ()
+    return tuple(int(part) for part in path[3:].split("."))
+
+
+def _completed_response_evidence(candidates: list[TextCandidate], match: dict, stats: dict) -> dict | None:
+    """Recognize a response footer belonging exclusively to the anchored reply.
+
+    Require both rating controls and a response action in the same message,
+    after its text, with no generation control in a fully observed window.
+    A footer from an earlier reply, missing AX data, or text stability alone
+    must never turn an unfinished response into a failure.
+    """
+    if stats.get("response_controls_complete") is not True:
+        return None
+    anchor = match.get("matched_candidate")
+    if not isinstance(anchor, TextCandidate) or not match.get("matched_submission_marker"):
+        return None
+    controls = stats.get("response_controls", [])
+    if any(_response_control_kind(control["labels"]) == "stop" for control in controls):
+        return None
+    enabled = [control for control in controls if control.get("enabled") is True]
+    good = [control for control in enabled if _response_control_kind(control["labels"]) == "good"]
+    bad = [control for control in enabled if _response_control_kind(control["labels"]) == "bad"]
+    actions = [control for control in enabled if _response_control_kind(control["labels"]) == "response_action"]
+    replies: dict[str, dict] = {}
+    for candidate in candidates[anchor.index + 1:]:
+        for positive in good:
+            for negative in bad:
+                paths = [candidate.path.split("."), positive["path"].split("."), negative["path"].split(".")]
+                common: list[str] = []
+                for parts in zip(*paths):
+                    if len(set(parts)) != 1:
+                        break
+                    common.append(parts[0])
+                scope = ".".join(common)
+                prefix = scope + "."
+                if not scope or anchor.path == scope or anchor.path.startswith(prefix):
+                    continue
+                body = [item for item in candidates if item.path == scope or item.path.startswith(prefix)]
+                if not body or any(item.index <= anchor.index for item in body):
+                    continue
+                body_end = max(_path_parts(path) for item in body for path in item.text_node_paths)
+                footer = [control for control in actions if control["path"].startswith(prefix)]
+                if not footer or any(_path_parts(control["path"]) <= body_end for control in (positive, negative)):
+                    continue
+                footer = [control for control in footer if _path_parts(control["path"]) > body_end]
+                if not footer:
+                    continue
+                replies[scope] = {
+                    "scope": scope,
+                    "response_text": "\n\n".join(item.text for item in body),
+                    "control_paths": sorted([positive["path"], negative["path"], footer[0]["path"]]),
+                }
+    return next(iter(replies.values())) if len(replies) == 1 else None
+
+
 def capture_response_after_feedback(
     feedback_text: str,
     app_name: str = "ChatGPT",
@@ -621,6 +765,7 @@ def capture_response_after_feedback(
 ) -> dict:
     del timeout_seconds
     reader = _AXReader(app_name=app_name, max_depth=max_depth, max_nodes=max_nodes)
+    reader._submission_marker_text = submission_marker_text
     last_stability_fingerprint: str | None = None
     last_response_text = ""
     stable_since: float | None = None
@@ -628,6 +773,9 @@ def capture_response_after_feedback(
     last_error: str | None = None
     last_stats: dict = {}
     last_match: dict = {}
+    completed_fingerprint: str | None = None
+    completed_since: float | None = None
+    completed_polls = 0
 
     while True:
         if _stop_requested(should_stop):
@@ -655,6 +803,40 @@ def capture_response_after_feedback(
                     require_sentinel_response=require_sentinel_response,
                 )
             last_match = _match_summary(match)
+            # This is a completion check, not a response timeout. Only extend
+            # the formerly indefinite missing/partial-prompt cases; all other
+            # capture decisions retain their existing behavior.
+            completion = None
+            if require_sentinel_response and match.get("sentinel_state") in {
+                SENTINEL_STATE_PENDING, SENTINEL_STATE_STREAMING_INCOMPLETE,
+            }:
+                completion = _completed_response_evidence(candidates, match, stats)
+            if completion is None:
+                completed_fingerprint, completed_since, completed_polls = None, None, 0
+            else:
+                fingerprint = repr((completion, last_match))
+                now = time.monotonic()
+                if fingerprint != completed_fingerprint:
+                    completed_fingerprint, completed_since, completed_polls = fingerprint, now, 1
+                else:
+                    completed_polls += 1
+                if completed_polls >= 2 and completed_since is not None and now - completed_since >= stable_seconds:
+                    return {
+                        **_cancelled_capture_result(
+                            stable_seconds=stable_seconds,
+                            poll_interval_seconds=poll_interval_seconds,
+                            successful_polls=completed_polls,
+                            require_sentinel_response=require_sentinel_response,
+                            last_stats=stats,
+                            last_match=last_match,
+                        ),
+                        "error": "ChatGPT finished without a usable prompt. This session needs attention; other sessions can continue.",
+                        "reason_code": COMPLETED_WITHOUT_PROMPT_REASON_CODE,
+                        "provisional": False,
+                        "stable": True,
+                        "response_text": completion["response_text"],
+                        "completion_evidence": completion,
+                    }
             if not match["ok"]:
                 last_error = match["error"]
                 if match.get("fatal"):
@@ -770,9 +952,11 @@ def capture_response_after_feedback(
                         ),
                     }
         except AXCaptureError as exc:
+            completed_fingerprint, completed_since, completed_polls = None, None, 0
             last_error = str(exc)
             last_match = {}
         except Exception as exc:
+            completed_fingerprint, completed_since, completed_polls = None, None, 0
             last_error = f"Unexpected AX capture error: {exc}"
             last_match = {}
 

@@ -675,7 +675,7 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         self.assertEqual(ledger.added_events[-1]["metadata"]["fallback_attempt_count"], 1)
         self.assertEqual(verification_results, [])
 
-    def test_axpress_fallback_enter_runs_after_three_seconds_not_full_poll_budget(self) -> None:
+    def test_axpress_fallback_enter_runs_after_ten_seconds_not_full_poll_budget(self) -> None:
         clock = {"now": 0.0}
 
         def monotonic() -> float:
@@ -711,16 +711,120 @@ class SubmitFeedbackToChatGPTServiceTests(unittest.TestCase):
         ]
         self.assertEqual(len(fallback_events), 1)
         previous = fallback_events[0]["metadata"]["previous_verification"]
-        self.assertEqual(previous["timeout_seconds"], CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS)
+        self.assertEqual(previous["timeout_seconds"], 10.0)
         self.assertLess(previous["poll_count"], CHATGPT_SUBMISSION_VERIFY_MAX_POLLS)
         self.assertGreaterEqual(previous["poll_count"], 1)
         self.assertEqual(send_calls, ["FW.2"])
         self.assertEqual(enter_calls, ["enter"])
         self.assertFalse(result.ok)
-        # Paste settle is 0.5s, then AXPress confirmation is capped at 3s.
+        # Paste settle is 0.5s, then AXPress confirmation is capped at 10s.
         # The full 40-poll budget would be ~14s of sleeps alone.
-        self.assertGreaterEqual(clock["now"], CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS)
-        self.assertLess(clock["now"], 8.0)
+        self.assertGreaterEqual(clock["now"], 10.0)
+        self.assertLess(clock["now"], 11.0)
+
+    def test_submission_marker_appearing_after_five_seconds_verifies_without_resending(self) -> None:
+        clock = {"now": 0.0}
+        calls = {"count": 0}
+
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            calls["count"] += 1
+            marker = str(marker_text)
+            if calls["count"] <= 3:
+                return _submission_observation(
+                    marker, composer_text=marker if calls["count"] > 1 else "", send_button=True,
+                )
+            # The composer clears immediately; transcript text arrives later.
+            return _submission_observation(
+                marker, candidates=[marker] if clock["now"] >= 5.5 else [],
+            )
+
+        result, _ledger, _copied, _send_calls, enter_calls = self._service(
+            inspection_function=inspect,
+            use_default_submission_verifier=True,
+            monotonic_function=lambda: clock["now"],
+            sleep_function=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(enter_calls, [])
+
+    def test_ax_read_errors_do_not_exhaust_fallback_deadline_before_draft_is_readable(self) -> None:
+        clock = {"now": 0.0}
+        calls = {"count": 0}
+
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            calls["count"] += 1
+            marker = str(marker_text)
+            if calls["count"] in (4, 5):
+                # Two failed window reads consume the confirmation deadline
+                # without providing composer evidence.
+                clock["now"] += CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS / 2
+                return _submission_observation(marker, ok=False, composer=False)
+            if calls["count"] >= 7:
+                return _submission_observation(marker, candidates=[marker])
+            return _submission_observation(
+                marker, composer_text=marker if calls["count"] > 1 else "", send_button=True,
+            )
+
+        result, ledger, _copied, _send_calls, enter_calls = self._service(
+            inspection_function=inspect,
+            use_default_submission_verifier=True,
+            monotonic_function=lambda: clock["now"],
+            sleep_function=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(enter_calls, ["enter"])
+        self.assertEqual(ledger.added_events[-1]["event_type"], "gpt_feedback_submission_verified")
+        self.assertEqual(ledger.added_events[-1]["metadata"]["fallback_attempt_count"], 1)
+
+    def test_ax_read_recovery_verifies_already_sent_message_without_enter(self) -> None:
+        clock = {"now": 0.0}
+        calls = {"count": 0}
+
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            calls["count"] += 1
+            marker = str(marker_text)
+            if calls["count"] in (4, 5):
+                clock["now"] += CHATGPT_AXPRESS_FALLBACK_VERIFY_TIMEOUT_SECONDS / 2
+                return _submission_observation(marker, ok=False, composer=False)
+            if calls["count"] >= 6:
+                return _submission_observation(marker, candidates=[marker])
+            return _submission_observation(
+                marker, composer_text=marker if calls["count"] > 1 else "", send_button=True,
+            )
+
+        result, _ledger, _copied, _send_calls, enter_calls = self._service(
+            inspection_function=inspect,
+            use_default_submission_verifier=True,
+            monotonic_function=lambda: clock["now"],
+            sleep_function=lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(enter_calls, [])
+
+    def test_persistent_ax_read_errors_remain_bounded_without_enter(self) -> None:
+        calls = {"count": 0}
+
+        def inspect(app_name: str, marker_text: str | None = None) -> dict:
+            calls["count"] += 1
+            marker = str(marker_text)
+            if calls["count"] >= 4:
+                return _submission_observation(marker, ok=False, composer=False)
+            return _submission_observation(
+                marker, composer_text=marker if calls["count"] > 1 else "", send_button=True,
+            )
+
+        result, ledger, _copied, _send_calls, enter_calls = self._service(
+            inspection_function=inspect, use_default_submission_verifier=True,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "chatgpt_submission_not_verified")
+        self.assertEqual(enter_calls, [])
+        self.assertEqual(calls["count"], 3 + CHATGPT_SUBMISSION_VERIFY_MAX_POLLS)
+        self.assertEqual(ledger.added_events[-1]["event_type"], "gpt_feedback_submission_failed")
 
     def test_fallback_enter_failure_does_not_verify_or_retry_again(self) -> None:
         verify_calls = []

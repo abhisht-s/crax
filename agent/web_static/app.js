@@ -41,6 +41,7 @@
   let pendingPairingCode = "";
   let pollingStopped = false;
   let stateRequestInFlight = false;
+  let stateRequestGeneration = 0;
   let pollTimer = null;
   let transientFailureDelay = 0;
   let currentStatePayload = null;
@@ -53,6 +54,7 @@
   let tickRequestInFlight = false;
   let retryRequestInFlight = false;
   let cancelRequestInFlight = false;
+  const cancelFeedback = new Map();
   let quotaContinueRequestInFlight = false;
   let leaseRequestInFlight = false;
   let leaseReleaseRequestInFlight = false;
@@ -67,7 +69,9 @@
   let progressStreamController = null;
   let progressStreamActive = false;
   let progressPollTimer = null;
-  let progressRequestInFlight = false;
+  let progressRequestInFlight = null;
+  let progressGeneration = 0;
+  let progressInitialized = false;
   let currentCodexSessionId = "";
   let currentCodexPlan = [];
 
@@ -235,7 +239,7 @@
     elements["reject-button"].addEventListener("click", () => onApproval("rejected"));
     elements["tick-button"].addEventListener("click", onTick);
     elements["retry-button"].addEventListener("click", onRetry);
-    elements["cancel-run-button"].addEventListener("click", onCancelRun);
+    elements["cancel-run-button"].addEventListener("click", () => onCancelRun(selectedRunId));
     elements["quota-force-continue-button"].addEventListener("click", onForceQuotaContinue);
     elements["lease-confirm-stale"].addEventListener("change", updateControlState);
     elements["lease-release-reason"].addEventListener("input", updateControlState);
@@ -417,6 +421,10 @@
     return requestJson("GET", `/api/runs/${encodeURIComponent(runId)}/progress?after_sequence=${cursor}`);
   }
 
+  async function getRunProgressSnapshot(runId) {
+    return requestJson("GET", `/api/runs/${encodeURIComponent(runId)}/progress?snapshot=1`);
+  }
+
   async function getProfileOptions() {
     return requestJson("GET", "/api/execution-profile/options");
   }
@@ -472,9 +480,9 @@
   async function requestForceQuotaResume(runId) {
     const target = runId || selectedRunId;
     if (target) {
-      return requestJson("POST", `/api/runs/${encodeURIComponent(target)}/quota-resume`, {});
+      return requestJson("POST", `/api/runs/${encodeURIComponent(target)}/continue`, {});
     }
-    return requestJson("POST", "/api/runs/current/quota-resume", {});
+    return requestJson("POST", "/api/runs/current/continue", {});
   }
 
   async function focusRun(runId) {
@@ -556,7 +564,11 @@
       return;
     }
     stateRequestInFlight = true;
+    const generation = ++stateRequestGeneration;
     const listResult = await getSessionList();
+    if (generation !== stateRequestGeneration) {
+      return;
+    }
     if (pollingStopped) {
       stateRequestInFlight = false;
       return;
@@ -582,12 +594,15 @@
       renderChatGPTLaneStatus(listResult);
       renderSessionCapacity(listResult);
     }
-    const targetRunId = resolveSelectedRunId(listResult);
+    const targetRunId = listResult.ok ? resolveSelectedRunId(listResult) : selectedRunId;
     let result;
     if (targetRunId) {
       result = await getRunState(targetRunId);
     } else {
       result = await getCurrentState();
+    }
+    if (generation !== stateRequestGeneration) {
+      return;
     }
     stateRequestInFlight = false;
     if (pollingStopped) {
@@ -610,7 +625,7 @@
     setConnectionState("connected", remoteDevice ? "Remote connected" : "Connected");
     renderState(result);
     await refreshLeaseStatus();
-    if (pollingStopped) {
+    if (pollingStopped || generation !== stateRequestGeneration) {
       return;
     }
     scheduleNextPoll(nextPollInterval(result));
@@ -940,7 +955,7 @@
     if (cancelRequestInFlight || !authenticated) {
       return;
     }
-    const targetRunId = runId || selectedRunId;
+    const targetRunId = typeof runId === "string" && runId ? runId : selectedRunId;
     const confirmMessage = targetRunId
       ? `Stop session ${targetRunId} and terminate its Codex process? Unrelated sessions keep running.`
       : "Stop the current CRAX run and terminate an active Codex process?";
@@ -948,14 +963,20 @@
       return;
     }
     cancelRequestInFlight = true;
+    cancelFeedback.delete(targetRunId);
     updateControlState();
-    setText(elements["cancel-run-status"], "Stopping run...");
+    if (targetRunId === selectedRunId) {
+      setText(elements["cancel-run-status"], "Stopping run...");
+    }
     const result = await requestCancel(targetRunId);
     cancelRequestInFlight = false;
-    setText(
-      elements["cancel-run-status"],
-      result.ok ? "Stop requested." : safeMessage(result),
-    );
+    cancelFeedback.set(targetRunId, {
+      message: result.ok ? "" : safeMessage(result),
+      termination: result.metadata && result.metadata.process_termination,
+    });
+    if (targetRunId === selectedRunId) {
+      setText(elements["cancel-run-status"], result.ok ? "Controller stopped." : safeMessage(result));
+    }
     if (result.status !== 401) {
       await forceRefresh();
     }
@@ -968,13 +989,13 @@
     }
     quotaContinueRequestInFlight = true;
     updateControlState();
-    setText(elements["quota-force-continue-status"], "Resuming Codex...");
-    const result = await requestForceQuotaResume(selectedRunId);
+    setText(elements["quota-force-continue-status"], "Sending continue prompt to Codex...");
+    const targetRunId = selectedRunId;
+    const result = await requestForceQuotaResume(targetRunId);
     quotaContinueRequestInFlight = false;
-    setText(
-      elements["quota-force-continue-status"],
-      result.ok ? "Continue started." : safeMessage(result),
-    );
+    if (targetRunId === selectedRunId) {
+      setText(elements["quota-force-continue-status"], result.ok ? "Continuing in the same Codex session." : safeMessage(result));
+    }
     if (result.status !== 401) {
       await forceRefresh();
     }
@@ -987,11 +1008,13 @@
     }
     selectedRunId = runId;
     selectedRunIdExplicit = true;
+    // Detach the old view before yielding to either HTTP request.
+    currentStatePayload = { state: { run_id: runId } };
+    renderState(currentStatePayload);
     renderSessionList(sessionListPayload);
-    const result = await focusRun(runId);
-    if (result.status !== 401) {
-      await forceRefresh();
-    }
+    const refresh = forceRefresh();
+    await focusRun(runId);
+    await refresh;
   }
 
   async function onReleaseStaleLease() {
@@ -1050,6 +1073,8 @@
 
   async function forceRefresh() {
     clearPollTimer();
+    // Earlier requests may still finish, but no longer own this view or flag.
+    stateRequestGeneration += 1;
     stateRequestInFlight = false;
     await refreshCurrentState();
     await refreshProgress();
@@ -1069,35 +1094,47 @@
       clearProgressPollTimer();
       resetProgress(normalizedRunId);
       renderCodexLiveProgress({}, currentReadModel());
-      startProgressStream();
-      scheduleProgressPoll(PROGRESS_POLL_MS);
-      return;
     }
-    if (!progressStreamActive && progressPollTimer === null) {
+    if (!progressInitialized) {
+      refreshProgress();
+    } else if (!progressStreamActive && progressPollTimer === null) {
       startProgressStream();
-      scheduleProgressPoll(PROGRESS_POLL_MS);
+      if (!progressStreamActive) {
+        scheduleProgressPoll(PROGRESS_POLL_MS);
+      }
     }
   }
 
   function resetProgress(runId) {
+    progressGeneration += 1;
+    progressRequestInFlight = null;
+    progressInitialized = false;
     progressRunId = runId;
     progressEvents = [];
     progressAfterSequence = 0;
     currentCodexSessionId = "";
     currentCodexPlan = [];
+    cancelFeedback.clear();
+    setText(elements["cancel-run-status"], "");
+    setText(elements["quota-force-continue-status"], "");
   }
 
   function startProgressStream() {
-    if (!authenticated || !progressRunId || progressStreamController || !window.ReadableStream) {
+    if (!authenticated || !progressRunId || !progressInitialized || progressStreamController || !window.ReadableStream) {
       return;
     }
-    progressStreamController = new AbortController();
+    const controller = new AbortController();
+    progressStreamController = controller;
     progressStreamActive = true;
-    readProgressStream(progressRunId, progressAfterSequence, progressStreamController)
+    readProgressStream(progressRunId, progressAfterSequence, controller)
       .catch(() => {})
       .finally(() => {
+        if (progressStreamController !== controller) {
+          return;
+        }
         progressStreamActive = false;
         progressStreamController = null;
+        scheduleProgressPoll(PROGRESS_POLL_MS);
       });
   }
 
@@ -1121,6 +1158,9 @@
       credentials: "same-origin",
       signal: controller.signal,
     });
+    if (controller.signal.aborted || progressStreamController !== controller) {
+      return;
+    }
     if (response.status === 401) {
       pollingStopped = true;
       clearPollTimer();
@@ -1137,6 +1177,9 @@
     let buffer = "";
     while (true) {
       const result = await reader.read();
+      if (controller.signal.aborted || progressStreamController !== controller) {
+        return;
+      }
       if (result.done) {
         buffer += decoder.decode();
         consumeProgressFrames(buffer, expectedRunId);
@@ -1160,7 +1203,7 @@
   }
 
   function handleProgressFrame(frame, expectedRunId) {
-    if (expectedRunId && progressRunId && String(expectedRunId) !== String(progressRunId)) {
+    if (String(expectedRunId) !== progressRunId) {
       return;
     }
     const lines = frame.split(/\r?\n/);
@@ -1197,31 +1240,41 @@
   }
 
   async function refreshProgress() {
-    if (!authenticated || !progressRunId || progressRequestInFlight) {
+    if (!authenticated || pollingStopped || !progressRunId || progressRequestInFlight) {
       return;
     }
-    progressRequestInFlight = true;
-    const result = progressRunId
-      ? await getRunProgress(progressRunId, progressAfterSequence)
-      : await getCurrentProgress(progressAfterSequence);
-    progressRequestInFlight = false;
-    if (result.status === 401) {
-      return;
-    }
-    if (result.ok) {
-      applyProgressPayload(result);
-      renderCodexLiveProgress({}, currentReadModel());
-      updateControlState();
-    }
-    if (!progressStreamActive && progressRunId) {
-      scheduleProgressPoll(PROGRESS_POLL_MS);
+    const request = { runId: progressRunId, generation: progressGeneration };
+    progressRequestInFlight = request;
+    try {
+      const result = progressInitialized
+        ? await getRunProgress(request.runId, progressAfterSequence)
+        : await getRunProgressSnapshot(request.runId);
+      if (request.generation !== progressGeneration || request.runId !== progressRunId || pollingStopped) {
+        return;
+      }
+      if (result.ok && applyProgressPayload(result)) {
+        progressInitialized = true;
+        renderCodexLiveProgress({}, currentReadModel());
+        updateControlState();
+        startProgressStream();
+      }
+    } finally {
+      if (progressRequestInFlight === request) {
+        progressRequestInFlight = null;
+        if (!progressStreamActive) {
+          scheduleProgressPoll(PROGRESS_POLL_MS);
+        }
+      }
     }
   }
 
   function scheduleProgressPoll(delay) {
     clearProgressPollTimer();
     if (!pollingStopped && progressRunId) {
-      progressPollTimer = window.setTimeout(refreshProgress, delay);
+      progressPollTimer = window.setTimeout(() => {
+        progressPollTimer = null;
+        refreshProgress();
+      }, delay);
     }
   }
 
@@ -1240,33 +1293,36 @@
       ? metadata.progress
       : null;
     if (!progress) {
-      return;
+      return false;
     }
     const runId = progress.run_id ? String(progress.run_id) : "";
-    if (runId && progressRunId && runId !== progressRunId) {
-      return;
-    }
-    if (runId && !progressRunId) {
-      progressRunId = runId;
+    if (!runId || runId !== progressRunId) {
+      return false;
     }
     const events = Array.isArray(progress.events) ? progress.events : [];
-    for (const event of events) {
+    for (const event of events.slice().sort((a, b) => (a && a.sequence || 0) - (b && b.sequence || 0))) {
       appendProgressEvent(event, progressRunId);
     }
     if (Number.isInteger(progress.latest_sequence)) {
       progressAfterSequence = Math.max(progressAfterSequence, progress.latest_sequence);
     }
+    return true;
   }
 
   function appendProgressEvent(event, expectedRunId) {
     if (!event || typeof event !== "object") {
       return;
     }
+    if (String(expectedRunId) !== progressRunId) {
+      return;
+    }
     if (event.run_id && expectedRunId && String(event.run_id) !== String(expectedRunId)) {
       return;
     }
     const sequence = Number.isInteger(event.sequence) ? event.sequence : 0;
-    if (sequence && progressEvents.some((item) => item.sequence === sequence)) {
+    // Both transports deliver ordered ranges. A late overlapping range must
+    // never replay old events, even after they have left the memory window.
+    if (sequence && sequence <= progressAfterSequence) {
       return;
     }
     if (event.kind === "process_started") {
@@ -1286,7 +1342,11 @@
       progressAfterSequence = Math.max(progressAfterSequence, sequence);
     }
     if (progressEvents.length > PROGRESS_EVENT_MEMORY_LIMIT) {
-      progressEvents = progressEvents.slice(-PROGRESS_EVENT_MEMORY_LIMIT);
+      const notes = progressEvents.filter((item) => item.kind === "assistant_commentary")
+        .slice(-PROGRESS_EVENT_RENDER_LIMIT);
+      const recent = progressEvents.slice(-PROGRESS_EVENT_MEMORY_LIMIT);
+      progressEvents = Array.from(new Set([...notes, ...recent]))
+        .sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
     }
   }
 
@@ -1422,7 +1482,7 @@
 
   function buildSessionCard(session) {
     const card = document.createElement("article");
-    const focused = session.run_id === selectedRunId || session.focused;
+    const focused = selectedRunId ? session.run_id === selectedRunId : session.focused;
     card.className = focused ? "session-card focused" : "session-card";
     card.setAttribute("data-run-id", session.run_id);
     card.addEventListener("click", () => onSelectSession(session.run_id));
@@ -1477,7 +1537,7 @@
     actions.className = "session-card-actions";
     actions.addEventListener("click", (event) => event.stopPropagation());
 
-    if (!session.terminal) {
+    if (session.live || session.action_running || session.codex_running || !session.terminal) {
       const stop = document.createElement("button");
       stop.type = "button";
       stop.className = "danger";
@@ -1703,7 +1763,7 @@
     elements["codex-live-state"].className = `status-badge ${label.className}`;
     setText(
       elements["codex-live-session-id"],
-      currentCodexSessionId || (progressRunId ? "Not available yet" : "None"),
+      currentCodexSessionId || (model && model.codex_session && model.codex_session.session_id) || (progressRunId ? "Not available yet" : "None"),
     );
     const quotaWait = model && model.quota_wait && typeof model.quota_wait === "object"
       ? model.quota_wait
@@ -2099,23 +2159,23 @@
     elements["start-additional-button"].classList.toggle("hidden", liveCount < 1);
     elements["start-additional-button"].disabled = disableAdditional;
     elements["cancel-run-button"].disabled =
-      !authenticated || !activeRun || cancelRequestInFlight || Boolean(model && model.terminal);
-    const quotaWaitThreadId = String(
-      (model && model.quota_wait && model.quota_wait.thread_id) || "",
-    ).trim();
-    const knownCodexSessionId = Boolean(currentCodexSessionId || quotaWaitThreadId);
-    const quotaWaitActive = Boolean(
-      model &&
-      model.quota_wait &&
-      model.quota_wait.resume_at &&
-      !quotaResumeIsLive(runtime),
-    );
+      !authenticated || !activeRun || cancelRequestInFlight;
+    if (!cancelRequestInFlight) {
+      const feedback = cancelFeedback.get(selectedRunId) || {};
+      const termination = runtime.cancel_termination || feedback.termination || {};
+      setText(elements["cancel-run-status"], runtime.cancel_requested
+        ? (termination.terminated ? "Codex terminated; controller stopped."
+          : termination.reason_code === "codex_process_not_running" ? "Controller stopped; no Codex process running."
+          : "Controller stopped; Codex termination unconfirmed. Try Emergency stop again.")
+        : feedback.message || "");
+    }
+    // Every stopped run offers continuation. The server checks whether the
+    // session can resume and returns a visible reason if it cannot.
     const forceContinueAvailable = Boolean(
       authenticated &&
       model &&
-      knownCodexSessionId &&
-      quotaWaitActive &&
       !running &&
+      !runtime.worker_running &&
       !quotaContinueRequestInFlight,
     );
     elements["quota-force-continue-button"].disabled = !forceContinueAvailable;

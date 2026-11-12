@@ -1777,6 +1777,8 @@ class NavigationBeforeGateTests(unittest.TestCase):
                 "project_open_truncated_by_node_limit",
                 "project_open_truncated_by_depth_limit",
                 "project_open_stability_status",
+                "project_open_stability_error",
+                "project_open_axpress_geometry_fallback",
             },
         )
         self.assertFalse(diagnostics["destination_confirmed"])
