@@ -8,6 +8,9 @@ ACTIVATE_APP_METHOD = "osascript_activate_app"
 ACTIVATE_BUNDLE_METHOD = "osascript_activate_bundle"
 FRONTMOST_APP_METHOD = "osascript_system_events_frontmost_app"
 CLASSIC_CHATGPT_BUNDLE_ID = "com.openai.chat"
+# The new ChatGPT desktop app (formerly the Codex app). It also presents itself as
+# "ChatGPT", so it must always be targeted by bundle id.
+NEW_CHATGPT_BUNDLE_ID = "com.openai.codex"
 
 
 def _applescript_string(value: str) -> str:

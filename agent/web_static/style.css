@@ -806,3 +806,44 @@ select:focus-visible {
     margin-bottom: 0.25rem;
   }
 }
+
+/* Copy icon next to IDs */
+dd.copyable {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+dd.copyable > span {
+  overflow-wrap: anywhere;
+}
+
+button.copy-button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+button.copy-button:hover:not(:disabled),
+button.copy-button:focus-visible {
+  border-color: var(--border);
+  background: transparent;
+  color: var(--text);
+}
+
+button.copy-button.copied {
+  color: var(--accent);
+}
+
+button.copy-button.hidden {
+  display: none;
+}

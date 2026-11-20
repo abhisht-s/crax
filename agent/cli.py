@@ -111,6 +111,15 @@ from agent.run_status_policy import status_from_supervision_decision
 from agent.supervise import SuperviseAction, detect_next_supervise_action
 from agent.supervision_services import run_supervision_step
 from agent import ledger
+from agent.chatgpt_target import (
+    CHATGPT_TARGET_CLASSIC,
+    SOURCE_DEFAULT as CHATGPT_TARGET_SOURCE_DEFAULT,
+    ChatGPTTargetError,
+    ensure_run_chatgpt_target,
+    get_run_chatgpt_target,
+    resolve_chatgpt_target,
+    services_for_target,
+)
 
 
 DEFAULT_SHELL_TIMEOUT_SECONDS = 30
@@ -2536,6 +2545,27 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
 
     approval_mode = _supervise_approval_mode(args)
 
+    # Which ChatGPT app this run hands off to. Without --chatgpt-app or
+    # CRAX_CHATGPT_APP the run's recorded app is used (Classic when none is
+    # recorded). An explicit choice must match the run, or is recorded for a run
+    # that has not handed off yet; a run never switches apps.
+    try:
+        target_selection = resolve_chatgpt_target(getattr(args, "chatgpt_app", None))
+        if target_selection.source == CHATGPT_TARGET_SOURCE_DEFAULT:
+            run_target = get_run_chatgpt_target(args.run_id, ledger=ledger)
+        else:
+            run_target = ensure_run_chatgpt_target(args.run_id, target_selection, ledger=ledger)
+    except ChatGPTTargetError as exc:
+        print(f"error: {exc} ({exc.reason_code})", file=sys.stderr)
+        return 2
+    new_app_services = (
+        services_for_target(run_target.target).as_step_kwargs()
+        if run_target.target != CHATGPT_TARGET_CLASSIC
+        else None
+    )
+    if new_app_services is not None:
+        print(f"ChatGPT app: new ({run_target.bundle_id}).")
+
     def submit_service(
         run_id: str,
         run: dict,
@@ -2658,6 +2688,15 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
             repo_snapshot = capture_git_snapshot(args.repo)
             _print_supervise_run_gate(plan, repo_snapshot)
 
+    # Classic runs: the CLI's own submit/capture wrappers and the default
+    # destination services, exactly as before. New-app runs: all four new-app
+    # services (submit, capture, destination adapter, navigation).
+    chatgpt_services: dict = (
+        new_app_services
+        if new_app_services is not None
+        else {"submit_service": submit_service, "capture_service": capture_service}
+    )
+
     def run_step(
         *,
         approval_decision: str | None = None,
@@ -2686,13 +2725,12 @@ def _run_supervise_command(args: argparse.Namespace) -> int:
             capture_stable_seconds=args.stable_seconds,
             ledger=ledger,
             planner=detect_next_supervise_action,
-            submit_service=submit_service,
-            capture_service=capture_service,
             extraction_service=extraction_service,
             extracted_prompt_execution_service=run_prompt_service,
             send_auto_safety_evaluator=_send_plan_auto_safe,
             auto_stop_recorder=auto_stop_recorder,
             before_action_callback=before_action if emit_pre_action else None,
+            **chatgpt_services,
         )
 
     while True:

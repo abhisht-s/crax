@@ -4,6 +4,7 @@ import argparse
 import hmac
 import json
 import re
+import shutil
 import threading
 import time
 from dataclasses import asdict, is_dataclass
@@ -26,7 +27,14 @@ from agent.remote_access import (
 from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
     CODEX_DEFAULT_SELECTION,
+    CODING_AGENT_EXECUTABLES,
+    DEFAULT_CODING_AGENT,
+    SELECTABLE_CODING_AGENTS,
     RunDestinationBinding,
+    allowed_model_selections,
+    allowed_reasoning_effort_selections,
+    coding_agent_label,
+    model_effort_compatible,
     execution_profile_options,
 )
 
@@ -78,6 +86,7 @@ class LocalControllerServer:
         remote_config: RemoteAccessConfig | None = None,
         remote_access: RemoteAccessManager | None = None,
         max_active_sessions: int | None = None,
+        chatgpt_target: str | None = None,
     ) -> None:
         if host != LOCAL_SERVER_BIND_HOST:
             raise ValueError("Local controller server must bind to 127.0.0.1.")
@@ -90,6 +99,8 @@ class LocalControllerServer:
             controller_kwargs: dict[str, Any] = {}
             if max_active_sessions is not None:
                 controller_kwargs["max_active_sessions"] = max_active_sessions
+            if chatgpt_target is not None:
+                controller_kwargs["chatgpt_target"] = chatgpt_target
             self.controller = LocalController(session=session, **controller_kwargs)
             self.session = self.controller.session
         self.remote_access = remote_access or (
@@ -1064,6 +1075,8 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     }
     optional = {
         "model",
+        "coding_agent",
+        "reasoning_effort",
         "allow_destination_navigation",
         "full_access_confirmation",
         "additional_session",
@@ -1101,16 +1114,50 @@ def _start_run_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
             f"Invalid browser sandbox. Allowed values: {allowed_text}.",
         )
     kwargs["sandbox"] = sandbox
-    if "model" in payload:
-        model = payload["model"]
-        if not isinstance(model, str) or model not in ALLOWED_CODEX_MODEL_SELECTIONS:
-            allowed_text = ", ".join(ALLOWED_CODEX_MODEL_SELECTIONS)
+    coding_agent = DEFAULT_CODING_AGENT
+    if "coding_agent" in payload:
+        coding_agent = payload["coding_agent"]
+        if not isinstance(coding_agent, str) or coding_agent not in SELECTABLE_CODING_AGENTS:
             raise LocalServerError(
                 400,
-                "invalid_codex_model",
-                f"Invalid Codex model. Allowed values: {allowed_text}.",
+                "invalid_coding_agent",
+                f"Invalid coding agent. Allowed values: {', '.join(SELECTABLE_CODING_AGENTS)}.",
+            )
+        kwargs["coding_agent"] = coding_agent
+    if "model" in payload:
+        model = payload["model"]
+        allowed_models = allowed_model_selections(coding_agent)
+        if not isinstance(model, str) or model not in allowed_models:
+            allowed_text = ", ".join(allowed_models)
+            if coding_agent == DEFAULT_CODING_AGENT:
+                raise LocalServerError(
+                    400,
+                    "invalid_codex_model",
+                    f"Invalid Codex model. Allowed values: {allowed_text}.",
+                )
+            raise LocalServerError(
+                400,
+                f"invalid_{coding_agent}_model",
+                f"Invalid {coding_agent_label(coding_agent)} model. Allowed values: {allowed_text}.",
             )
         kwargs["model"] = model
+    if "reasoning_effort" in payload:
+        effort = payload["reasoning_effort"]
+        allowed_efforts = allowed_reasoning_effort_selections(coding_agent)
+        if not isinstance(effort, str) or effort not in allowed_efforts:
+            raise LocalServerError(
+                400,
+                "invalid_reasoning_effort",
+                f"Invalid reasoning effort for {coding_agent_label(coding_agent)}. "
+                f"Allowed values: {', '.join(allowed_efforts)}.",
+            )
+        if not model_effort_compatible(coding_agent, payload.get("model", CODEX_DEFAULT_SELECTION), effort):
+            raise LocalServerError(
+                400,
+                "invalid_reasoning_effort",
+                f"Model {payload.get('model')} does not support reasoning effort {effort}.",
+            )
+        kwargs["reasoning_effort"] = effort
     if "allow_destination_navigation" in payload:
         allow_navigation = payload["allow_destination_navigation"]
         if not isinstance(allow_navigation, bool):
@@ -1435,10 +1482,54 @@ def _execution_profile_options_payload(
         _option_payload(value, "Codex default" if value == CODEX_DEFAULT_SELECTION else value)
         for value in options["model_options"]
     ]
+    coding_agent_options = []
+    for agent in options.get("coding_agent_options", [DEFAULT_CODING_AGENT]):
+        executable = CODING_AGENT_EXECUTABLES.get(agent)
+        available = executable is not None and shutil.which(executable) is not None
+        option = _option_payload(
+            agent,
+            coding_agent_label(agent),
+            None if available else f"The `{executable}` CLI was not found on this computer's PATH.",
+        )
+        option["available"] = available
+        coding_agent_options.append(option)
+    model_options_by_agent = {
+        agent: [_model_option_payload(agent, value) for value in values]
+        for agent, values in options.get(
+            "model_options_by_agent", {DEFAULT_CODING_AGENT: options["model_options"]}
+        ).items()
+    }
+    reasoning_effort_options_by_agent = {
+        agent: [_effort_option_payload(agent, value) for value in values]
+        for agent, values in options.get("reasoning_effort_options_by_agent", {}).items()
+    }
+    sandbox_options_by_agent = {
+        agent: [
+            _option_payload(
+                value,
+                _sandbox_label(value, agent),
+                _sandbox_description(value, agent),
+            )
+            for value in options["sandbox_options"]
+            if value in allowed_sandboxes
+        ]
+        for agent in model_options_by_agent
+    }
     return {
         "ok": True,
         "sandbox_options": sandbox_options,
         "model_options": model_options,
+        "coding_agent_options": coding_agent_options,
+        "model_options_by_agent": model_options_by_agent,
+        "reasoning_effort_options_by_agent": reasoning_effort_options_by_agent,
+        "sandbox_options_by_agent": sandbox_options_by_agent,
+        "agent_presentation": {
+            agent: {
+                "approval_policy_label": _approval_policy_label(agent),
+                "autonomous_button_label": f"Use {_sandbox_label('danger-full-access', agent).split(' (')[0]}",
+            }
+            for agent in model_options_by_agent
+        },
         "locked": {
             "reasoning_effort": _option_payload(options["reasoning_effort"], "Codex default"),
             "approval_policy": _option_payload(
@@ -1449,6 +1540,61 @@ def _execution_profile_options_payload(
     }
 
 
+def _default_model_label(coding_agent: str) -> str:
+    if coding_agent == "claude_code":
+        # Runs resolve "default" to the user's own Claude settings (model/effortLevel).
+        from agent.claude_code_provider import user_claude_defaults
+
+        defaults = user_claude_defaults()
+        if defaults.get("model"):
+            return f"Default (your Claude setting: {defaults['model']})"
+        return "Default (Claude Code built-in)"
+    return f"{coding_agent_label(coding_agent)} default"
+
+
+_EFFORT_LABELS = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "Extra high (xhigh)", "max": "Max"}
+
+
+def _model_option_payload(coding_agent: str, value: str) -> dict[str, Any]:
+    if value == CODEX_DEFAULT_SELECTION:
+        description = None
+        if coding_agent == "claude_code":
+            from agent.claude_code_provider import user_claude_defaults
+
+            defaults = user_claude_defaults()
+            description = (
+                f"Same as running claude yourself: {defaults['model']}"
+                + (f", effort {defaults['effort']}" if defaults.get("effort") else "")
+                if defaults.get("model")
+                else "Claude Code's own default model"
+            )
+        option: dict[str, Any] = _option_payload(value, _default_model_label(coding_agent), description)
+        option["group"] = "main"
+        return option
+    if coding_agent == "claude_code":
+        from agent.claude_code_models import CLAUDE_MODELS_BY_ID
+
+        model = CLAUDE_MODELS_BY_ID.get(value)
+        if model is not None:
+            option = _option_payload(value, model.label, model.description)
+            option["group"] = model.group
+            option["efforts"] = list(model.efforts)
+            return option
+    return _option_payload(value, value)
+
+
+def _effort_option_payload(coding_agent: str, value: str) -> dict[str, str]:
+    if value == CODEX_DEFAULT_SELECTION:
+        if coding_agent == "claude_code":
+            from agent.claude_code_provider import user_claude_defaults
+
+            effort = user_claude_defaults().get("effort")
+            return _option_payload(value, f"Default (your Claude setting: {effort})" if effort
+                                   else "Default (the model's own)")
+        return _option_payload(value, f"{coding_agent_label(coding_agent)} default")
+    return _option_payload(value, _EFFORT_LABELS.get(value, value))
+
+
 def _option_payload(value: str, label: str, description: str | None = None) -> dict[str, str]:
     payload = {"value": value, "label": label}
     if description is not None:
@@ -1456,7 +1602,10 @@ def _option_payload(value: str, label: str, description: str | None = None) -> d
     return payload
 
 
-def _sandbox_label(value: str) -> str:
+def _sandbox_label(value: str, coding_agent: str = DEFAULT_CODING_AGENT) -> str:
+    if coding_agent == "claude_code" and value == "danger-full-access":
+        # Claude Code's autonomous level runs in auto mode (agent/claude_code_provider.py).
+        return "Auto Mode (Autonomous)"
     return {
         "read-only": "Read Only",
         "workspace-write": "Workspace Write",
@@ -1464,7 +1613,31 @@ def _sandbox_label(value: str) -> str:
     }.get(value, value)
 
 
-def _sandbox_description(value: str) -> str:
+_CLAUDE_CODE_SANDBOX_DESCRIPTIONS = {
+    "read-only": (
+        "Claude Code can read and search the workspace. Edits and shell commands are not "
+        "allowed for this dashboard run."
+    ),
+    "workspace-write": (
+        "Claude Code can edit files in this repository. Shell commands run in the macOS "
+        "sandbox, limited to this repository; anything that would ask permission is refused."
+    ),
+    "danger-full-access": (
+        "Claude Code runs in auto mode: its safety classifier approves or blocks each action, "
+        "and anything it would ask about is refused. The loop does not request per-run approval."
+    ),
+}
+
+
+def _approval_policy_label(coding_agent: str = DEFAULT_CODING_AGENT) -> str:
+    if coding_agent == "claude_code":
+        return "Claude Code default — Auto Mode decides instead of asking"
+    return "Codex default — Full Access bypasses approvals"
+
+
+def _sandbox_description(value: str, coding_agent: str = DEFAULT_CODING_AGENT) -> str:
+    if coding_agent == "claude_code":
+        return _CLAUDE_CODE_SANDBOX_DESCRIPTIONS.get(value, "")
     return {
         "read-only": (
             "Codex can inspect the workspace. Edits are not allowed for this dashboard run."
@@ -1548,6 +1721,16 @@ def main(argv: list[str] | None = None) -> None:
             "additional_session start request."
         ),
     )
+    parser.add_argument(
+        "--chatgpt-app",
+        choices=("classic", "new"),
+        default=None,
+        help=(
+            "ChatGPT desktop app that new runs hand off to: classic (com.openai.chat) or "
+            "new (com.openai.codex). Default: the CRAX_CHATGPT_APP environment variable, else classic. "
+            "Existing runs keep the app they started with."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.host != LOCAL_SERVER_BIND_HOST:
         parser.exit(2, "error: local server host must be 127.0.0.1\n")
@@ -1573,6 +1756,7 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         remote_config=remote_config,
         max_active_sessions=args.max_active_sessions,
+        chatgpt_target=args.chatgpt_app,
     )
     try:
         server.start()

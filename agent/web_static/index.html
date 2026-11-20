@@ -94,7 +94,15 @@
             <span class="form-note">Operator-approved: before each handoff, open the bound Project and chat, then verify. Disabled by default; the read-only gate still decides.</span>
           </span>
 
-          <label for="sandbox-select">Codex Permission Preset</label>
+          <label for="coding-agent-select">Coding agent</label>
+          <div class="field-stack">
+            <select id="coding-agent-select" name="coding_agent" aria-describedby="coding-agent-description">
+              <option value="">Loading...</option>
+            </select>
+            <p id="coding-agent-description" class="form-note">Runs every prompt for this session. Fixed once the run starts.</p>
+          </div>
+
+          <label id="sandbox-label" for="sandbox-select">Codex Permission Preset</label>
           <div class="field-stack">
             <select id="sandbox-select" name="sandbox" aria-describedby="permission-preset-description">
               <option value="">Loading...</option>
@@ -103,13 +111,21 @@
             <p id="permission-preset-description" class="form-note">Codex can inspect the workspace. Edits are not allowed for this dashboard run.</p>
           </div>
 
-          <label for="model-select">Codex model</label>
-          <select id="model-select" name="model">
-            <option value="">Loading...</option>
-          </select>
+          <label id="model-label" for="model-select">Codex model</label>
+          <div class="field-stack">
+            <select id="model-select" name="model">
+              <option value="">Loading...</option>
+            </select>
+            <p id="model-description" class="form-note"></p>
+          </div>
 
-          <span>Reasoning</span>
-          <span id="reasoning-lock" class="locked-value">Codex default</span>
+          <label id="reasoning-label" for="effort-select">Reasoning</label>
+          <div class="field-stack">
+            <span id="reasoning-lock" class="locked-value">Codex default</span>
+            <select id="effort-select" name="reasoning_effort" class="hidden">
+              <option value="">Loading...</option>
+            </select>
+          </div>
 
           <span>Approval</span>
           <span id="approval-lock" class="locked-value">Codex default — Full Access bypasses approvals</span>
@@ -135,13 +151,14 @@
           </summary>
           <div class="disclosure-content">
             <dl class="summary-grid">
-              <div><dt>Run ID</dt><dd id="run-id">None</dd></div>
+              <div><dt>Run ID</dt><dd class="copyable"><span id="run-id">None</span><button id="copy-run-id-button" type="button" class="copy-button hidden" title="Copy run ID" aria-label="Copy run ID"><svg class="copy-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><rect x="5" y="5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button></dd></div>
               <div><dt>Repository</dt><dd id="run-repository">None</dd></div>
               <div><dt>Bound Project</dt><dd id="run-project-title">None</dd></div>
               <div><dt>Bound Chat</dt><dd id="run-chat-title">None</dd></div>
               <div><dt>Destination binding</dt><dd id="run-destination-state">No autonomous destination binding</dd></div>
               <div><dt>Navigation approved</dt><dd id="run-navigation-approved">Disabled</dd></div>
               <div><dt>Handoff phase</dt><dd id="run-handoff-phase">None</dd></div>
+              <div><dt>Coding agent</dt><dd id="run-coding-agent">None</dd></div>
               <div><dt>Permission preset / sandbox</dt><dd id="run-sandbox">None</dd></div>
               <div><dt>Model</dt><dd id="run-model">None</dd></div>
               <div><dt>Reasoning</dt><dd id="run-reasoning">None</dd></div>
@@ -209,7 +226,7 @@
         <h2 id="codex-live-heading">Codex Working Notes</h2>
         <p id="codex-live-state" class="status-badge status-muted" aria-live="polite">No active run</p>
         <dl class="summary-grid codex-live-grid">
-          <div><dt>Codex session ID</dt><dd id="codex-live-session-id">Not available yet</dd></div>
+          <div><dt id="codex-live-session-label">Codex session ID</dt><dd class="copyable"><span id="codex-live-session-id">Not available yet</span><button id="copy-session-id-button" type="button" class="copy-button hidden" title="Copy session ID" aria-label="Copy session ID"><svg class="copy-icon" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false"><rect x="5" y="5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button></dd></div>
           <div><dt>Usage limit</dt><dd id="codex-live-quota-wait">None</dd></div>
           <div><dt>Final message</dt><dd id="codex-live-final">Not available yet</dd></div>
           <div><dt>Latest issue</dt><dd id="codex-live-error">None</dd></div>

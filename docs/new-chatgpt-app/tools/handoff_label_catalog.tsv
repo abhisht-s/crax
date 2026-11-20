@@ -1,0 +1,99 @@
+appShell.skipToContent	Skip to content	app-initial-61c077dcc1af.js
+chatgptConversations.composer.addBrowserTabs	Add browser tabs	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.addBrowserTabs.installBrowserExtension	Install the {browser} extension to ask about your browser	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.addBrowserTabs.useOpenTabs	Use open tabs	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.addFiles	Add files	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.addFilesDescription	Upload from computer	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.addFromLibrary	Add from library	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.addPhotos	Add photos	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.addPhotosAndFiles	Add photos & files	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.attachFiles	Attach files	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.attachMedia	Attach photos or videos	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.attachPhotos	Attach photos	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.attachmentEmpty	This file is empty. Remove it and choose another file.	app-initial-61c077dcc1af.js
+chatgptConversations.composer.attachmentNoText	No text could be extracted from this file. Remove it and choose another file.	app-initial-61c077dcc1af.js
+chatgptConversations.composer.attachmentUploadFailed	Upload failed	app-initial-61c077dcc1af.js
+chatgptConversations.composer.browseLibraryFiles	Add library files	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.browseLibraryFiles.space	Add Space files	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.browseLibraryFilesDescription	Browse and search your files	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.browserTabMenu.empty	No browser tabs found	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.browserTabMenu.title	Browser	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.collapse	Collapse	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.contextMenu.add	Add	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.contextMenu.pluginConnect	Connect	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.contextMenu.searchPlugins	Type to search plugins	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.contextMenu.selected	Selected	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.createImage	Create image	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.expand	Expand	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptAtMention.error	GPTs couldn't be loaded	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptAtMention.loading	Loading GPTs…	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptAtMention.title	Custom GPTs	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptSlashCommand.description	Start a chat with one of your GPTs	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptSlashCommand.empty	No GPTs yet	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptSlashCommand.error	GPTs couldn't be loaded	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptSlashCommand.loading	Loading GPTs…	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptSlashCommand.sectionTitle	Your GPTs	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.gptSlashCommand.title	Add custom GPT	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.imageGenerationLimit.instantResetTimeMenu	Available when Instant resets at {resetTime}	app-initial-61c077dcc1af.js
+chatgptConversations.composer.imageGenerationLimit.instantResetTimeTooltip	Try again at {resetTime}	app-initial-61c077dcc1af.js
+chatgptConversations.composer.imageGenerationLimit.remainingTooltip	{remaining} images left until {resetTime}	app-initial-61c077dcc1af.js
+chatgptConversations.composer.imageGenerationLimit.resetDateTooltip	{limit} more available on {resetDate}	app-initial-61c077dcc1af.js
+chatgptConversations.composer.libraryFile.sharedBy	Shared by {name}	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.libraryMention.accountSource	{account} · {provider}	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.memoryCorrection.placeholder	Make a correction	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.memoryCorrection.remove	Remove memory correction	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.messageTooLong	Message is too long	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.modelSlashCommand.description	Change from {model}	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.modelSlashCommand.title	Model	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.placeholder	Ask ChatGPT	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSelector.change	Change project: {projectName}	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSelector.changeTooltip	Change project	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSelector.choose	Choose project	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSelector.clearProject	Don't work in a project	composer-project-picker-content-fe54d1e86d40.js
+chatgptConversations.composer.projectSelector.createProject	New project	composer-project-picker-content-fe54d1e86d40.js
+chatgptConversations.composer.projectSelector.empty	No projects	composer-project-picker-content-fe54d1e86d40.js
+chatgptConversations.composer.projectSelector.error	Projects couldn't be loaded	composer-project-picker-content-fe54d1e86d40.js
+chatgptConversations.composer.projectSelector.loading	Loading projects…	composer-project-picker-content-fe54d1e86d40.js
+chatgptConversations.composer.projectSelector.none	No project	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSlashCommand.description	Start a chat in a project	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSlashCommand.empty	No projects	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSlashCommand.error	Projects couldn't be loaded	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSlashCommand.loading	Loading projects…	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.projectSlashCommand.title	Work in a project	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.rateLimitHardBlock.tooltip	Messages limit reached	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.readAloud.description	Listen to the last response	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.readAloud.title	Read aloud	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.removeAttachment	Remove {filename}	app-initial-61c077dcc1af.js
+chatgptConversations.composer.removeSelectedGpt	Remove {gptName}	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.removeSystemHint	Remove {tool}	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.send.ariaLabel	Send	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.startVoiceTooltip	Start Voice	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.stop.ariaLabel	Stop	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.systemHint.customAgentGroup	Plugins	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.systemHint.selected	Selected	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.targetedReply.remove	Remove reply context	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.thinkingLimitReached	You've reached your Thinking limit	app-primary-15d1279f1ff0.js
+chatgptConversations.composer.uploadingAttachment	Uploading	native-room-e49f0e771dbe.js
+chatgptConversations.composer.webSearch	Web search	app-primary-15d1279f1ff0.js
+chatgptConversations.keyboardStop.description	You can ask again or send a follow-up anytime	dialog-dbde8cc58b46.js
+chatgptConversations.keyboardStop.keepThinking	Keep thinking	dialog-dbde8cc58b46.js
+chatgptConversations.keyboardStop.stop	Stop	dialog-dbde8cc58b46.js
+chatgptConversations.keyboardStop.title	Stop this response?	dialog-dbde8cc58b46.js
+chatgptConversations.loadingWorkMessage	Working	app-primary-15d1279f1ff0.js
+chatgptConversations.modelPicker.ariaLabel	Select ChatGPT model	app-primary-15d1279f1ff0.js
+chatgptConversations.modelPicker.tooltip	Select ChatGPT model	app-primary-15d1279f1ff0.js
+chatgptConversations.newChat	New chat	app-initial-61c077dcc1af.js
+chatgptConversations.regenerate.label	Regenerate response	chatgpt-conversation-turn-content-7ca20ac4bca6.js
+chatgptConversations.submitError	Could not send this ChatGPT message	app-initial-61c077dcc1af.js
+codex.conversation.latestResponse	Latest response	virtualized-turn-list-e72da4a701af.js
+codex.conversation.latestResponseUnavailable	No response available	virtualized-turn-list-e72da4a701af.js
+codex.conversation.roleHeading.assistant	ChatGPT said:	user-message-attachments-e1dfd22082fe.js
+codex.conversation.roleHeading.user	You said:	user-message-attachments-e1dfd22082fe.js
+composer.contextButton.ariaLabel	Add files and more	app-initial-61c077dcc1af.js
+composer.dictation.aria	Dictate	app-initial-61c077dcc1af.js
+composer.latestTurn	Latest turn	hosted-map-cd91dd8768cc.js
+composer.latestTurn.working	Working	hosted-map-cd91dd8768cc.js
+sidebarElectron.productMode.trigger	Switch mode, current mode: {mode}	app-initial-61c077dcc1af.js
+chatgptConversations.loadingMessage	ChatGPT is responding	app-primary-15d1279f1ff0.js
+chatgptConversations.responseComplete	Response complete	chatgpt-conversation-page-fa3d1f9f143d.js
+localConversation.assistantResponse.announcement.completed	Response complete	sites-end-resource-7e6c33984bd6.js

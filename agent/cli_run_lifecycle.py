@@ -13,16 +13,60 @@ def handle_init_command(args: argparse.Namespace, *, ledger: Any) -> None:
     print(f"Database initialized: {ledger.DB_PATH}")
 
 
+def _requested_start_profile(args: argparse.Namespace) -> Any:
+    """The run profile asked for by ``start`` flags, or None when no flag was given.
+
+    Without flags ``start`` behaves as it always has: no profile is recorded and
+    the run uses Codex. Raises ValueError for an invalid combination (for
+    example a Codex model with ``--coding-agent claude_code``).
+    """
+
+    from agent.run_services import CODEX_DEFAULT_SELECTION, DEFAULT_CODING_AGENT, RunExecutionProfile
+
+    coding_agent = getattr(args, "coding_agent", None)
+    sandbox = getattr(args, "sandbox", None)
+    model = getattr(args, "model", None)
+    effort = getattr(args, "effort", None)
+    if coding_agent is None and sandbox is None and model is None and effort is None:
+        return None
+    sandbox = sandbox or "read-only"
+    return RunExecutionProfile(
+        sandbox=sandbox,
+        model=model or CODEX_DEFAULT_SELECTION,
+        reasoning_effort=effort or CODEX_DEFAULT_SELECTION,
+        approval_policy="never" if sandbox == "danger-full-access" else CODEX_DEFAULT_SELECTION,
+        profile_source="explicit_user_selection",
+        coding_agent=coding_agent or DEFAULT_CODING_AGENT,
+    )
+
+
 def handle_start_command(
     args: argparse.Namespace,
     *,
     ledger: Any,
     create_run_service: Callable[..., Any],
 ) -> None:
+    try:
+        profile = _requested_start_profile(args)
+    except (TypeError, ValueError) as exc:
+        # Checked before the run exists, so a bad flag never leaves an orphan run.
+        print(f"error: invalid execution profile: {exc}", file=sys.stderr)
+        raise SystemExit(2)
     result = create_run_service(args.instruction, ledger=ledger)
     if not result.ok:
         print(f"error: {result.error_message}", file=sys.stderr)
         raise SystemExit(1)
+    if profile is not None:
+        from agent.run_services import select_run_execution_profile
+
+        selected = select_run_execution_profile(result.run_id, profile, ledger=ledger)
+        if not selected.ok:
+            print(
+                f"error: run {result.run_id} was created but its execution profile was not recorded: "
+                f"{selected.error_message or selected.reason_code}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
     print(result.run_id)
 
 

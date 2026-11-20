@@ -102,7 +102,11 @@ def _print_codex_exec_result(result: dict) -> None:
     print(f"repo_path: {result['repo_path']}")
     print(f"sandbox: {result['sandbox']}")
     print(f"found: {result['found']}")
-    print(f"codex_path: {result['codex_path'] or ''}")
+    if result.get("coding_agent") == "claude_code":
+        print("coding_agent: claude_code")
+        print(f"claude_path: {result.get('executable_path') or ''}")
+    else:
+        print(f"codex_path: {result['codex_path'] or ''}")
     print(f"exit_code: {result['exit_code']}")
     print(f"timed_out: {result['timed_out']}")
     if result["validation_error"]:

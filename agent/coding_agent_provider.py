@@ -25,6 +25,8 @@ class CodingAgentRequest:
     sandbox: str
     model: str
     invocation_id: str | None = None
+    # The run profile's reasoning effort ("codex_default" = the agent's default).
+    reasoning_effort: str | None = None
     artifact_dir: str | None = None
     progress_callback: Callable[[dict[str, object]], None] | None = None
     extraction_event_id: int | None = None

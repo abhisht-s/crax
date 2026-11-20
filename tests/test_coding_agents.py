@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -28,6 +29,7 @@ from agent.local_controller import (
 )
 from agent.run_services import RunExecutionProfile, get_run_execution_profile, select_run_execution_profile
 from agent.run_state import RunStatus
+from tests.test_claude_code_provider import FAKE_CLAUDE_SOURCE
 from tests.test_codex_invocation import FAKE_CODEX_SOURCE
 from tests.test_extracted_prompt_services import _submission, _capture, _extraction
 
@@ -35,7 +37,8 @@ from tests.test_extracted_prompt_services import _submission, _capture, _extract
 class ProviderRegistryTests(unittest.TestCase):
     def test_known_identity_is_distinct_from_executable_provider(self):
         self.assertEqual(resolve_provider("codex").identity, "codex")
-        for identity in ("claude_code", "cursor"):
+        self.assertEqual(resolve_provider("claude_code").identity, "claude_code")
+        for identity in ("cursor",):
             with self.subTest(identity=identity), self.assertRaises(ProviderResolutionError) as raised:
                 resolve_provider(identity)
             self.assertEqual(raised.exception.reason_code, "coding_agent_unavailable")
@@ -60,11 +63,21 @@ class ProviderCompositionTests(unittest.TestCase):
         {"type": "thread.started", "thread_id": sys.argv[sys.argv.index("resume") + 1] if "resume" in sys.argv else str(uuid.uuid5(uuid.NAMESPACE_URL, sys.argv[-1]))},
 ''')
         executable = bin_dir / "codex"
-        executable.write_text(source)
+        executable.write_text(source.replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1))
         executable.chmod(0o755)
-        env = {key: value for key, value in os.environ.items() if not key.startswith("FAKE_CODEX_")}
-        env["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        fake_claude = bin_dir / "claude"
+        fake_claude.write_text(FAKE_CLAUDE_SOURCE.replace("#!/usr/bin/env python3", f"#!{sys.executable}", 1))
+        fake_claude.chmod(0o755)
+        env = {key: value for key, value in os.environ.items() if not key.startswith(("FAKE_CODEX_", "FAKE_CLAUDE_"))}
+        # Only the fake CLIs and system tools: the user's real `codex` and
+        # `claude` (e.g. ~/.local/bin) must never be reachable from these tests.
+        env["PATH"] = os.pathsep.join([str(bin_dir), "/usr/bin", "/bin"])
+        # Never read the user's real ~/.claude/settings.json.
+        env["CLAUDE_CONFIG_DIR"] = str(self.root / "claude-config")
         self.enterContext(mock.patch.dict(os.environ, env, clear=True))
+        import shutil
+        for name in ("codex", "claude"):  # guard: only the fakes are reachable
+            self.assertEqual(shutil.which(name), str(bin_dir / name))
         self.enterContext(mock.patch.object(ledger, "DB_PATH", self.root / "ledger.db"))
         self.enterContext(mock.patch("agent.codex_invocation.default_runs_root", return_value=self.root / "runs"))
 
@@ -114,6 +127,8 @@ class ProviderCompositionTests(unittest.TestCase):
             self.assertTrue(select_run_execution_profile(run_id, RunExecutionProfile(sandbox="read-only", coding_agent=identity), ledger=ledger).ok)
             different = select_run_execution_profile(run_id, RunExecutionProfile(sandbox="read-only"), ledger=ledger)
             self.assertFalse(different.ok)
+            if identity == "claude_code":
+                continue  # has an adapter since Step 2; covered by tests/test_claude_code_provider.py
             with mock.patch("agent.codex_terminal.run_codex_exec", side_effect=AssertionError("No fallback")):
                 result = self.execute(run_id)
             self.assertFalse(result.ok)
@@ -173,7 +188,7 @@ class ProviderCompositionTests(unittest.TestCase):
         self.assertFalse(guarded.durability_guard.status()["blocked"])
 
     def test_extracted_unavailable_provider_rejects_before_callback(self):
-        run_id = self.run_id("claude_code")
+        run_id = self.run_id("cursor")
         ledger.update_run_status(run_id, RunStatus.COMPLETED)
         callback = mock.Mock(side_effect=AssertionError("No fallback callback"))
         result = execute_extracted_codex_prompt_service(run_id, ledger.get_run(run_id), str(self.repo), "read-only", None, confirm_full_access=False, allow_full_access=False, approval_mode="human", ledger=ledger, codex_flow_coordinator=callback)
@@ -229,7 +244,7 @@ class ProviderCompositionTests(unittest.TestCase):
         self.assertEqual(bad.reason_code, "coding_agent_session_mismatch")
 
     def test_unavailable_native_continuation_never_dispatches_codex(self):
-        run_id = self.run_id("claude_code")
+        run_id = self.run_id("cursor")
         with mock.patch("agent.codex_terminal.run_codex_exec", side_effect=AssertionError("No fallback")):
             result = execute_coding_agent_resume_service(run_id=run_id, run=ledger.get_run(run_id), repository_path=str(self.repo), sandbox="read-only", session_id="other", ledger=ledger)
         self.assertEqual(result.reason_code, "coding_agent_unavailable")
@@ -300,8 +315,8 @@ class ProviderCompositionTests(unittest.TestCase):
             results = list(pool.map(lambda pair: self.execute(pair[1], prompt=f"Say exactly: mixed {pair[0]}"), enumerate(run_ids)))
         for identity, result in zip(identities, results):
             self.assertEqual(result.coding_agent, identity)
-            self.assertEqual(result.ok, identity == "codex")
-            if identity != "codex":
+            self.assertEqual(result.ok, identity in ("codex", "claude_code"), result.reason_code)
+            if identity == "cursor":
                 self.assertEqual(result.reason_code, "coding_agent_unavailable")
 
     def test_empty_native_session_cannot_turn_continuation_into_a_new_task(self):

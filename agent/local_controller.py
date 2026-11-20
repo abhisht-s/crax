@@ -15,6 +15,13 @@ from typing import Any, Callable
 
 from agent import ledger as default_ledger
 from agent.chatgpt_ax_capture import COMPLETED_WITHOUT_PROMPT_REASON_CODE
+from agent.chatgpt_target import (
+    CHATGPT_TARGET_CLASSIC,
+    get_run_chatgpt_target,
+    record_run_chatgpt_target,
+    resolve_chatgpt_target,
+    services_for_target,
+)
 from agent.chatgpt_desktop_mutex import ChatGPTDesktopMutex
 from agent.codex_invocation import (
     STATUS_COMPLETE,
@@ -33,6 +40,12 @@ from agent.run_services import (
     ALLOWED_CODEX_MODEL_SELECTIONS,
     CHATGPT_UI_LEASE_ACQUIRE_DENIED_EVENT_TYPE,
     CODEX_DEFAULT_SELECTION,
+    DEFAULT_CODING_AGENT,
+    SELECTABLE_CODING_AGENTS,
+    allowed_model_selections,
+    allowed_reasoning_effort_selections,
+    coding_agent_label,
+    model_effort_compatible,
     DestinationBindingLookupStatus,
     ExecutionProfileLookupStatus,
     RunDestinationBinding,
@@ -388,6 +401,8 @@ class StartRequestValidationResult:
     sandbox: str | None = None
     model: str | None = None
     profile_source: str | None = None
+    coding_agent: str | None = None
+    reasoning_effort: str | None = None
     project_title: str | None = None
     chat_title: str | None = None
     allow_destination_navigation: bool = False
@@ -610,7 +625,12 @@ class LocalController:
         chatgpt_wait_sleeper: Callable[[float], None] | None = None,
         desktop_mutex: Any | None = None,
         codex_resume_executor: Callable[..., Any] = execute_codex_resume_service,
+        chatgpt_target: str | None = None,
     ) -> None:
+        # Which ChatGPT app new runs hand off to: explicit value, else the
+        # CRAX_CHATGPT_APP environment variable, else Classic. An invalid value
+        # raises here rather than silently falling back to Classic.
+        self.chatgpt_target_selection = resolve_chatgpt_target(chatgpt_target)
         restore_persisted_session = session is None
         self.session = session or LocalControllerSession()
         if isinstance(ledger, DurabilityGuardedLedger):
@@ -906,6 +926,8 @@ class LocalController:
         chat_title: str,
         sandbox: str | None = None,
         model: str | None = None,
+        coding_agent: str | None = None,
+        reasoning_effort: str | None = None,
         allow_destination_navigation: bool = False,
         additional_session: bool = False,
         timeout_seconds: float | None = None,
@@ -916,6 +938,8 @@ class LocalController:
             initial_instruction,
             sandbox,
             model=model,
+            coding_agent=coding_agent,
+            reasoning_effort=reasoning_effort,
             project_title=project_title,
             chat_title=chat_title,
             allow_destination_navigation=allow_destination_navigation,
@@ -1021,6 +1045,9 @@ class LocalController:
             run_id = start_result.run_id
             if run_id is None:
                 raise ValueError("start_local_controller_run returned no run_id")
+            if self.chatgpt_target_selection.target != CHATGPT_TARGET_CLASSIC:
+                # Only new-app runs get a target event; Classic runs' ledgers are unchanged.
+                record_run_chatgpt_target(run_id, self.chatgpt_target_selection, ledger=self.ledger)
             runtime = self._get_or_create_session(run_id)
             runtime.controller_state = LOCAL_CONTROLLER_STATE_STARTING_INITIAL_CODEX
             runtime.pending_approval = None
@@ -2600,11 +2627,19 @@ class LocalController:
                 return
 
     def _supervision_handoff_kwargs(self, run_id: str) -> dict[str, Any]:
-        return {
+        kwargs: dict[str, Any] = {
             "desktop_mutex": self.desktop_mutex,
             "controller_instance_id": self.session.session_id,
             "should_stop": lambda: self._cancel_requested_for(run_id),
         }
+        # Per-run ChatGPT app. Classic runs (no target event) keep
+        # run_supervision_step's defaults, exactly as before. New-app runs get
+        # the new-app services. A malformed or contradictory record raises
+        # ChatGPTTargetError, which the worker records and pauses the run on.
+        target = get_run_chatgpt_target(run_id, ledger=self.ledger)
+        if target.target != CHATGPT_TARGET_CLASSIC:
+            kwargs.update(services_for_target(target.target).as_step_kwargs())
+        return kwargs
 
     def _navigation_for_handoff(self, run_id: str, configured: bool) -> bool:
         """Effective navigation policy for one ChatGPT lane slice.
@@ -3620,6 +3655,8 @@ def validate_local_controller_start_request(
     sandbox: str | None = None,
     *,
     model: str | None = None,
+    coding_agent: str | None = None,
+    reasoning_effort: str | None = None,
     project_title: str | None = None,
     chat_title: str | None = None,
     allow_destination_navigation: bool = False,
@@ -3676,17 +3713,57 @@ def validate_local_controller_start_request(
             ),
         )
 
+    coding_agent_was_omitted = coding_agent is None
+    agent_text = DEFAULT_CODING_AGENT if coding_agent_was_omitted else str(coding_agent or "").strip()
+    if agent_text not in SELECTABLE_CODING_AGENTS:
+        return StartRequestValidationResult(
+            ok=False,
+            repository_path=str(resolved_path),
+            initial_instruction=instruction_text,
+            sandbox=sandbox_text,
+            coding_agent=agent_text,
+            reason_code="invalid_coding_agent",
+            error_message=f"Invalid coding agent. Allowed values: {', '.join(SELECTABLE_CODING_AGENTS)}.",
+        )
+
     model_text = CODEX_DEFAULT_SELECTION if model_was_omitted else str(model or "").strip()
-    if model_text not in ALLOWED_CODEX_MODEL_SELECTIONS:
-        allowed_text = ", ".join(ALLOWED_CODEX_MODEL_SELECTIONS)
+    allowed_models = allowed_model_selections(agent_text)
+    if model_text not in allowed_models:
+        allowed_text = ", ".join(allowed_models)
+        codex = agent_text == DEFAULT_CODING_AGENT
         return StartRequestValidationResult(
             ok=False,
             repository_path=str(resolved_path),
             initial_instruction=instruction_text,
             sandbox=sandbox_text,
             model=model_text,
-            reason_code="invalid_codex_model",
-            error_message=f"Invalid Codex model. Allowed values: {allowed_text}.",
+            coding_agent=agent_text,
+            reason_code="invalid_codex_model" if codex else f"invalid_{agent_text}_model",
+            error_message=f"Invalid {coding_agent_label(agent_text)} model. Allowed values: {allowed_text}.",
+        )
+
+    effort_was_omitted = reasoning_effort is None
+    effort_text = CODEX_DEFAULT_SELECTION if effort_was_omitted else str(reasoning_effort or "").strip()
+    allowed_efforts = allowed_reasoning_effort_selections(agent_text)
+    effort_error = None
+    if effort_text not in allowed_efforts:
+        effort_error = (
+            f"Invalid reasoning effort for {coding_agent_label(agent_text)}. "
+            f"Allowed values: {', '.join(allowed_efforts)}."
+        )
+    elif not model_effort_compatible(agent_text, model_text, effort_text):
+        effort_error = f"Model {model_text} does not support reasoning effort {effort_text}."
+    if effort_error is not None:
+        return StartRequestValidationResult(
+            ok=False,
+            repository_path=str(resolved_path),
+            initial_instruction=instruction_text,
+            sandbox=sandbox_text,
+            model=model_text,
+            coding_agent=agent_text,
+            reasoning_effort=effort_text,
+            reason_code="invalid_reasoning_effort",
+            error_message=effort_error,
         )
 
     destination_result = _validate_destination_titles(project_title, chat_title)
@@ -3707,9 +3784,11 @@ def validate_local_controller_start_request(
         initial_instruction=instruction_text,
         sandbox=sandbox_text,
         model=model_text,
+        coding_agent=agent_text,
+        reasoning_effort=effort_text,
         profile_source=(
             "system_default"
-            if sandbox_was_omitted and model_was_omitted
+            if sandbox_was_omitted and model_was_omitted and coding_agent_was_omitted and effort_was_omitted
             else "explicit_user_selection"
         ),
         project_title=destination_result.project_title,
@@ -3900,13 +3979,14 @@ def start_local_controller_run(
         profile = RunExecutionProfile(
             sandbox=start_request.sandbox,
             model=model,
-            reasoning_effort=CODEX_DEFAULT_SELECTION,
+            reasoning_effort=start_request.reasoning_effort or CODEX_DEFAULT_SELECTION,
             approval_policy=(
                 "never"
                 if start_request.sandbox == "danger-full-access"
                 else CODEX_DEFAULT_SELECTION
             ),
             profile_source=profile_source,
+            coding_agent=start_request.coding_agent or DEFAULT_CODING_AGENT,
         )
     except (TypeError, ValueError) as exc:
         _release_run_conversation_claim(ledger, run_id, reason="run_start_failed")
@@ -4592,6 +4672,7 @@ def _profile_summary(
 ) -> dict[str, Any]:
     return {
         "status": status,
+        "coding_agent": profile.coding_agent,
         "sandbox": profile.sandbox,
         "model": profile.model,
         "reasoning_effort": profile.reasoning_effort,
