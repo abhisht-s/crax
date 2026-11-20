@@ -22,6 +22,8 @@ from agent.codex_invocation import boot_identity, process_group_id, process_star
 from agent.run_state import RunStatus
 
 
+from agent.claude_code_models import CLAUDE_EFFORT_LEVELS, CLAUDE_MODEL_IDS, claude_model_supports_effort
+
 DB_PATH = Path("data/agent_ledger.db")
 SQLITE_BUSY_TIMEOUT_SECONDS = 10.0
 RUN_DESTINATION_BOUND_EVENT_TYPE = "run_destination_bound"
@@ -59,7 +61,45 @@ ALLOWED_CODEX_MODEL_SELECTIONS = (
     "gpt-5",
     "gpt-5-codex",
 )
+# CODEX_DEFAULT_SELECTION is the stored token for "the agent's own default
+# model" for every agent; the name predates other agents. Claude Code models
+# are full model IDs from agent/claude_code_models.py.
+ALLOWED_CLAUDE_CODE_MODEL_SELECTIONS = (CODEX_DEFAULT_SELECTION, *CLAUDE_MODEL_IDS)
+ALLOWED_MODEL_SELECTIONS_BY_CODING_AGENT = {
+    DEFAULT_CODING_AGENT: ALLOWED_CODEX_MODEL_SELECTIONS,
+    "claude_code": ALLOWED_CLAUDE_CODE_MODEL_SELECTIONS,
+    # No adapter yet; keeps the list every profile was validated against before.
+    "cursor": ALLOWED_CODEX_MODEL_SELECTIONS,
+}
+
+
+def allowed_reasoning_effort_selections(coding_agent: object) -> tuple[str, ...]:
+    if coding_agent == "claude_code":
+        return ALLOWED_CLAUDE_CODE_REASONING_EFFORT_SELECTIONS
+    return ALLOWED_REASONING_EFFORT_SELECTIONS
+
+
+def model_effort_compatible(coding_agent: object, model: object, reasoning_effort: object) -> bool:
+    """A Claude Code profile may not pair a model with an effort it does not accept."""
+
+    if coding_agent != "claude_code" or reasoning_effort == CODEX_DEFAULT_SELECTION:
+        return True
+    if model == CODEX_DEFAULT_SELECTION:
+        return True  # resolved at run time from the user's settings
+    return claude_model_supports_effort(str(model), str(reasoning_effort))
+
+
+def allowed_model_selections(coding_agent: object) -> tuple[str, ...]:
+    """Model values a run profile may store for this agent.
+
+    An unknown agent gets the Codex list, so validation order and messages for
+    invalid agents are what they were; the agent check rejects it separately.
+    """
+
+    return ALLOWED_MODEL_SELECTIONS_BY_CODING_AGENT.get(coding_agent, ALLOWED_CODEX_MODEL_SELECTIONS)  # type: ignore[arg-type]
 ALLOWED_REASONING_EFFORT_SELECTIONS = (CODEX_DEFAULT_SELECTION,)
+# Codex reasoning stays locked to its default; Claude Code adds --effort levels.
+ALLOWED_CLAUDE_CODE_REASONING_EFFORT_SELECTIONS = (CODEX_DEFAULT_SELECTION, *CLAUDE_EFFORT_LEVELS)
 ALLOWED_APPROVAL_POLICY_SELECTIONS = (CODEX_DEFAULT_SELECTION, "never")
 ALLOWED_EXECUTION_PROFILE_SOURCES = (
     "explicit_user_selection",
@@ -4400,9 +4440,11 @@ def _parse_execution_profile_metadata(
 
     if sandbox not in ALLOWED_EXECUTION_PROFILE_SANDBOXES:
         return None
-    if model not in ALLOWED_CODEX_MODEL_SELECTIONS:
+    if model not in allowed_model_selections(coding_agent):
         return None
-    if reasoning_effort not in ALLOWED_REASONING_EFFORT_SELECTIONS:
+    if reasoning_effort not in allowed_reasoning_effort_selections(coding_agent):
+        return None
+    if not model_effort_compatible(coding_agent, model, reasoning_effort):
         return None
     if approval_policy not in ALLOWED_APPROVAL_POLICY_SELECTIONS:
         return None

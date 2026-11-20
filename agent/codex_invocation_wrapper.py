@@ -10,6 +10,7 @@ from typing import Any
 
 from agent.codex_invocation import (
     EXIT_FILENAME,
+    FINAL_MESSAGE_FILENAME,
     IDENTITY_FILENAME,
     STDERR_FILENAME,
     STDOUT_FILENAME,
@@ -48,7 +49,7 @@ def _install_child_signal_handler(child_holder: dict[str, subprocess.Popen | Non
     signal.signal(signal.SIGTERM, handler)
 
 
-def _write_exit(path: Path, invocation_id: str, exit_code: int | None) -> None:
+def _write_exit(path: Path, invocation_id: str, exit_code: int | None, extra: dict[str, Any] | None = None) -> None:
     signaled = isinstance(exit_code, int) and exit_code < 0
     payload = {
         "codex_invocation_id": invocation_id,
@@ -58,7 +59,32 @@ def _write_exit(path: Path, invocation_id: str, exit_code: int | None) -> None:
         "signal": (-exit_code) if signaled and exit_code is not None else None,
         "finished_at": _utc_now(),
     }
+    if extra:
+        payload.update(extra)
     write_json_atomic(path, payload)
+
+
+def _extract_final_message(intent: dict[str, Any], stdout_path: Path, artifact_dir: Path) -> dict[str, Any] | None:
+    """For agents with no final-message file (Claude Code), copy it out of the stream.
+
+    Runs before exit.json is written, so the final message is on disk whenever
+    the exit is, even if the controller restarted mid-run. Codex intents carry
+    no ``final_message_source`` and are untouched.
+    """
+
+    source = intent.get("final_message_source")
+    if not source:
+        return None
+    try:
+        from agent.claude_code_stream import FINAL_MESSAGE_SOURCE_CLAUDE_STREAM, write_final_message_from_stream
+
+        if source != FINAL_MESSAGE_SOURCE_CLAUDE_STREAM:
+            return {"final_message_extraction": "unknown_source", "final_message_source": str(source)}
+        final_path = Path(str(intent.get("final_message_path") or artifact_dir / FINAL_MESSAGE_FILENAME))
+        status = write_final_message_from_stream(stdout_path, final_path)
+    except Exception as exc:  # never let extraction lose the exit record
+        return {"final_message_extraction": "extraction_error", "final_message_extraction_error": type(exc).__name__}
+    return {"final_message_extraction": status, "final_message_source": source}
 
 
 def run_wrapper(manifest_path: Path) -> int:
@@ -99,7 +125,7 @@ def run_wrapper(manifest_path: Path) -> int:
     except OSError:
         _write_exit(exit_path, invocation_id, 1)
         return 1
-    _write_exit(exit_path, invocation_id, exit_code)
+    _write_exit(exit_path, invocation_id, exit_code, _extract_final_message(intent, stdout_path, artifact_dir))
     return 0 if exit_code == 0 else int(exit_code or 1)
 
 

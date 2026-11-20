@@ -176,7 +176,9 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn("Permission preset / sandbox", self.html)
         self.assertIn("Codex default — Full Access bypasses approvals", self.all_static)
         options = re.findall(r'<option value="([^"]*)">', self.html)
-        self.assertEqual(options, ["", "", ""])
+        # Every select ships only a "Loading..." placeholder; real options come
+        # from the server. Five since the coding-agent and effort pickers were added.
+        self.assertEqual(options, ["", "", "", "", ""])
         self.assertIn("Loading...", self.html)
         self.assertIn("currently open ChatGPT Desktop destination", self.html)
         self.assertIn("exact titles", self.html)
@@ -284,7 +286,10 @@ class StaticSourceContractTests(unittest.TestCase):
         ):
             self.assertIn(required, self.js)
 
-        self.assertNotIn("reasoning_effort:", self.js)
+        # Reasoning is selectable for Claude Code only (Codex stays locked to its
+        # default via selectedReasoningEffort()); approval is never sent.
+        self.assertIn("reasoning_effort: reasoningEffort", self.js)
+        self.assertIn('selectedCodingAgent() !== "codex"', self.js)
         self.assertNotIn("approval_policy:", self.js)
 
     def test_dashboard_renders_chatgpt_ui_lease_state_and_guarded_controls(self) -> None:
@@ -371,9 +376,18 @@ class StaticSourceContractTests(unittest.TestCase):
         self.assertIn("danger-full-access", self.all_static)
         self.assertNotIn("WebSocket", self.js)
         self.assertNotIn("EventSource", self.js)
-        self.assertNotIn("clipboard", self.all_static.lower())
+        # The dashboard may WRITE the clipboard only from a user click on an ID
+        # copy icon (copyIdFrom, user request 2026-11-20). It never reads it, and
+        # nothing else in the page touches it.
+        self.assertNotIn("clipboard", self.html.lower())
+        self.assertNotIn("clipboard", self.css.lower())
+        copy_fn = self.js[self.js.index("async function copyIdFrom("):]
+        copy_fn = copy_fn[:copy_fn.index("\n  }\n") + 4]
+        self.assertEqual(self.js.lower().count("clipboard"), copy_fn.lower().count("clipboard"))
+        self.assertIn("navigator.clipboard.writeText(text)", copy_fn)
+        self.assertNotIn("clipboard.read", self.js)
+        self.assertIn('addEventListener("click", () =>\n      copyIdFrom(', self.js)
         self.assertIn("navigator.serviceWorker.register", self.js)
-        self.assertNotIn("navigator.clipboard", self.js)
         self.assertNotIn("navigator.geolocation", self.js)
         self.assertNotIn("accessibility", self.all_static.lower())
         self.assertNotIn("AXUIElement", self.all_static)

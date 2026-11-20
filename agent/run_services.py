@@ -175,6 +175,10 @@ ALLOWED_EXECUTION_PROFILE_SANDBOXES = (
     default_ledger.ALLOWED_EXECUTION_PROFILE_SANDBOXES
 )
 ALLOWED_CODEX_MODEL_SELECTIONS = default_ledger.ALLOWED_CODEX_MODEL_SELECTIONS
+ALLOWED_CLAUDE_CODE_MODEL_SELECTIONS = default_ledger.ALLOWED_CLAUDE_CODE_MODEL_SELECTIONS
+allowed_model_selections = default_ledger.allowed_model_selections
+allowed_reasoning_effort_selections = default_ledger.allowed_reasoning_effort_selections
+model_effort_compatible = default_ledger.model_effort_compatible
 ALLOWED_REASONING_EFFORT_SELECTIONS = (
     default_ledger.ALLOWED_REASONING_EFFORT_SELECTIONS
 )
@@ -261,12 +265,30 @@ class ChatGPTHandoffQueueLookupStatus(StrEnum):
     INVALID = "invalid"
 
 
+# Agents a user may pick for a new run: those with an execution adapter
+# (agent.coding_agents.resolve_provider). "cursor" is recognized but not here.
+SELECTABLE_CODING_AGENTS = (DEFAULT_CODING_AGENT, "claude_code")
+CODING_AGENT_LABELS = {DEFAULT_CODING_AGENT: "Codex", "claude_code": "Claude Code", "cursor": "Cursor"}
+CODING_AGENT_EXECUTABLES = {DEFAULT_CODING_AGENT: "codex", "claude_code": "claude"}
+
+
+def coding_agent_label(coding_agent: object) -> str:
+    return CODING_AGENT_LABELS.get(coding_agent, str(coding_agent))  # type: ignore[arg-type]
+
+
 def execution_profile_options() -> dict[str, Any]:
     """Return UI-safe execution profile choices from validation constants."""
 
     return {
         "sandbox_options": list(ALLOWED_EXECUTION_PROFILE_SANDBOXES),
         "model_options": list(ALLOWED_CODEX_MODEL_SELECTIONS),
+        "coding_agent_options": list(SELECTABLE_CODING_AGENTS),
+        "model_options_by_agent": {
+            agent: list(allowed_model_selections(agent)) for agent in SELECTABLE_CODING_AGENTS
+        },
+        "reasoning_effort_options_by_agent": {
+            agent: list(allowed_reasoning_effort_selections(agent)) for agent in SELECTABLE_CODING_AGENTS
+        },
         "reasoning_effort": CODEX_DEFAULT_SELECTION,
         "approval_policy": CODEX_DEFAULT_SELECTION,
     }
@@ -313,11 +335,11 @@ class RunExecutionProfile:
             self.sandbox,
             ALLOWED_EXECUTION_PROFILE_SANDBOXES,
         )
-        _require_allowed_value("model", self.model, ALLOWED_CODEX_MODEL_SELECTIONS)
+        _require_allowed_value("model", self.model, allowed_model_selections(self.coding_agent))
         _require_allowed_value(
             "reasoning_effort",
             self.reasoning_effort,
-            ALLOWED_REASONING_EFFORT_SELECTIONS,
+            allowed_reasoning_effort_selections(self.coding_agent),
         )
         _require_allowed_value(
             "approval_policy",
@@ -334,6 +356,10 @@ class RunExecutionProfile:
             self.coding_agent,
             ALLOWED_CODING_AGENTS,
         )
+        if not model_effort_compatible(self.coding_agent, self.model, self.reasoning_effort):
+            raise ValueError(
+                f"Model {self.model!r} does not support reasoning effort {self.reasoning_effort!r}."
+            )
 
 
 @dataclass(frozen=True)

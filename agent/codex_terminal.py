@@ -411,7 +411,13 @@ def _default_final_message_path(run_id: str | None) -> Path:
     )
 
 
-def _final_message_artifact_result(path: Path) -> dict:
+def _exec_noun(agent_label: str) -> str:
+    """Codex keeps its historical "Codex exec" wording; other agents use their name."""
+
+    return "Codex exec" if agent_label == "Codex" else agent_label
+
+
+def _final_message_artifact_result(path: Path, agent_label: str = "Codex") -> dict:
     base = {
         "final_message_path": str(path),
         "final_message": "",
@@ -424,19 +430,19 @@ def _final_message_artifact_result(path: Path) -> dict:
     except FileNotFoundError:
         return {
             **base,
-            "final_message_error": "Codex final-message artifact was not written.",
+            "final_message_error": f"{agent_label} final-message artifact was not written.",
         }
     except UnicodeDecodeError as error:
         return {
             **base,
             "final_message_status": "invalid_utf8",
-            "final_message_error": f"Codex final-message artifact is not valid UTF-8: {error}",
+            "final_message_error": f"{agent_label} final-message artifact is not valid UTF-8: {error}",
         }
     except OSError as error:
         return {
             **base,
             "final_message_status": "unreadable",
-            "final_message_error": f"Unable to read Codex final-message artifact: {error}",
+            "final_message_error": f"Unable to read {agent_label} final-message artifact: {error}",
         }
 
     clean_text = text.strip()
@@ -444,7 +450,7 @@ def _final_message_artifact_result(path: Path) -> dict:
         return {
             **base,
             "final_message_status": "empty",
-            "final_message_error": "Codex final-message artifact was empty.",
+            "final_message_error": f"{agent_label} final-message artifact was empty.",
         }
 
     return {
@@ -646,8 +652,14 @@ def run_json_streaming_command(
             if metadata.get("extraction_prompt_sha256")
             else None
         ),
+        final_message_source=(
+            str(metadata["final_message_source"])
+            if metadata.get("final_message_source")
+            else None
+        ),
     )
     write_intent(paths, intent)
+    agent_label = str(metadata.pop("agent_label", None) or "Codex")
     cancellation = _CANCELLATION_EVENT.get()
     if cancellation is not None and cancellation.is_set():
         write_cancel_marker(paths, invocation_id=invocation_id, source="operator_cancel")
@@ -657,7 +669,7 @@ def run_json_streaming_command(
         })
         return {
             "command": command, "cwd": cwd, "exit_code": -signal.SIGTERM,
-            "stdout": "", "stderr": "Run cancelled before Codex started.",
+            "stdout": "", "stderr": f"Run cancelled before {agent_label} started.",
             "timed_out": False, "started_at": started_at, "finished_at": _utc_now(),
             "cancel_requested": True,
         }
@@ -681,8 +693,8 @@ def run_json_streaming_command(
             _progress_event(
                 kind="process_started",
                 status="running",
-                title="Codex process started",
-                summary="Codex exec started with JSONL progress enabled.",
+                title=f"{agent_label} process started",
+                summary=f"{_exec_noun(agent_label)} started with JSONL progress enabled.",
                 metadata={
                     **metadata,
                     "pid": getattr(process, "pid", None),
@@ -715,8 +727,8 @@ def run_json_streaming_command(
             _progress_event(
                 kind="error",
                 status="failed",
-                title="Codex process failed to start",
-                summary="Codex CLI executable could not be started.",
+                title=f"{agent_label} process failed to start",
+                summary=f"{agent_label} CLI executable could not be started.",
                 metadata={
                     **metadata,
                     "error_type": type(error).__name__,
@@ -1147,6 +1159,7 @@ def observe_existing_codex_invocation(
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     wrapper: subprocess.Popen | None = None,
     progress_normalizer: Callable[[str], dict[str, object]] | None = None,
+    agent_label: str = "Codex",
 ) -> dict:
     intent = classification.intent or {}
     command = intent.get("command") if isinstance(intent.get("command"), list) else []
@@ -1188,7 +1201,7 @@ def observe_existing_codex_invocation(
             started_at=started_at,
             observation=observation,
         )
-        final_message = _final_message_artifact_result(classification.paths.final_message_path)
+        final_message = _final_message_artifact_result(classification.paths.final_message_path, agent_label)
         final_status = str(final_message.get("final_message_status") or "")
         _emit_progress(
             progress_callback,
@@ -1196,7 +1209,7 @@ def observe_existing_codex_invocation(
                 kind="final_message_available",
                 status="available" if final_status == "valid" else final_status or "unavailable",
                 title="Final message available" if final_status == "valid" else "Final message unavailable",
-                summary="Codex final assistant message was read from the final-message artifact.",
+                summary=f"{agent_label} final assistant message was read from the final-message artifact.",
                 metadata={
                     **metadata,
                     "final_message_status": final_status,
@@ -1212,8 +1225,8 @@ def observe_existing_codex_invocation(
             _progress_event(
                 kind="process_exited",
                 status="completed" if result.get("exit_code") == 0 else "failed",
-                title="Codex process exited",
-                summary="Codex exec process exited.",
+                title=f"{agent_label} process exited",
+                summary=f"{_exec_noun(agent_label)} process exited.",
                 metadata={
                     **metadata,
                     "exit_code": result.get("exit_code"),

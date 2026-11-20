@@ -6,6 +6,7 @@ from typing import Any, Callable
 from agent import ledger as default_ledger
 from agent.codex_invocation import event_metadata
 from agent.coding_agent_provider import CodingAgentProvider
+from agent.claude_code_provider import ClaudeCodeProvider
 from agent.codex_provider import CodexProvider
 from agent.run_services import ExecutionProfileLookupStatus, get_run_execution_profile
 
@@ -19,9 +20,11 @@ class ProviderResolutionError(ValueError):
 def resolve_provider(identity: str, *, codex_runner: Callable | None = None) -> CodingAgentProvider:
     if identity not in default_ledger.ALLOWED_CODING_AGENTS:
         raise ProviderResolutionError("coding_agent_unknown", f"Unknown coding agent: {identity!r}.")
-    if identity != "codex":
-        raise ProviderResolutionError("coding_agent_unavailable", f"Coding agent {identity!r} is recognized but its execution adapter is unavailable.")
-    return CodexProvider(runner=codex_runner)
+    if identity == "codex":
+        return CodexProvider(runner=codex_runner)
+    if identity == "claude_code":
+        return ClaudeCodeProvider()
+    raise ProviderResolutionError("coding_agent_unavailable", f"Coding agent {identity!r} is recognized but its execution adapter is unavailable.")
 
 
 def validate_invocation_provider(identity: str, events: list[dict], invocation: Any = None) -> None:

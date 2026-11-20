@@ -326,6 +326,7 @@ def build_intent_payload(
     extraction_event_id: int | None = None,
     extraction_prompt_sha256: str | None = None,
     coding_agent: str = "codex",
+    final_message_source: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "codex_invocation_id": invocation_id,
@@ -348,6 +349,10 @@ def build_intent_payload(
         payload["extraction_event_id"] = extraction_event_id
     if extraction_prompt_sha256 is not None:
         payload["extraction_prompt_sha256"] = extraction_prompt_sha256
+    if final_message_source is not None:
+        # The wrapper copies the final answer out of stdout (Claude Code).
+        # Absent for Codex, which writes the final-message file itself.
+        payload["final_message_source"] = final_message_source
     return payload
 
 

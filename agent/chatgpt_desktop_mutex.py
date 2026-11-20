@@ -153,10 +153,11 @@ def capture_mutex_identity(
     owning_run_id: str,
     controller_instance_id: str | None = None,
     mutex_token: str | None = None,
+    chatgpt_target: str | None = None,
 ) -> dict[str, Any]:
     pid = os.getpid()
     pgid = process_group_id(pid)
-    return {
+    identity = {
         "controller_instance_id": controller_instance_id or f"process-{pid}",
         "boot_id": boot_identity(),
         "pid": pid,
@@ -165,6 +166,12 @@ def capture_mutex_identity(
         "owning_run_id": owning_run_id,
         "mutex_token": mutex_token or secrets.token_urlsafe(16),
     }
+    # Which ChatGPT app the holder drives ("classic" or "new"). Only written
+    # when given, so existing callers produce exactly the same record. The lock
+    # itself stays shared: Classic and new-app runs never drive ChatGPT at once.
+    if chatgpt_target is not None:
+        identity["chatgpt_target"] = chatgpt_target
+    return identity
 
 
 @dataclass
@@ -185,7 +192,7 @@ class ChatGPTDesktopMutexHold:
 
 
 class ChatGPTDesktopMutex:
-    """Machine-scoped exclusive lock for Classic ChatGPT Desktop."""
+    """Machine-scoped exclusive lock for ChatGPT Desktop (Classic and the new app share it)."""
 
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else DEFAULT_CHATGPT_DESKTOP_MUTEX_PATH
@@ -195,6 +202,7 @@ class ChatGPTDesktopMutex:
         owning_run_id: str,
         *,
         controller_instance_id: str | None = None,
+        chatgpt_target: str | None = None,
     ) -> ChatGPTDesktopMutexHold:
         if fcntl is None:
             return ChatGPTDesktopMutexHold(
@@ -227,6 +235,7 @@ class ChatGPTDesktopMutex:
         identity = capture_mutex_identity(
             owning_run_id=owning_run_id,
             controller_instance_id=controller_instance_id,
+            chatgpt_target=chatgpt_target,
         )
         try:
             _write_mutex_identity(handle, identity)
@@ -266,13 +275,13 @@ class NullChatGPTDesktopMutex:
         owning_run_id: str,
         *,
         controller_instance_id: str | None = None,
+        chatgpt_target: str | None = None,
     ) -> ChatGPTDesktopMutexHold:
         del controller_instance_id
-        return ChatGPTDesktopMutexHold(
-            ok=True,
-            identity={"owning_run_id": owning_run_id, "mutex_token": str(uuid.uuid4())},
-            owner_is_live=True,
-        )
+        identity = {"owning_run_id": owning_run_id, "mutex_token": str(uuid.uuid4())}
+        if chatgpt_target is not None:
+            identity["chatgpt_target"] = chatgpt_target
+        return ChatGPTDesktopMutexHold(ok=True, identity=identity, owner_is_live=True)
 
 
 def _read_mutex_identity(handle: Any) -> dict[str, Any] | None:

@@ -448,6 +448,9 @@ def execute_coding_agent_service(
     }
     if model != CODEX_DEFAULT_SELECTION:
         started_metadata["model"] = model
+    reasoning_effort = profile.reasoning_effort if profile is not None else CODEX_DEFAULT_SELECTION
+    if reasoning_effort != CODEX_DEFAULT_SELECTION:
+        started_metadata["reasoning_effort"] = reasoning_effort
     started_metadata["coding_agent"] = identity
     if native_session is not None:
         started_metadata["resume_session_id"] = native_session.session_id
@@ -552,7 +555,7 @@ def execute_coding_agent_service(
                 )
             result = provider.execute(CodingAgentRequest(
                 run_id=run_id, prompt=prompt, repo_path=repo_path, sandbox=sandbox,
-                model=model, invocation_id=codex_invocation_id,
+                model=model, invocation_id=codex_invocation_id, reasoning_effort=reasoning_effort,
                 progress_callback=callback, native_session=native_session,
                 artifact_dir=started_metadata.get("artifact_dir"),
                 extraction_event_id=started_metadata.get("extraction_event_id"),

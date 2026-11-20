@@ -17,6 +17,44 @@ def build_parser() -> argparse.ArgumentParser:
 
     start_parser = subparsers.add_parser("start", help="Create a new run.")
     start_parser.add_argument("instruction", help="User instruction for the run.")
+    start_parser.add_argument(
+        "--coding-agent",
+        choices=("codex", "claude_code"),
+        default=None,
+        help=(
+            "Coding agent for this run: codex or claude_code. Fixed for the life of the run. "
+            "Giving --coding-agent, --sandbox or --model records the run's execution profile; "
+            "later codex-run calls must then use the same --sandbox. Default: no profile (Codex)."
+        ),
+    )
+    start_parser.add_argument(
+        "--sandbox",
+        choices=("read-only", "workspace-write", "danger-full-access"),
+        default=None,
+        help=(
+            "Sandbox recorded in the run profile. Default when a profile is recorded: read-only. "
+            "For claude_code, danger-full-access runs Claude Code in auto mode."
+        ),
+    )
+    start_parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Model recorded in the run profile. Codex: codex_default, gpt-5, gpt-5-codex. "
+            "Claude Code: codex_default (your Claude settings' model) or a model ID such as "
+            "claude-opus-5-5, claude-fable-5-2, claude-fable-5-1, claude-fable-5, "
+            "claude-sonnet-5-5, claude-haiku-5-5 (full list: agent/claude_code_models.py)."
+        ),
+    )
+    start_parser.add_argument(
+        "--effort",
+        choices=("low", "medium", "high", "xhigh", "max"),
+        default=None,
+        help=(
+            "Claude Code reasoning effort recorded in the run profile (passed as --effort). "
+            "Default: your Claude settings' effortLevel. Not available for Codex."
+        ),
+    )
 
     show_parser = subparsers.add_parser("show", help="Show a run and its events.")
     show_parser.add_argument("run_id", help="Run ID to show.")
@@ -815,6 +853,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         action="store_true",
         help="Ask for y/N confirmation before each otherwise-safe supervised handoff step.",
+    )
+    supervise_parser.add_argument(
+        "--chatgpt-app",
+        choices=("classic", "new"),
+        default=None,
+        help=(
+            "ChatGPT desktop app for this run: classic (com.openai.chat) or new (com.openai.codex). "
+            "Default: CRAX_CHATGPT_APP, else the app the run already uses (classic if none). "
+            "A run never switches apps."
+        ),
     )
 
     run_shell_parser = subparsers.add_parser(

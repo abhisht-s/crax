@@ -14,6 +14,10 @@
     "workspace-write": "Workspace Write",
     "danger-full-access": "Full Access (Autonomous)",
   };
+  const CODING_AGENT_LABELS = {
+    codex: "Codex",
+    claude_code: "Claude Code",
+  };
   const PERMISSION_PRESET_DESCRIPTIONS = {
     "read-only": "Codex can inspect the workspace. Edits are not allowed for this dashboard run.",
     "workspace-write": "Codex can edit files in this repository. Outside-workspace and dangerous access remain blocked by this dashboard run.",
@@ -120,10 +124,17 @@
       "project-title",
       "chat-title",
       "allow-destination-navigation",
+      "coding-agent-select",
+      "coding-agent-description",
+      "sandbox-label",
       "sandbox-select",
       "full-access-button",
       "permission-preset-description",
+      "model-label",
       "model-select",
+      "model-description",
+      "reasoning-label",
+      "effort-select",
       "reasoning-lock",
       "approval-lock",
       "full-access-confirmation-label",
@@ -139,12 +150,14 @@
       "chatgpt-lane-status",
       "durability-banner",
       "run-id",
+      "copy-run-id-button",
       "run-repository",
       "run-project-title",
       "run-chat-title",
       "run-destination-state",
       "run-navigation-approved",
       "run-handoff-phase",
+      "run-coding-agent",
       "run-sandbox",
       "run-model",
       "run-reasoning",
@@ -159,6 +172,8 @@
       "actionable-error",
       "codex-live-state",
       "codex-live-session-id",
+      "codex-live-session-label",
+      "copy-session-id-button",
       "codex-live-quota-wait",
       "quota-force-continue-button",
       "quota-force-continue-status",
@@ -224,6 +239,10 @@
       updateControlState();
     });
     elements["default-greeting-button"].addEventListener("click", onDefaultGreeting);
+    elements["copy-run-id-button"].addEventListener("click", () =>
+      copyIdFrom(elements["run-id"], elements["copy-run-id-button"]));
+    elements["copy-session-id-button"].addEventListener("click", () =>
+      copyIdFrom(elements["codex-live-session-id"], elements["copy-session-id-button"]));
     elements["initial-task"].addEventListener("input", updateControlState);
     elements["project-title"].addEventListener("input", updateControlState);
     elements["chat-title"].addEventListener("input", updateControlState);
@@ -233,7 +252,15 @@
       updateControlState();
     });
     elements["full-access-button"].addEventListener("click", onSelectFullAccess);
-    elements["model-select"].addEventListener("change", updateControlState);
+    elements["coding-agent-select"].addEventListener("change", () => {
+      applyCodingAgentSelection();
+      updateControlState();
+    });
+    elements["model-select"].addEventListener("change", () => {
+      applyModelSelection();
+      updateControlState();
+    });
+    elements["effort-select"].addEventListener("change", updateControlState);
     elements["full-access-confirmation"].addEventListener("input", updateControlState);
     elements["approve-button"].addEventListener("click", () => onApproval("approved"));
     elements["reject-button"].addEventListener("click", () => onApproval("rejected"));
@@ -727,6 +754,8 @@
     const chatTitle = elements["chat-title"].value.trim();
     const sandbox = elements["sandbox-select"].value;
     const model = elements["model-select"].value;
+    const codingAgent = selectedCodingAgent();
+    const reasoningEffort = selectedReasoningEffort();
     const allowDestinationNavigation = Boolean(elements["allow-destination-navigation"].checked);
     const fullAccessConfirmation = elements["full-access-confirmation"].value.trim();
     if (!repositoryPath) {
@@ -755,6 +784,8 @@
       chat_title: chatTitle,
       sandbox,
       model,
+      coding_agent: codingAgent,
+      reasoning_effort: reasoningEffort,
       allow_destination_navigation: allowDestinationNavigation,
       ...(additionalSession ? { additional_session: true } : {}),
       ...(sandbox === "danger-full-access"
@@ -779,7 +810,7 @@
     if (!fullAccessAvailable) {
       setText(
         elements["startup-status"],
-        "Remote Full Access requires --allow-remote-full-access on the Mac.",
+        `Remote ${autonomousPresetLabel(selectedCodingAgent())} requires --allow-remote-full-access on the Mac.`,
       );
       return;
     }
@@ -1358,13 +1389,63 @@
     const metadata = event && event.metadata && typeof event.metadata === "object"
       ? event.metadata
       : {};
-    if (metadata.event_type !== "thread.started") {
-      return "";
-    }
     const summary = metadata.value_summary && typeof metadata.value_summary === "object"
       ? metadata.value_summary
       : {};
+    if (metadata.event_type === "system.init") {
+      // Claude Code's first stream event (agent/claude_code_provider.py).
+      return typeof summary.claude_session_id === "string" ? summary.claude_session_id : "";
+    }
+    if (metadata.event_type !== "thread.started") {
+      return "";
+    }
     return typeof summary.codex_session_id === "string" ? summary.codex_session_id : "";
+  }
+
+  const NOT_COPYABLE_TEXT = new Set(["", "None", "Not available yet"]);
+
+  function updateCopyButton(button, valueElement) {
+    const text = (valueElement.textContent || "").trim();
+    button.classList.toggle("hidden", NOT_COPYABLE_TEXT.has(text));
+  }
+
+  async function copyIdFrom(valueElement, button) {
+    const text = (valueElement.textContent || "").trim();
+    if (NOT_COPYABLE_TEXT.has(text)) {
+      return;
+    }
+    let copied = false;
+    try {
+      // Needs a secure context: true on the Mac (localhost), not on plain-http remote devices.
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      }
+    } catch (error) {
+      copied = false;
+    }
+    if (!copied) {
+      const scratch = document.createElement("textarea");
+      scratch.value = text;
+      scratch.setAttribute("readonly", "");
+      scratch.style.position = "fixed";
+      scratch.style.opacity = "0";
+      document.body.append(scratch);
+      scratch.select();
+      try {
+        copied = document.execCommand("copy");
+      } catch (error) {
+        copied = false;
+      }
+      scratch.remove();
+    }
+    const label = button.getAttribute("aria-label") || "Copy";
+    button.classList.toggle("copied", copied);
+    button.title = copied ? "Copied" : "Copy failed — select the text instead";
+    window.setTimeout(() => {
+      button.classList.remove("copied");
+      button.title = label;
+    }, 1500);
   }
 
   function codexPlanFromProgressEvent(event) {
@@ -1590,6 +1671,7 @@
     const activeRunId = valueOrNone(rawActiveRunId);
 
     setText(elements["run-id"], activeRunId);
+    updateCopyButton(elements["copy-run-id-button"], elements["run-id"]);
     setText(elements["run-repository"], valueOrNone(model && model.repository_path));
     renderDestinationBinding(model);
     renderNavigationApproval(model);
@@ -1765,6 +1847,9 @@
       elements["codex-live-session-id"],
       currentCodexSessionId || (model && model.codex_session && model.codex_session.session_id) || (progressRunId ? "Not available yet" : "None"),
     );
+    updateCopyButton(elements["copy-session-id-button"], elements["codex-live-session-id"]);
+    const liveAgent = model && model.execution_profile && model.execution_profile.coding_agent;
+    setText(elements["codex-live-session-label"], `${codingAgentLabel(liveAgent || "codex")} session ID`);
     const quotaWait = model && model.quota_wait && typeof model.quota_wait === "object"
       ? model.quota_wait
       : null;
@@ -1971,6 +2056,10 @@
 
   function renderExecutionProfile(model) {
     const profile = model && model.execution_profile ? model.execution_profile : null;
+    setText(
+      elements["run-coding-agent"],
+      profile && profile.status !== "invalid" ? codingAgentLabel(profile.coding_agent || "codex") : "None",
+    );
     if (!profile) {
       setProfileText("None", "None", "None", "None", "None");
       return;
@@ -1991,16 +2080,30 @@
         ? "Legacy/default compatibility"
         : profile.profile_source;
     setProfileText(
-      permissionPresetSummary(profile.sandbox),
-      profile.model === "codex_default" ? "Codex default" : valueOrNone(profile.model),
-      profile.reasoning_effort === "codex_default"
-        ? "Codex default"
-        : valueOrNone(profile.reasoning_effort),
+      profile.coding_agent === "claude_code"
+        ? permissionPresetSummary(profile.sandbox).replace("Full Access", autonomousPresetLabel("claude_code"))
+        : permissionPresetSummary(profile.sandbox),
+      runAgentText(
+        profile.coding_agent,
+        profile.model === "codex_default" ? "Codex default" : valueOrNone(modelDisplayName(profile.coding_agent, profile.model)),
+      ),
+      runAgentText(
+        profile.coding_agent,
+        profile.reasoning_effort === "codex_default"
+          ? "Codex default"
+          : valueOrNone(profile.reasoning_effort),
+      ),
       profile.approval_policy === "codex_default"
         ? "Codex default"
         : valueOrNone(profile.approval_policy),
       valueOrNone(source),
     );
+  }
+
+  function runAgentText(agent, text) {
+    // The stored "codex_default" means the run's own agent default.
+    const label = codingAgentLabel(agent || "codex");
+    return label === "Codex" ? text : String(text).replace(/\bCodex\b/g, label);
   }
 
   function setProfileText(sandbox, model, reasoning, approval, source) {
@@ -2151,9 +2254,11 @@
     elements["project-title"].disabled = disableInputs;
     elements["chat-title"].disabled = disableInputs;
     elements["allow-destination-navigation"].disabled = disableInputs;
+    elements["coding-agent-select"].disabled = disableInputs || optionsUnavailable;
     elements["sandbox-select"].disabled = disableInputs || optionsUnavailable;
     elements["full-access-button"].disabled = disableInputs || optionsUnavailable;
     elements["model-select"].disabled = disableInputs || optionsUnavailable;
+    elements["effort-select"].disabled = disableInputs || optionsUnavailable;
     elements["full-access-confirmation"].disabled = disableInputs;
     elements["start-button"].disabled = disableStart;
     elements["start-additional-button"].classList.toggle("hidden", liveCount < 1);
@@ -2230,9 +2335,11 @@
       "project-title",
       "chat-title",
       "allow-destination-navigation",
+      "coding-agent-select",
       "sandbox-select",
       "full-access-button",
       "model-select",
+      "effort-select",
       "full-access-confirmation",
       "start-button",
       "start-additional-button",
@@ -2302,23 +2409,192 @@
       sandboxOptions,
       "read-only",
     );
-    replaceOptions(
-      elements["model-select"],
-      Array.isArray(options.model_options) ? options.model_options : [],
-      "codex_default",
+    const agentOptions = codingAgentOptions(options);
+    const previousAgent = elements["coding-agent-select"].value;
+    replaceOptions(elements["coding-agent-select"], agentOptions, previousAgent || "codex");
+    for (const item of elements["coding-agent-select"].options) {
+      const option = agentOptions.find((candidate) => candidate.value === item.value);
+      item.disabled = Boolean(option && option.available === false);
+      if (item.disabled) {
+        setText(item, `${optionLabel(option, item.value)} (CLI not found)`);
+      }
+    }
+    const chosen = elements["coding-agent-select"].selectedOptions[0];
+    if (chosen && chosen.disabled) {
+      elements["coding-agent-select"].value = "codex";
+    }
+    applyCodingAgentSelection();
+    updateFullAccessConfirmation();
+  }
+
+  function codingAgentOptions(options) {
+    const fallback = [{ value: "codex", label: "Codex", available: true }];
+    if (!options || !Array.isArray(options.coding_agent_options) || options.coding_agent_options.length === 0) {
+      return fallback;
+    }
+    return options.coding_agent_options.filter(
+      (option) => option && typeof option.value === "string" && option.value,
     );
-    const locked = options.locked && typeof options.locked === "object" ? options.locked : {};
-    setText(elements["reasoning-lock"], optionLabel(locked.reasoning_effort, "Codex default"));
+  }
+
+  function selectedCodingAgent() {
+    return elements["coding-agent-select"].value || "codex";
+  }
+
+  function codingAgentLabel(value) {
+    return CODING_AGENT_LABELS[value] || String(value || "Codex");
+  }
+
+  function modelOptionsForAgent(options, agent) {
+    const byAgent = options && options.model_options_by_agent && typeof options.model_options_by_agent === "object"
+      ? options.model_options_by_agent
+      : null;
+    if (byAgent && Array.isArray(byAgent[agent])) {
+      return byAgent[agent];
+    }
+    return agent === "codex" && options && Array.isArray(options.model_options) ? options.model_options : [];
+  }
+
+  function agentText(text) {
+    // Server descriptions name Codex; show the selected agent instead.
+    const label = codingAgentLabel(selectedCodingAgent());
+    return label === "Codex" ? text : String(text).replace(/\bCodex\b/g, label);
+  }
+
+  function applyCodingAgentSelection() {
+    const agent = selectedCodingAgent();
+    const label = codingAgentLabel(agent);
+    const previousModel = elements["model-select"].value;
+    const models = modelOptionsForAgent(profileOptions, agent);
+    replaceGroupedOptions(
+      elements["model-select"],
+      models,
+      optionValueAllowed(models, previousModel) ? previousModel : "codex_default",
+    );
+    const previousSandbox = elements["sandbox-select"].value;
+    const sandboxes = sandboxOptionsForAgent(profileOptions, agent);
+    replaceOptions(
+      elements["sandbox-select"],
+      sandboxes,
+      optionValueAllowed(sandboxes, previousSandbox) ? previousSandbox : "read-only",
+    );
+    const autonomousAvailable = sandboxes.some((option) => option.value === "danger-full-access");
+    elements["full-access-button"].classList.toggle("hidden", !autonomousAvailable);
+    const presentation = agentPresentation(agent);
+    setText(
+      elements["full-access-button"],
+      typeof presentation.autonomous_button_label === "string" ? presentation.autonomous_button_label : "Use Full Access",
+    );
+    setText(elements["sandbox-label"], `${label} Permission Preset`);
+    setText(elements["model-label"], `${label} model`);
+    const locked = profileOptions && profileOptions.locked && typeof profileOptions.locked === "object"
+      ? profileOptions.locked
+      : {};
+    setText(elements["reasoning-lock"], agentText(optionLabel(locked.reasoning_effort, "Codex default")));
     setText(
       elements["approval-lock"],
-      optionLabel(locked.approval_policy, "Codex default — Full Access bypasses approvals"),
+      typeof presentation.approval_policy_label === "string"
+        ? presentation.approval_policy_label
+        : agentText(optionLabel(locked.approval_policy, "Codex default — Full Access bypasses approvals")),
     );
     updatePermissionPresetDescription();
     updateFullAccessConfirmation();
-    const fullAccessAvailable = sandboxOptions.some(
-      (option) => option.value === "danger-full-access",
+    applyModelSelection();
+  }
+
+  function replaceGroupedOptions(select, options, preferredValue) {
+    // Like Claude Code's /model: main models first, the rest under "More models".
+    replaceOptions(select, options.filter((option) => !option || option.group !== "more"), preferredValue);
+    const more = options.filter((option) => option && option.group === "more" && typeof option.value === "string");
+    if (more.length > 0) {
+      const group = document.createElement("optgroup");
+      group.label = "More models";
+      for (const option of more) {
+        const item = document.createElement("option");
+        item.value = option.value;
+        setText(item, optionLabel(option, option.value));
+        group.append(item);
+      }
+      select.append(group);
+      if (optionValueAllowed(more, preferredValue)) {
+        select.value = preferredValue;
+      }
+    }
+  }
+
+  function selectedModelOption() {
+    const agent = selectedCodingAgent();
+    return modelOptionsForAgent(profileOptions, agent).find(
+      (option) => option && option.value === elements["model-select"].value,
+    ) || null;
+  }
+
+  function effortOptionsForSelection() {
+    const agent = selectedCodingAgent();
+    const byAgent = profileOptions && profileOptions.reasoning_effort_options_by_agent
+      && typeof profileOptions.reasoning_effort_options_by_agent === "object"
+      ? profileOptions.reasoning_effort_options_by_agent
+      : {};
+    const all = Array.isArray(byAgent[agent]) ? byAgent[agent] : [];
+    const model = selectedModelOption();
+    if (!model || !Array.isArray(model.efforts)) {
+      return all;
+    }
+    return all.filter((option) => option.value === "codex_default" || model.efforts.includes(option.value));
+  }
+
+  function selectedReasoningEffort() {
+    return elements["effort-select"].classList.contains("hidden")
+      ? "codex_default"
+      : elements["effort-select"].value || "codex_default";
+  }
+
+  function applyModelSelection() {
+    const model = selectedModelOption();
+    setText(elements["model-description"], model && model.description ? model.description : "");
+    const efforts = effortOptionsForSelection();
+    const selectable = selectedCodingAgent() !== "codex" && efforts.length > 1;
+    elements["effort-select"].classList.toggle("hidden", !selectable);
+    elements["reasoning-lock"].classList.toggle("hidden", selectable);
+    if (selectable) {
+      const previous = elements["effort-select"].value;
+      replaceOptions(
+        elements["effort-select"],
+        efforts,
+        optionValueAllowed(efforts, previous) ? previous : "codex_default",
+      );
+    } else if (selectedCodingAgent() !== "codex") {
+      setText(elements["reasoning-lock"], "Not adjustable for this model");
+    }
+  }
+
+  function modelDisplayName(agent, value) {
+    const option = modelOptionsForAgent(profileOptions, agent || "codex").find(
+      (candidate) => candidate && candidate.value === value,
     );
-    elements["full-access-button"].classList.toggle("hidden", !fullAccessAvailable);
+    return option && option.label && option.label !== value ? `${option.label} (${value})` : value;
+  }
+
+  function sandboxOptionsForAgent(options, agent) {
+    const byAgent = options && options.sandbox_options_by_agent && typeof options.sandbox_options_by_agent === "object"
+      ? options.sandbox_options_by_agent
+      : null;
+    if (byAgent && Array.isArray(byAgent[agent])) {
+      return safePermissionPresetOptions(byAgent[agent]);
+    }
+    return safePermissionPresetOptions(options && options.sandbox_options);
+  }
+
+  function agentPresentation(agent) {
+    const all = profileOptions && profileOptions.agent_presentation && typeof profileOptions.agent_presentation === "object"
+      ? profileOptions.agent_presentation
+      : {};
+    return all[agent] && typeof all[agent] === "object" ? all[agent] : {};
+  }
+
+  function autonomousPresetLabel(agent) {
+    // Codex: Full Access. Claude Code: Auto Mode (agent/claude_code_provider.py).
+    return agent === "claude_code" ? "Auto Mode" : "Full Access";
   }
 
   function replaceOptions(select, options, preferredValue) {
@@ -2361,10 +2637,14 @@
 
   function updatePermissionPresetDescription() {
     const value = elements["sandbox-select"].value;
-    const selected = safePermissionPresetOptions(profileOptions && profileOptions.sandbox_options)
+    const selected = sandboxOptionsForAgent(profileOptions, selectedCodingAgent())
       .find((option) => option.value === value);
     const fallback = PERMISSION_PRESET_DESCRIPTIONS[value] || "Select the Codex sandbox mode for this dashboard run.";
-    setText(elements["permission-preset-description"], optionDescription(selected, fallback));
+    // Agent-specific descriptions come from the server; only the Codex fallback is relabelled.
+    setText(
+      elements["permission-preset-description"],
+      selected && selected.description ? selected.description : agentText(fallback),
+    );
   }
 
   function updateFullAccessConfirmation() {
@@ -2389,9 +2669,16 @@
     if (!profileOptions) {
       return false;
     }
+    const agent = selectedCodingAgent();
+    const agentOption = codingAgentOptions(profileOptions).find((option) => option.value === agent);
     return (
+      Boolean(agentOption) &&
+      agentOption.available !== false &&
       optionValueAllowed(safePermissionPresetOptions(profileOptions.sandbox_options), elements["sandbox-select"].value) &&
-      optionValueAllowed(profileOptions.model_options, elements["model-select"].value)
+      optionValueAllowed(sandboxOptionsForAgent(profileOptions, agent), elements["sandbox-select"].value) &&
+      optionValueAllowed(modelOptionsForAgent(profileOptions, agent), elements["model-select"].value) &&
+      (selectedReasoningEffort() === "codex_default" ||
+        optionValueAllowed(effortOptionsForSelection(), selectedReasoningEffort()))
     );
   }
 
